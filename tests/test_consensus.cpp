@@ -20,6 +20,37 @@ TEST(test_leader_selection_determinism) {
   ASSERT_EQ(*l1, *l2);
 }
 
+TEST(test_committee_selection_determinism) {
+  std::vector<PubKey32> vals(10);
+  for (size_t i = 0; i < vals.size(); ++i) vals[i].fill(static_cast<std::uint8_t>(20 + i));
+  std::sort(vals.begin(), vals.end());
+
+  Hash32 prev{};
+  prev.fill(0x42);
+
+  auto c1 = consensus::select_committee(prev, 50, vals, 6);
+  auto c2 = consensus::select_committee(prev, 50, vals, 6);
+  ASSERT_EQ(c1, c2);
+  ASSERT_EQ(c1.size(), 6u);
+}
+
+TEST(test_committee_selection_changes_with_seed_inputs) {
+  std::vector<PubKey32> vals(12);
+  for (size_t i = 0; i < vals.size(); ++i) vals[i].fill(static_cast<std::uint8_t>(80 + i));
+  std::sort(vals.begin(), vals.end());
+
+  Hash32 prev_a{};
+  prev_a.fill(0x11);
+  Hash32 prev_b{};
+  prev_b.fill(0x22);
+
+  auto c1 = consensus::select_committee(prev_a, 100, vals, 8);
+  auto c2 = consensus::select_committee(prev_a, 101, vals, 8);
+  auto c3 = consensus::select_committee(prev_b, 100, vals, 8);
+  ASSERT_TRUE(c1 != c2);
+  ASSERT_TRUE(c1 != c3);
+}
+
 TEST(test_quorum_formula_1_to_20) {
   for (size_t n = 1; n <= 20; ++n) {
     const size_t q = consensus::quorum_threshold(n);

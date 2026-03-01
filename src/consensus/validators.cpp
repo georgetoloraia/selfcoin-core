@@ -97,4 +97,35 @@ std::optional<PubKey32> select_leader(const Hash32& prev_finalized_hash, std::ui
   return active_sorted[pick % active_sorted.size()];
 }
 
+std::vector<PubKey32> select_committee(const Hash32& prev_finalized_hash, std::uint64_t height,
+                                       const std::vector<PubKey32>& active_sorted, std::size_t max_committee) {
+  if (active_sorted.empty()) return {};
+  const std::size_t committee_size = std::min(max_committee, active_sorted.size());
+
+  codec::ByteWriter seed_w;
+  seed_w.bytes(Bytes{'S', 'C', '-', 'C', 'O', 'M', 'M', 'I', 'T', 'T', 'E', 'E', '-', 'V', '0'});
+  seed_w.bytes_fixed(prev_finalized_hash);
+  seed_w.u64le(height);
+  const Hash32 seed = crypto::sha256d(seed_w.data());
+
+  std::vector<std::pair<Hash32, PubKey32>> scored;
+  scored.reserve(active_sorted.size());
+  for (const auto& pub : active_sorted) {
+    codec::ByteWriter sw;
+    sw.bytes_fixed(seed);
+    sw.bytes_fixed(pub);
+    scored.push_back({crypto::sha256d(sw.data()), pub});
+  }
+
+  std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return a.second < b.second;
+  });
+
+  std::vector<PubKey32> out;
+  out.reserve(committee_size);
+  for (std::size_t i = 0; i < committee_size; ++i) out.push_back(scored[i].second);
+  return out;
+}
+
 }  // namespace selfcoin::consensus

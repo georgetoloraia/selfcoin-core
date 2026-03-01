@@ -209,6 +209,10 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         if (!crypto::ed25519_verify(b_bid, evidence.b.signature, evidence.b.validator_pubkey)) {
           return {false, "invalid evidence signature b", 0};
         }
+        if (!ctx->is_committee_member) return {false, "slash spend requires committee context", 0};
+        if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
+          return {false, "slash evidence validator not in committee", 0};
+        }
       } else {
         // UNBOND path
         if (tx.outputs.size() != 1) return {false, "unbond tx must have exactly one output", 0};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -17,6 +18,7 @@ struct TxValidationResult {
 struct SpecialValidationContext {
   const consensus::ValidatorRegistry* validators{nullptr};
   std::uint64_t current_height{0};
+  std::function<bool(const PubKey32&, std::uint64_t, std::uint32_t)> is_committee_member;
 };
 
 struct SlashEvidence {

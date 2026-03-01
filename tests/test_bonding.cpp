@@ -143,7 +143,7 @@ TEST(test_slash_evidence_parsing_and_validation) {
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(200);
-  SpecialValidationContext ctx{&vr, 200};
+  SpecialValidationContext ctx{&vr, 200, [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; }};
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);

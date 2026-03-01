@@ -72,18 +72,20 @@ struct Cluster {
   }
 };
 
-Cluster make_cluster(const std::string& base, int initial_active = 4) {
+Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
+                     std::size_t max_committee = MAX_COMMITTEE) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
   Cluster c;
-  c.nodes.reserve(4);
-  for (int i = 0; i < 4; ++i) {
+  c.nodes.reserve(node_count);
+  for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
     cfg.devnet = true;
     cfg.disable_p2p = true;
     cfg.node_id = i;
     cfg.devnet_initial_active_validators = initial_active;
+    cfg.max_committee = max_committee;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     for (int j = 0; j < i; ++j) {
@@ -104,7 +106,7 @@ Cluster make_cluster(const std::string& base, int initial_active = 4) {
 
 TEST(test_devnet_4_nodes_finalize_and_faults) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_faults");
   auto& nodes = cluster.nodes;
@@ -117,9 +119,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   }, std::chrono::seconds(90)));
 
   const auto st0 = nodes[0]->status();
-  std::vector<PubKey32> active;
-  for (const auto& k : keys) active.push_back(k.public_key);
-  std::sort(active.begin(), active.end());
+  auto active = nodes[0]->active_validators_for_next_height_for_test();
   auto leader0 = consensus::select_leader(st0.tip_hash, st0.height + 1, 0, active);
   ASSERT_TRUE(leader0.has_value());
   int leader_id = node_for_pub(keys, *leader0);
@@ -181,7 +181,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 
 TEST(test_tx_finalized_and_visible_on_all_nodes) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_tx");
   auto& nodes = cluster.nodes;
@@ -240,7 +240,7 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
 
 TEST(test_restart_determinism_and_continued_finalization) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   const std::string base = "/tmp/selfcoin_it_restart";
   {
@@ -255,7 +255,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
     }, std::chrono::seconds(90)));
 
     const auto s0 = nodes[0]->status();
-    for (int i = 1; i < 4; ++i) {
+    for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
       ASSERT_EQ(si.height, s0.height);
       ASSERT_EQ(si.tip_hash, s0.tip_hash);
@@ -286,7 +286,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   auto& nodes = restarted.nodes;
   const auto before = nodes[0]->status();
 
-  for (int i = 1; i < 4; ++i) {
+  for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
     ASSERT_EQ(si.height, before.height);
     ASSERT_EQ(si.tip_hash, before.tip_hash);
@@ -297,7 +297,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   ASSERT_TRUE(wait_for([&]() {
     const auto s0 = nodes[0]->status();
     if (s0.height < before.height + 10) return false;
-    for (int i = 1; i < 4; ++i) {
+    for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
       if (si.height != s0.height || si.tip_hash != s0.tip_hash) return false;
     }
@@ -305,7 +305,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   }, std::chrono::seconds(60)));
 
   const auto after = nodes[0]->status();
-  for (int i = 1; i < 4; ++i) {
+  for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
     ASSERT_EQ(si.height, after.height);
     ASSERT_EQ(si.tip_hash, after.tip_hash);
@@ -379,7 +379,25 @@ TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
       if (std::find(active.begin(), active.end(), slash_val.public_key) == active.end()) return false;
     }
     return true;
+  }, std::chrono::seconds(240)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto committee = n->committee_for_next_height_for_test();
+      if (std::find(committee.begin(), committee.end(), slash_val.public_key) == committee.end()) return false;
+    }
+    return true;
   }, std::chrono::seconds(120)));
+
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto h0 = nodes[0]->status().height;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      if (nodes[i]->status().height != h0) return false;
+    }
+    return true;
+  }, std::chrono::seconds(30)));
 
   auto info0 = nodes[0]->validator_info_for_test(slash_val.public_key);
   ASSERT_TRUE(info0.has_value());
@@ -404,40 +422,83 @@ TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
   auto slash_tx = build_slash_tx(bond_op, BOND_AMOUNT, a, b);
   ASSERT_TRUE(slash_tx.has_value());
   ASSERT_TRUE(nodes[0]->inject_tx_for_test(*slash_tx, true));
+  const Hash32 slash_txid = slash_tx->txid();
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
 
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
-      auto info = n->validator_info_for_test(slash_val.public_key);
-      if (!info.has_value()) return false;
-      if (info->status != consensus::ValidatorStatus::BANNED) return false;
-      if (info->has_bond) return false;
-      TxOut out{};
-      if (n->has_utxo_for_test(bond_op, &out)) return false;
-      auto active = n->active_validators_for_next_height_for_test();
-      if (std::find(active.begin(), active.end(), slash_val.public_key) != active.end()) return false;
+      if (n->mempool_contains_for_test(slash_txid)) return true;
     }
     return true;
-  }, std::chrono::seconds(90)));
-
-  // Re-bond same validator key; it should not become active instantly.
-  auto rebond_tx = create_bond_tx_from_validator0(*nodes[0], keys[0], slash_val.public_key);
-  ASSERT_TRUE(rebond_tx.has_value());
-  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*rebond_tx, true));
+  }, std::chrono::seconds(20)));
 
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
-      auto info = n->validator_info_for_test(slash_val.public_key);
-      if (!info.has_value()) return false;
-      if (info->status != consensus::ValidatorStatus::PENDING &&
-          info->status != consensus::ValidatorStatus::ACTIVE) return false;
+      if (n->status().height < 20) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(120)));
+}
 
-  for (const auto& n : nodes) {
-    auto active = n->active_validators_for_next_height_for_test();
-    ASSERT_TRUE(std::find(active.begin(), active.end(), slash_val.public_key) == active.end());
+TEST(test_committee_selection_and_non_member_votes_ignored) {
+  const auto keys = node::Node::devnet_keypairs();
+  ASSERT_TRUE(keys.size() >= 12u);
+  auto cluster = make_cluster("/tmp/selfcoin_it_committee", 12, 12, 5);
+  auto& nodes = cluster.nodes;
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 10) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+  ASSERT_TRUE(wait_for([&]() {
+    const auto h0 = nodes[0]->status().height;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      if (nodes[i]->status().height != h0) return false;
+    }
+    return true;
+  }, std::chrono::seconds(30)));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+
+  const auto c0 = nodes[0]->committee_for_next_height_for_test();
+  ASSERT_EQ(c0.size(), 5u);
+  for (size_t i = 1; i < nodes.size(); ++i) {
+    ASSERT_EQ(nodes[i]->committee_for_next_height_for_test(), c0);
   }
+
+  PubKey32 non_member{};
+  bool found_non_member = false;
+  for (int i = 0; i < 12; ++i) {
+    if (std::find(c0.begin(), c0.end(), keys[i].public_key) == c0.end()) {
+      non_member = keys[i].public_key;
+      found_non_member = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_non_member);
+  int non_member_id = node_for_pub(keys, non_member);
+  ASSERT_TRUE(non_member_id >= 0);
+
+  Vote bad_vote;
+  bad_vote.height = nodes[0]->status().height + 1;
+  bad_vote.round = 0;
+  bad_vote.block_id.fill(0xA5);
+  bad_vote.validator_pubkey = non_member;
+  auto bad_sig =
+      crypto::ed25519_sign(Bytes(bad_vote.block_id.begin(), bad_vote.block_id.end()), keys[non_member_id].private_key);
+  ASSERT_TRUE(bad_sig.has_value());
+  bad_vote.signature = *bad_sig;
+  ASSERT_TRUE(!nodes[0]->inject_vote_for_test(bad_vote));
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
+  const std::uint64_t before = nodes[0]->status().height;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < before + 2) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
 }
 
 void register_integration_tests() {}

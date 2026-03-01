@@ -46,5 +46,8 @@ class ValidatorRegistry {
 std::size_t quorum_threshold(std::size_t n_active);
 std::optional<PubKey32> select_leader(const Hash32& prev_finalized_hash, std::uint64_t height,
                                       std::uint32_t round, const std::vector<PubKey32>& active_sorted);
+std::vector<PubKey32> select_committee(const Hash32& prev_finalized_hash, std::uint64_t height,
+                                       const std::vector<PubKey32>& active_sorted,
+                                       std::size_t max_committee = MAX_COMMITTEE);
 
 }  // namespace selfcoin::consensus

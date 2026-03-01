@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -27,6 +28,7 @@ struct NodeConfig {
   std::string db_path{"./data/node"};
   bool disable_p2p{false};
   int devnet_initial_active_validators{4};
+  std::size_t max_committee{MAX_COMMITTEE};
 };
 
 struct NodeStatus {
@@ -58,6 +60,7 @@ class Node {
                                                          OutPoint* outpoint = nullptr) const;
   bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
+  std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
 
   static std::vector<crypto::KeyPair> devnet_keypairs();
@@ -83,6 +86,8 @@ class Node {
   bool persist_finalized_block(const Block& block);
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
+  bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
+  std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   void log_line(const std::string& s) const;
@@ -104,6 +109,7 @@ class Node {
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
+  std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
 
   crypto::KeyPair local_key_;
   bool is_validator_{false};

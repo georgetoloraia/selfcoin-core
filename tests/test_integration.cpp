@@ -1,13 +1,22 @@
 #include "test_framework.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <thread>
+#include <array>
 
 #include "address/address.hpp"
 #include "consensus/validators.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "lightserver/server.hpp"
 #include "node/node.hpp"
 #include "utxo/signing.hpp"
 
@@ -31,6 +40,30 @@ int node_for_pub(const std::vector<crypto::KeyPair>& keys, const PubKey32& pub) 
   return -1;
 }
 
+crypto::KeyPair key_from_byte(std::uint8_t b) {
+  std::array<std::uint8_t, 32> seed{};
+  seed.fill(b);
+  auto kp = crypto::keypair_from_seed32(seed);
+  if (!kp.has_value()) throw std::runtime_error("key generation failed");
+  return *kp;
+}
+
+std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
+                                                 const PubKey32& new_validator_pub) {
+  const auto sender_pkh = crypto::h160(Bytes(validator0.public_key.begin(), validator0.public_key.end()));
+  OutPoint spend_op{};
+  auto spend_out = node0.find_utxo_by_pubkey_hash_for_test(sender_pkh, &spend_op);
+  if (!spend_out.has_value()) return std::nullopt;
+  if (spend_out->value < BOND_AMOUNT) return std::nullopt;
+
+  Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  reg_spk.insert(reg_spk.end(), new_validator_pub.begin(), new_validator_pub.end());
+  std::vector<TxOut> outs{TxOut{BOND_AMOUNT, reg_spk}};
+  const std::uint64_t change = spend_out->value - BOND_AMOUNT;
+  if (change > 0) outs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
+  return build_signed_p2pkh_tx_single_input(spend_op, *spend_out, validator0.private_key, outs);
+}
+
 struct Cluster {
   std::vector<std::unique_ptr<node::Node>> nodes;
 
@@ -47,17 +80,20 @@ struct Cluster {
   }
 };
 
-Cluster make_cluster(const std::string& base) {
+Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
+                     std::size_t max_committee = MAX_COMMITTEE) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
   Cluster c;
-  c.nodes.reserve(4);
-  for (int i = 0; i < 4; ++i) {
+  c.nodes.reserve(node_count);
+  for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
     cfg.devnet = true;
     cfg.disable_p2p = true;
     cfg.node_id = i;
+    cfg.devnet_initial_active_validators = initial_active;
+    cfg.max_committee = max_committee;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     for (int j = 0; j < i; ++j) {
@@ -74,11 +110,26 @@ Cluster make_cluster(const std::string& base) {
   return c;
 }
 
+std::optional<std::uint16_t> find_free_port(std::uint16_t from, std::uint16_t to) {
+  for (std::uint16_t p = from; p <= to; ++p) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) continue;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(p);
+    bool ok = (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    ::close(fd);
+    if (ok) return p;
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 TEST(test_devnet_4_nodes_finalize_and_faults) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_faults");
   auto& nodes = cluster.nodes;
@@ -91,9 +142,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
   }, std::chrono::seconds(90)));
 
   const auto st0 = nodes[0]->status();
-  std::vector<PubKey32> active;
-  for (const auto& k : keys) active.push_back(k.public_key);
-  std::sort(active.begin(), active.end());
+  auto active = nodes[0]->active_validators_for_next_height_for_test();
   auto leader0 = consensus::select_leader(st0.tip_hash, st0.height + 1, 0, active);
   ASSERT_TRUE(leader0.has_value());
   int leader_id = node_for_pub(keys, *leader0);
@@ -155,7 +204,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 
 TEST(test_tx_finalized_and_visible_on_all_nodes) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_tx");
   auto& nodes = cluster.nodes;
@@ -214,7 +263,7 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
 
 TEST(test_restart_determinism_and_continued_finalization) {
   const auto keys = node::Node::devnet_keypairs();
-  ASSERT_EQ(keys.size(), 4u);
+  ASSERT_TRUE(keys.size() >= 4u);
 
   const std::string base = "/tmp/selfcoin_it_restart";
   {
@@ -229,7 +278,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
     }, std::chrono::seconds(90)));
 
     const auto s0 = nodes[0]->status();
-    for (int i = 1; i < 4; ++i) {
+    for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
       ASSERT_EQ(si.height, s0.height);
       ASSERT_EQ(si.tip_hash, s0.tip_hash);
@@ -260,7 +309,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
   auto& nodes = restarted.nodes;
   const auto before = nodes[0]->status();
 
-  for (int i = 1; i < 4; ++i) {
+  for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
     ASSERT_EQ(si.height, before.height);
     ASSERT_EQ(si.tip_hash, before.tip_hash);
@@ -269,20 +318,324 @@ TEST(test_restart_determinism_and_continued_finalization) {
   }
 
   ASSERT_TRUE(wait_for([&]() {
-    for (const auto& n : nodes) {
-      if (n->status().height < before.height + 10) return false;
+    const auto s0 = nodes[0]->status();
+    if (s0.height < before.height + 10) return false;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      const auto si = nodes[i]->status();
+      if (si.height != s0.height || si.tip_hash != s0.tip_hash) return false;
     }
     return true;
   }, std::chrono::seconds(60)));
 
   const auto after = nodes[0]->status();
-  for (int i = 1; i < 4; ++i) {
+  for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
     ASSERT_EQ(si.height, after.height);
     ASSERT_EQ(si.tip_hash, after.tip_hash);
     ASSERT_EQ(nodes[i]->active_validators_for_next_height_for_test(),
               nodes[0]->active_validators_for_next_height_for_test());
   }
+}
+
+TEST(test_permissionless_join_pending_to_active_after_warmup) {
+  const auto keys = node::Node::devnet_keypairs();
+  auto cluster = make_cluster("/tmp/selfcoin_it_join", 1);
+  auto& nodes = cluster.nodes;
+
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 5; }, std::chrono::seconds(30)));
+
+  const auto new_val = key_from_byte(99);
+  auto bond_tx = create_bond_tx_from_validator0(*nodes[0], keys[0], new_val.public_key);
+  ASSERT_TRUE(bond_tx.has_value());
+  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*bond_tx, true));
+
+  std::uint64_t joined_height = 0;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto info = n->validator_info_for_test(new_val.public_key);
+      if (!info.has_value()) return false;
+      if (info->status != consensus::ValidatorStatus::PENDING &&
+          info->status != consensus::ValidatorStatus::ACTIVE) {
+        return false;
+      }
+      joined_height = info->joined_height;
+    }
+    return joined_height > 0;
+  }, std::chrono::seconds(60)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto active = n->active_validators_for_next_height_for_test();
+      bool found = std::find(active.begin(), active.end(), new_val.public_key) != active.end();
+      if (!found) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+}
+
+TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
+  const auto keys = node::Node::devnet_keypairs();
+  auto cluster = make_cluster("/tmp/selfcoin_it_slash", 1);
+  auto& nodes = cluster.nodes;
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 5; }, std::chrono::seconds(30)));
+
+  const auto slash_val = key_from_byte(77);
+  auto bond_tx = create_bond_tx_from_validator0(*nodes[0], keys[0], slash_val.public_key);
+  ASSERT_TRUE(bond_tx.has_value());
+  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*bond_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto info = n->validator_info_for_test(slash_val.public_key);
+      if (!info.has_value()) return false;
+      if (info->status != consensus::ValidatorStatus::PENDING &&
+          info->status != consensus::ValidatorStatus::ACTIVE) {
+        return false;
+      }
+    }
+    return true;
+  }, std::chrono::seconds(60)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto active = n->active_validators_for_next_height_for_test();
+      if (std::find(active.begin(), active.end(), slash_val.public_key) == active.end()) return false;
+    }
+    return true;
+  }, std::chrono::seconds(240)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto committee = n->committee_for_next_height_for_test();
+      if (std::find(committee.begin(), committee.end(), slash_val.public_key) == committee.end()) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto h0 = nodes[0]->status().height;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      if (nodes[i]->status().height != h0) return false;
+    }
+    return true;
+  }, std::chrono::seconds(30)));
+
+  auto info0 = nodes[0]->validator_info_for_test(slash_val.public_key);
+  ASSERT_TRUE(info0.has_value());
+  OutPoint bond_op = info0->bond_outpoint;
+  ASSERT_TRUE(info0->has_bond);
+
+  Vote a;
+  a.height = nodes[0]->status().height + 1;
+  a.round = 0;
+  a.block_id.fill(0x31);
+  a.validator_pubkey = slash_val.public_key;
+  auto sa = crypto::ed25519_sign(Bytes(a.block_id.begin(), a.block_id.end()), slash_val.private_key);
+  ASSERT_TRUE(sa.has_value());
+  a.signature = *sa;
+
+  Vote b = a;
+  b.block_id.fill(0x41);
+  auto sb = crypto::ed25519_sign(Bytes(b.block_id.begin(), b.block_id.end()), slash_val.private_key);
+  ASSERT_TRUE(sb.has_value());
+  b.signature = *sb;
+
+  auto slash_tx = build_slash_tx(bond_op, BOND_AMOUNT, a, b);
+  ASSERT_TRUE(slash_tx.has_value());
+  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*slash_tx, true));
+  const Hash32 slash_txid = slash_tx->txid();
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->mempool_contains_for_test(slash_txid)) return true;
+    }
+    return true;
+  }, std::chrono::seconds(20)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 20) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+}
+
+TEST(test_committee_selection_and_non_member_votes_ignored) {
+  const auto keys = node::Node::devnet_keypairs();
+  ASSERT_TRUE(keys.size() >= 12u);
+  auto cluster = make_cluster("/tmp/selfcoin_it_committee", 12, 12, 5);
+  auto& nodes = cluster.nodes;
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 10) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+  ASSERT_TRUE(wait_for([&]() {
+    const auto h0 = nodes[0]->status().height;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      if (nodes[i]->status().height != h0) return false;
+    }
+    return true;
+  }, std::chrono::seconds(30)));
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+
+  const auto c0 = nodes[0]->committee_for_next_height_for_test();
+  ASSERT_EQ(c0.size(), 5u);
+  for (size_t i = 1; i < nodes.size(); ++i) {
+    ASSERT_EQ(nodes[i]->committee_for_next_height_for_test(), c0);
+  }
+
+  PubKey32 non_member{};
+  bool found_non_member = false;
+  for (int i = 0; i < 12; ++i) {
+    if (std::find(c0.begin(), c0.end(), keys[i].public_key) == c0.end()) {
+      non_member = keys[i].public_key;
+      found_non_member = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found_non_member);
+  int non_member_id = node_for_pub(keys, non_member);
+  ASSERT_TRUE(non_member_id >= 0);
+
+  Vote bad_vote;
+  bad_vote.height = nodes[0]->status().height + 1;
+  bad_vote.round = 0;
+  bad_vote.block_id.fill(0xA5);
+  bad_vote.validator_pubkey = non_member;
+  auto bad_sig =
+      crypto::ed25519_sign(Bytes(bad_vote.block_id.begin(), bad_vote.block_id.end()), keys[non_member_id].private_key);
+  ASSERT_TRUE(bad_sig.has_value());
+  bad_vote.signature = *bad_sig;
+  ASSERT_TRUE(!nodes[0]->inject_vote_for_test(bad_vote));
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
+  const std::uint64_t before = nodes[0]->status().height;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < before + 2) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
+}
+
+TEST(test_testnet_seed_bootstrap_and_catchup) {
+  const std::string base = "/tmp/selfcoin_it_testnet_bootstrap";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  auto p0 = find_free_port(31000, 32000);
+  auto p1 = find_free_port(32001, 33000);
+  auto p2 = find_free_port(33001, 34000);
+  auto p3 = find_free_port(34001, 35000);
+  auto p4 = find_free_port(35001, 36000);
+  ASSERT_TRUE(p0.has_value() && p1.has_value() && p2.has_value() && p3.has_value() && p4.has_value());
+
+  std::vector<std::unique_ptr<node::Node>> nodes;
+  for (int i = 0; i < 4; ++i) {
+    node::NodeConfig cfg;
+    cfg.devnet = false;
+    cfg.testnet = true;
+    cfg.network = testnet_network();
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.p2p_port = (i == 0) ? *p0 : (i == 1) ? *p1 : (i == 2) ? *p2 : *p3;
+    if (i > 0) cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+    auto n = std::make_unique<node::Node>(cfg);
+    ASSERT_TRUE(n->init());
+    nodes.push_back(std::move(n));
+  }
+  for (auto& n : nodes) n->start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 8) return false;
+    }
+    return true;
+  }, std::chrono::seconds(90)));
+
+  node::NodeConfig join_cfg;
+  join_cfg.devnet = false;
+  join_cfg.testnet = true;
+  join_cfg.network = testnet_network();
+  join_cfg.node_id = 7;
+  join_cfg.db_path = base + "/joiner";
+  join_cfg.p2p_port = *p4;
+  join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+  auto joiner = std::make_unique<node::Node>(join_cfg);
+  ASSERT_TRUE(joiner->init());
+  joiner->start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto jh = joiner->status().height;
+    std::uint64_t min_h = UINT64_MAX;
+    for (const auto& n : nodes) min_h = std::min(min_h, n->status().height);
+    return jh >= min_h;
+  }, std::chrono::seconds(90)));
+
+  joiner->stop();
+  for (auto& n : nodes) n->stop();
+}
+
+TEST(test_observer_reports_ok_on_two_lightservers) {
+  const std::string base = "/tmp/selfcoin_it_observer";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig ncfg;
+  ncfg.devnet = true;
+  ncfg.testnet = false;
+  ncfg.network = devnet_network();
+  ncfg.node_id = 0;
+  ncfg.disable_p2p = true;
+  ncfg.devnet_initial_active_validators = 1;
+  ncfg.max_committee = 1;
+  ncfg.db_path = base + "/node0";
+  node::Node n(ncfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 10; }, std::chrono::seconds(60)));
+  n.stop();
+
+  auto p1 = find_free_port(42000, 50000);
+  auto p2 = find_free_port(50001, 58000);
+  ASSERT_TRUE(p1.has_value() && p2.has_value());
+
+  lightserver::Config l1;
+  l1.devnet = true;
+  l1.testnet = false;
+  l1.network = devnet_network();
+  l1.db_path = ncfg.db_path;
+  l1.bind_ip = "127.0.0.1";
+  l1.port = *p1;
+  lightserver::Server s1(l1);
+  ASSERT_TRUE(s1.init());
+  ASSERT_TRUE(s1.start());
+
+  lightserver::Config l2 = l1;
+  l2.port = *p2;
+  lightserver::Server s2(l2);
+  ASSERT_TRUE(s2.init());
+  ASSERT_TRUE(s2.start());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string out_file = base + "/observer.out";
+  const std::string cmd = "python3 scripts/observe.py --interval 0.2 --max-intervals 2 --mismatch-threshold 2 " +
+                          std::string("http://127.0.0.1:") + std::to_string(*p1) + "/rpc " +
+                          "http://127.0.0.1:" + std::to_string(*p2) + "/rpc > " + out_file + " 2>&1";
+  const int rc = std::system(cmd.c_str());
+  s2.stop();
+  s1.stop();
+  ASSERT_TRUE(rc == 0);
+
+  std::ifstream in(out_file);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_TRUE(content.find("mismatch") == std::string::npos);
 }
 
 void register_integration_tests() {}

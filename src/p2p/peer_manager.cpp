@@ -9,6 +9,12 @@
 
 namespace selfcoin::p2p {
 
+void PeerManager::configure_network(std::uint32_t magic, std::uint16_t proto_version, std::size_t max_payload_len) {
+  magic_ = magic;
+  proto_version_ = proto_version;
+  max_payload_len_ = max_payload_len;
+}
+
 bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port) {
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) return false;
@@ -100,7 +106,7 @@ void PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payl
     p = it->second;
   }
   std::lock_guard<std::mutex> wl(p->write_mu);
-  write_frame_fd(p->fd, Frame{msg_type, payload});
+  write_frame_fd(p->fd, Frame{msg_type, payload}, magic_, proto_version_);
 }
 
 void PeerManager::broadcast(std::uint16_t msg_type, const Bytes& payload) {
@@ -179,7 +185,7 @@ void PeerManager::read_loop(int peer_id) {
   }
 
   while (running_) {
-    auto frame = read_frame_fd(p->fd);
+    auto frame = read_frame_fd(p->fd, max_payload_len_, magic_, proto_version_);
     if (!frame.has_value()) break;
     if (on_message_) on_message_(peer_id, frame->msg_type, frame->payload);
   }

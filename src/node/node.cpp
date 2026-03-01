@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <sstream>
 
@@ -20,6 +23,11 @@ namespace {
 constexpr std::size_t kMaxBlockTxs = 1000;
 constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
 constexpr std::uint32_t kTxRatePerSec = 100;
+
+std::string short_pub_hex(const PubKey32& pub) {
+  Bytes b(pub.begin(), pub.begin() + 4);
+  return hex_encode(b);
+}
 
 Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
   std::string msg = "cb:" + std::to_string(h) + ":" + std::to_string(r);
@@ -39,7 +47,7 @@ Node::~Node() { stop(); }
 
 std::vector<crypto::KeyPair> Node::devnet_keypairs() {
   std::vector<crypto::KeyPair> out;
-  for (int i = 1; i <= 4; ++i) {
+  for (int i = 1; i <= 16; ++i) {
     std::array<std::uint8_t, 32> seed{};
     for (size_t j = 0; j < seed.size(); ++j) seed[j] = static_cast<std::uint8_t>(i * 19 + j);
     auto kp = crypto::keypair_from_seed32(seed);
@@ -49,6 +57,8 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 }
 
 bool Node::init() {
+  if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
+  if (cfg_.p2p_port == 0) cfg_.p2p_port = cfg_.network.p2p_default_port;
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
@@ -58,18 +68,27 @@ bool Node::init() {
     return false;
   }
 
-  if (cfg_.devnet) {
+  {
     const auto keys = devnet_keypairs();
-    if (cfg_.node_id < 0 || cfg_.node_id >= static_cast<int>(keys.size())) {
-      std::cerr << "invalid node_id " << cfg_.node_id << "\n";
+    if (keys.empty()) {
+      std::cerr << "no key material available\n";
       return false;
     }
-    local_key_ = keys[cfg_.node_id];
+    const int safe_node_id = std::max(0, cfg_.node_id);
+    local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
 
-    if (validators_.all().empty()) {
-      for (const auto& kp : keys) {
-        validators_.upsert(kp.public_key, consensus::ValidatorInfo{consensus::ValidatorStatus::ACTIVE, 0});
-        db_.put_validator(kp.public_key, consensus::ValidatorInfo{consensus::ValidatorStatus::ACTIVE, 0});
+    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet)) {
+      const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
+      for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
+        const auto& kp = keys[idx];
+        consensus::ValidatorInfo vi;
+        vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
+        vi.joined_height = 0;
+        vi.has_bond = (idx < n_active);
+        vi.bond_outpoint = OutPoint{zero_hash(), 0};
+        vi.unbond_height = 0;
+        validators_.upsert(kp.public_key, vi);
+        db_.put_validator(kp.public_key, vi);
       }
     }
     is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
@@ -77,7 +96,15 @@ bool Node::init() {
 
   round_started_ms_ = now_unix() * 1000;
 
+  load_persisted_peers();
+  for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
+  for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
+  if (cfg_.testnet && cfg_.seeds.empty()) {
+    for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
+  }
+
   if (!cfg_.disable_p2p) {
+    p2p_.configure_network(cfg_.network.magic, cfg_.network.protocol_version, cfg_.network.max_payload_len);
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
     });
@@ -85,17 +112,7 @@ bool Node::init() {
       std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
       return false;
     }
-    for (const auto& peer : cfg_.peers) {
-      const auto pos = peer.find(':');
-      if (pos == std::string::npos) continue;
-      const std::string host = peer.substr(0, pos);
-      const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
-      if (p2p_.connect_to(host, port)) {
-        for (int pid : p2p_.peer_ids()) {
-          send_version(pid);
-        }
-      }
-    }
+    try_connect_bootstrap_peers();
   }
 
   return true;
@@ -113,6 +130,7 @@ void Node::start() {
 void Node::stop() {
   if (!running_.exchange(false)) return;
   if (loop_thread_.joinable()) loop_thread_.join();
+  persist_peers();
   p2p_.stop();
   if (cfg_.disable_p2p) {
     std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -130,6 +148,9 @@ NodeStatus Node::status() const {
   auto leader = consensus::select_leader(finalized_hash_, finalized_height_ + 1, current_round_, active);
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
+  s.peers = peer_count();
+  s.mempool_size = mempool_.size();
+  s.committee_size = committee_for_height(finalized_height_ + 1).size();
   return s;
 }
 
@@ -137,6 +158,11 @@ bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, fal
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
+  mempool_.set_validation_context(
+      SpecialValidationContext{&validators_, finalized_height_ + 1,
+                               [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+                                 return is_committee_member_for(pub, h, round);
+                               }});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -175,6 +201,14 @@ std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return validators_.active_sorted(finalized_height_ + 1);
 }
+std::vector<PubKey32> Node::committee_for_next_height_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return committee_for_height(finalized_height_ + 1);
+}
+std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return validators_.get(pub);
+}
 
 void Node::event_loop() {
   while (running_) {
@@ -183,14 +217,40 @@ void Node::event_loop() {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
+      mempool_.set_validation_context(
+          SpecialValidationContext{&validators_, h, [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
+                                     return is_committee_member_for(pub, ch, round);
+                                   }});
       const auto active = validators_.active_sorted(h);
+      const auto committee = consensus::select_committee(finalized_hash_, h, active, cfg_.max_committee);
       const auto leader = consensus::select_leader(finalized_hash_, h, current_round_, active);
+      const std::size_t quorum = consensus::quorum_threshold(committee.size());
 
       const std::uint64_t now_ms = now_unix() * 1000;
-      if (now_ms > round_started_ms_ + ROUND_TIMEOUT_MS) {
+      if (now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
         ++current_round_;
         round_started_ms_ = now_ms;
         log_line("round-timeout height=" + std::to_string(h) + " new_round=" + std::to_string(current_round_));
+      }
+
+      const auto hr = std::make_pair(h, current_round_);
+      if (logged_committee_rounds_.insert(hr).second) {
+        std::ostringstream coss;
+        coss << "committee height=" << h << " round=" << current_round_ << " size=" << committee.size()
+             << " quorum=" << quorum << " members=";
+        for (std::size_t i = 0; i < committee.size(); ++i) {
+          if (i) coss << ",";
+          coss << short_pub_hex(committee[i]);
+        }
+        log_line(coss.str());
+        if (cfg_.log_json) {
+          std::ostringstream j;
+          j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
+            << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
+            << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
+            << ",\"committee_size\":" << committee.size() << "}";
+          std::cout << j.str() << "\n";
+        }
       }
 
       if (!pause_proposals_ && leader.has_value() && *leader == local_key_.public_key) {
@@ -214,6 +274,13 @@ void Node::event_loop() {
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!cfg_.disable_p2p && cfg_.testnet) {
+      const std::uint64_t now_ms = now_unix() * 1000;
+      if (peer_count() == 0 && now_ms > last_seed_attempt_ms_ + 3000) {
+        try_connect_bootstrap_peers();
+        last_seed_attempt_ms_ = now_ms;
+      }
+    }
   }
 }
 
@@ -237,7 +304,7 @@ void Node::maybe_send_verack(int peer_id) {
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {
   if (msg_type == p2p::MsgType::VERSION) {
     auto v = p2p::de_version(payload);
-    if (!v.has_value() || v->proto_version != PROTOCOL_VERSION) return;
+    if (!v.has_value() || v->proto_version != cfg_.network.protocol_version) return;
     p2p_.mark_handshake_rx(peer_id, true, false);
 
     auto info = p2p_.get_peer_info(peer_id);
@@ -291,12 +358,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       std::lock_guard<std::mutex> lk(mu_);
       if (blk->header.height == finalized_height_ + 1 && blk->header.prev_finalized_hash == finalized_hash_) {
         const auto bid = blk->header.block_id();
-        const auto active = validators_.active_sorted(blk->header.height);
-        const std::size_t quorum = consensus::quorum_threshold(active.size());
+        const auto committee = committee_for_height(blk->header.height);
+        if (committee.empty()) return;
+        const std::size_t quorum = consensus::quorum_threshold(committee.size());
+        std::set<PubKey32> committee_set(committee.begin(), committee.end());
         std::set<PubKey32> seen;
         std::size_t valid_sigs = 0;
         for (const auto& s : blk->finality_proof.sigs) {
-          if (!validators_.is_active_for_height(s.validator_pubkey, blk->header.height)) continue;
+          if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
           if (!seen.insert(s.validator_pubkey).second) continue;
           Bytes bid_bytes(bid.begin(), bid.end());
           if (!crypto::ed25519_verify(bid_bytes, s.signature, s.validator_pubkey)) continue;
@@ -308,9 +377,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             confirmed_txids.reserve(blk->txs.size());
             for (const auto& tx : blk->txs) confirmed_txids.push_back(tx.txid());
             mempool_.remove_confirmed(confirmed_txids);
+            UtxoSet pre_utxos = utxos_;
+            apply_validator_state_changes(*blk, pre_utxos, blk->header.height);
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
-            apply_validator_registrations(*blk, blk->header.height);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             current_round_ = 0;
@@ -380,13 +450,17 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto merkle_root = merkle::compute_merkle_root_from_txs(tx_bytes);
     if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) return false;
 
-    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD);
+    SpecialValidationContext vctx{&validators_, msg.height,
+                                  [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+                                    return is_committee_member_for(pub, h, round);
+                                  }};
+    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx);
     if (!valid.ok) return false;
 
     Hash32 bid = blk->header.block_id();
     candidate_blocks_[bid] = *blk;
 
-    if (validators_.is_active_for_height(local_key_.public_key, msg.height)) {
+    if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       Bytes b_id(bid.begin(), bid.end());
       auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
       if (!sig.has_value()) return false;
@@ -408,17 +482,21 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
 bool Node::handle_vote(const Vote& vote, bool from_network) {
   std::lock_guard<std::mutex> lk(mu_);
   if (vote.height != finalized_height_ + 1) return false;
-  if (!validators_.is_active_for_height(vote.validator_pubkey, vote.height)) return false;
+  if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
 
   Bytes bid(vote.block_id.begin(), vote.block_id.end());
   if (!crypto::ed25519_verify(bid, vote.signature, vote.validator_pubkey)) return false;
 
   auto tr = votes_.add_vote(vote);
   if (tr.equivocation && tr.evidence.has_value()) {
-    validators_.ban(vote.validator_pubkey);
-    db_.put_validator(vote.validator_pubkey, consensus::ValidatorInfo{consensus::ValidatorStatus::BANNED, vote.height});
-    log_line("equivocation-banned validator=" + hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
-             " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
+    if (is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
+      validators_.ban(vote.validator_pubkey);
+      auto vi = validators_.get(vote.validator_pubkey);
+      if (vi.has_value()) db_.put_validator(vote.validator_pubkey, *vi);
+      log_line("equivocation-banned validator=" +
+               hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
+               " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
+    }
   }
 
   if (!tr.accepted) return tr.duplicate;
@@ -434,6 +512,11 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
+    mempool_.set_validation_context(
+        SpecialValidationContext{&validators_, finalized_height_ + 1,
+                                 [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+                                   return is_committee_member_for(pub, h, round);
+                                 }});
     std::string err;
     if (!mempool_.accept_tx(tx, utxos_, &err)) {
       return false;
@@ -451,14 +534,16 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (blk_it == candidate_blocks_.end()) return false;
 
   auto sigs = votes_.signatures_for(height, round, block_id);
-  const auto active = validators_.active_sorted(height);
-  const std::size_t quorum = consensus::quorum_threshold(active.size());
+  const auto committee = committee_for_height(height);
+  if (committee.empty()) return false;
+  const std::size_t quorum = consensus::quorum_threshold(committee.size());
+  std::set<PubKey32> committee_set(committee.begin(), committee.end());
   if (sigs.size() < quorum) return false;
 
   std::set<PubKey32> seen;
   std::vector<FinalitySig> filtered;
   for (const auto& s : sigs) {
-    if (!validators_.is_active_for_height(s.validator_pubkey, height)) continue;
+    if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(s.validator_pubkey).second) continue;
     Bytes bid(block_id.begin(), block_id.end());
     if (!crypto::ed25519_verify(bid, s.signature, s.validator_pubkey)) continue;
@@ -475,9 +560,10 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   confirmed_txids.reserve(b.txs.size());
   for (const auto& tx : b.txs) confirmed_txids.push_back(tx.txid());
   mempool_.remove_confirmed(confirmed_txids);
+  UtxoSet pre_utxos = utxos_;
+  apply_validator_state_changes(b, pre_utxos, height);
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
-  apply_validator_registrations(b, height);
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
@@ -526,8 +612,12 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   }
 
   std::uint64_t total_fees = 0;
+  SpecialValidationContext vctx{&validators_, height, [this](const PubKey32& pub, std::uint64_t h,
+                                                             std::uint32_t round) {
+                                  return is_committee_member_for(pub, h, round);
+                                }};
   for (const auto& tx : picked) {
-    auto vr = validate_tx(tx, 1, utxos_);
+    auto vr = validate_tx(tx, 1, utxos_, &vctx);
     if (vr.ok) total_fees += vr.fee;
   }
 
@@ -634,18 +724,36 @@ bool Node::persist_finalized_block(const Block& block) {
   if (!db_.set_height_hash(block.header.height, h)) return false;
   if (!db_.set_tip(storage::TipState{block.header.height, h})) return false;
 
-  // Persist UTXOs for finalized state.
+  // Persist tx index + UTXOs + lightserver indexes for finalized state.
+  for (std::uint32_t tx_i = 0; tx_i < block.txs.size(); ++tx_i) {
+    const auto& tx = block.txs[tx_i];
+    if (!db_.put_tx_index(tx.txid(), block.header.height, tx_i, tx.serialize())) return false;
+  }
+
   if (block.txs.size() > 1) {
     for (size_t i = 1; i < block.txs.size(); ++i) {
+      const auto spending_txid = block.txs[i].txid();
       for (const auto& in : block.txs[i].inputs) {
-        db_.erase_utxo(OutPoint{in.prev_txid, in.prev_index});
+        const OutPoint op{in.prev_txid, in.prev_index};
+        auto prev = utxos_.find(op);
+        if (prev != utxos_.end()) {
+          const Hash32 sh = crypto::sha256(prev->second.out.script_pubkey);
+          if (!db_.erase_script_utxo(sh, op)) return false;
+          if (!db_.add_script_history(sh, block.header.height, spending_txid)) return false;
+        }
+        if (!db_.erase_utxo(op)) return false;
       }
     }
   }
   for (const auto& tx : block.txs) {
     const Hash32 txid = tx.txid();
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      db_.put_utxo(OutPoint{txid, out_i}, tx.outputs[out_i]);
+      const OutPoint op{txid, out_i};
+      const auto& out = tx.outputs[out_i];
+      const Hash32 sh = crypto::sha256(out.script_pubkey);
+      if (!db_.put_utxo(op, out)) return false;
+      if (!db_.put_script_utxo(sh, op, out, block.header.height)) return false;
+      if (!db_.add_script_history(sh, block.header.height, txid)) return false;
     }
   }
   return true;
@@ -667,16 +775,134 @@ bool Node::load_state() {
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
 
+  if (validators_.all().empty() && finalized_height_ > 0) {
+    UtxoSet replay_utxos;
+    for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) continue;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) continue;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) continue;
+      apply_validator_state_changes(*blk, replay_utxos, h);
+      apply_block_to_utxo(*blk, replay_utxos);
+    }
+  }
+
   return true;
 }
 
-void Node::apply_validator_registrations(const Block& block, std::uint64_t height) {
-  for (const auto& tx : block.txs) {
-    for (const auto& out : tx.outputs) {
+std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
+  if (height == 0) return {};
+  if (height == finalized_height_ + 1) {
+    const auto active = validators_.active_sorted(height);
+    return consensus::select_committee(finalized_hash_, height, active, cfg_.max_committee);
+  }
+  if (height > finalized_height_) return {};
+
+  consensus::ValidatorRegistry replay_validators;
+  UtxoSet replay_utxos;
+
+  if (cfg_.devnet || cfg_.testnet) {
+    const auto keys = devnet_keypairs();
+    const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
+    for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
+      consensus::ValidatorInfo vi;
+      vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
+      vi.joined_height = 0;
+      vi.has_bond = (idx < n_active);
+      vi.bond_outpoint = OutPoint{zero_hash(), 0};
+      vi.unbond_height = 0;
+      replay_validators.upsert(keys[idx].public_key, vi);
+    }
+  }
+
+  auto apply_changes = [&](const Block& block, std::uint64_t h) {
+    for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+      const auto& tx = block.txs[txi];
+      for (const auto& in : tx.inputs) {
+        OutPoint op{in.prev_txid, in.prev_index};
+        auto it = replay_utxos.find(op);
+        if (it == replay_utxos.end()) continue;
+        PubKey32 pub{};
+        if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+
+        SlashEvidence evidence;
+        if (parse_slash_script_sig(in.script_sig, &evidence)) {
+          replay_validators.ban(pub);
+        } else {
+          replay_validators.request_unbond(pub, h);
+        }
+      }
+    }
+
+    for (const auto& tx : block.txs) {
+      const Hash32 txid = tx.txid();
+      for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+        const auto& out = tx.outputs[out_i];
+        PubKey32 pub{};
+        if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
+          replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+        }
+      }
+    }
+    replay_validators.advance_height(h + 1);
+  };
+
+  for (std::uint64_t h = 1; h <= height - 1; ++h) {
+    auto bh = db_.get_height_hash(h);
+    if (!bh.has_value()) return {};
+    auto bb = db_.get_block(*bh);
+    if (!bb.has_value()) return {};
+    auto blk = Block::parse(*bb);
+    if (!blk.has_value()) return {};
+    apply_changes(*blk, h);
+    apply_block_to_utxo(*blk, replay_utxos);
+  }
+
+  Hash32 prev_hash = zero_hash();
+  if (height > 1) {
+    auto prev = db_.get_height_hash(height - 1);
+    if (!prev.has_value()) return {};
+    prev_hash = *prev;
+  }
+  const auto active = replay_validators.active_sorted(height);
+  return consensus::select_committee(prev_hash, height, active, cfg_.max_committee);
+}
+
+bool Node::is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const {
+  (void)round;
+  const auto committee = committee_for_height(height);
+  return std::find(committee.begin(), committee.end(), pub) != committee.end();
+}
+
+void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
+  for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    for (const auto& in : tx.inputs) {
+      OutPoint op{in.prev_txid, in.prev_index};
+      auto it = pre_utxos.find(op);
+      if (it == pre_utxos.end()) continue;
+      PubKey32 pub{};
+      if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        validators_.ban(pub);
+      } else {
+        validators_.request_unbond(pub, height);
+      }
+    }
+  }
+
+  for (size_t txi = 0; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-        validators_.register_pending(pub, height);
-        db_.put_validator(pub, consensus::ValidatorInfo{consensus::ValidatorStatus::PENDING, height});
+        validators_.register_bond(pub, OutPoint{txid, out_i}, height);
       }
     }
   }
@@ -693,11 +919,61 @@ std::uint64_t Node::now_unix() const {
 }
 
 void Node::log_line(const std::string& s) const {
+  if (cfg_.log_json) {
+    std::cout << "{\"type\":\"log\",\"node_id\":" << cfg_.node_id << ",\"network\":\"" << cfg_.network.name
+              << "\",\"msg\":\"" << s << "\"}\n";
+    return;
+  }
   std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
 }
 
+void Node::load_persisted_peers() {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "peers.dat";
+  std::ifstream in(p);
+  if (!in.good()) return;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    cfg_.peers.push_back(line);
+  }
+}
+
+void Node::persist_peers() const {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "peers.dat";
+  std::ofstream out(p, std::ios::trunc);
+  if (!out.good()) return;
+
+  std::set<std::string> seen;
+  for (const auto& ep : cfg_.peers) seen.insert(ep);
+  for (const auto& ep : cfg_.seeds) seen.insert(ep);
+  for (int id : p2p_.peer_ids()) {
+    auto pi = p2p_.get_peer_info(id);
+    if (!pi.endpoint.empty()) seen.insert(pi.endpoint);
+  }
+  for (const auto& ep : seen) out << ep << "\n";
+}
+
+void Node::try_connect_bootstrap_peers() {
+  std::set<std::string> uniq(bootstrap_peers_.begin(), bootstrap_peers_.end());
+  for (const auto& peer : uniq) {
+    const auto pos = peer.find(':');
+    if (pos == std::string::npos) continue;
+    const std::string host = peer.substr(0, pos);
+    const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+    if (!p2p_.connect_to(host, port)) continue;
+    for (int pid : p2p_.peer_ids()) send_version(pid);
+  }
+}
+
+std::size_t Node::peer_count() const { return static_cast<std::size_t>(p2p_.peer_ids().size()); }
+
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
+  cfg.network = devnet_network();
+  cfg.p2p_port = cfg.network.p2p_default_port;
+  cfg.max_committee = cfg.network.max_committee;
+  bool port_explicit = false;
+  bool committee_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -711,6 +987,16 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
 
     if (a == "--devnet") {
       cfg.devnet = true;
+      cfg.testnet = false;
+      cfg.network = devnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--testnet") {
+      cfg.testnet = true;
+      cfg.devnet = false;
+      cfg.network = testnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -719,6 +1005,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.p2p_port = static_cast<std::uint16_t>(std::stoi(*v));
+      port_explicit = true;
     } else if (a == "--db") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -733,6 +1020,25 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       }
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--seeds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      std::stringstream ss(*v);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        if (!item.empty()) cfg.seeds.push_back(item);
+      }
+    } else if (a == "--devnet-initial-active") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.devnet_initial_active_validators = std::stoi(*v);
+    } else if (a == "--max-committee") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
+      committee_explicit = true;
+    } else if (a == "--log-json") {
+      cfg.log_json = true;
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

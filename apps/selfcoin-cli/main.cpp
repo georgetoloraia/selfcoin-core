@@ -87,6 +87,14 @@ std::optional<std::array<std::uint8_t, 32>> decode_hex32(const std::string& hex)
   return out;
 }
 
+std::optional<std::array<std::uint8_t, 64>> decode_hex64(const std::string& hex) {
+  auto b = selfcoin::hex_decode(hex);
+  if (!b.has_value() || b->size() != 64) return std::nullopt;
+  std::array<std::uint8_t, 64> out{};
+  std::copy(b->begin(), b->end(), out.begin());
+  return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -96,6 +104,9 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp tsc]\n"
               << "  selfcoin-cli address_from_pubkey --hrp <sc|tsc> --pubkey <hex32>\n"
               << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
+              << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
+              << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
               << "  selfcoin-cli broadcast_tx --host <ip> --port <p> --tx-hex <hex>\n";
     return 1;
   }
@@ -254,6 +265,165 @@ int main(int argc, char** argv) {
       return 1;
     }
 
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "create_validator_bond_tx") {
+    std::string prev_txid_hex;
+    std::uint32_t prev_index = 0;
+    std::uint64_t prev_value = 0;
+    std::string from_priv_hex;
+    std::string change_addr;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto prev_txid = decode_hex32(prev_txid_hex);
+    auto priv = decode_hex32(from_priv_hex);
+    if (!prev_txid || !priv) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+    if (prev_value < selfcoin::BOND_AMOUNT + fee) {
+      std::cerr << "insufficient prev value for bond + fee\n";
+      return 1;
+    }
+
+    auto kp = selfcoin::crypto::keypair_from_seed32(*priv);
+    if (!kp) {
+      std::cerr << "invalid private key\n";
+      return 1;
+    }
+    auto from_pkh = selfcoin::crypto::h160(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end()));
+    selfcoin::OutPoint op{*prev_txid, prev_index};
+    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(from_pkh)};
+
+    selfcoin::Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+    reg_spk.insert(reg_spk.end(), kp->public_key.begin(), kp->public_key.end());
+    std::vector<selfcoin::TxOut> outputs{selfcoin::TxOut{selfcoin::BOND_AMOUNT, reg_spk}};
+
+    const std::uint64_t change = prev_value - selfcoin::BOND_AMOUNT - fee;
+    if (change > 0) {
+      if (!change_addr.empty()) {
+        auto ch = selfcoin::address::decode(change_addr);
+        if (!ch) {
+          std::cerr << "invalid change address\n";
+          return 1;
+        }
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash)});
+      } else {
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(from_pkh)});
+      }
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_signed_p2pkh_tx_single_input(op, prev_out, selfcoin::Bytes(priv->begin(), priv->end()), outputs, &err);
+    if (!tx) {
+      std::cerr << "create bond tx failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "create_unbond_tx") {
+    std::string bond_txid_hex;
+    std::uint32_t bond_index = 0;
+    std::uint64_t bond_value = selfcoin::BOND_AMOUNT;
+    std::string validator_pub_hex;
+    std::string validator_priv_hex;
+    std::uint64_t fee = 0;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
+      else if (a == "--bond-index" && i + 1 < argc) bond_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--bond-value" && i + 1 < argc) bond_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--validator-pubkey" && i + 1 < argc) validator_pub_hex = argv[++i];
+      else if (a == "--validator-privkey" && i + 1 < argc) validator_priv_hex = argv[++i];
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+    auto bond_txid = decode_hex32(bond_txid_hex);
+    auto pub = decode_hex32(validator_pub_hex);
+    auto priv = decode_hex32(validator_priv_hex);
+    if (!bond_txid || !pub || !priv) {
+      std::cerr << "invalid args\n";
+      return 1;
+    }
+
+    selfcoin::OutPoint op{*bond_txid, bond_index};
+    std::string err;
+    auto tx = selfcoin::build_unbond_tx(op, *pub, bond_value, fee, selfcoin::Bytes(priv->begin(), priv->end()), &err);
+    if (!tx) {
+      std::cerr << "create unbond tx failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "create_slash_tx") {
+    std::string bond_txid_hex;
+    std::uint32_t bond_index = 0;
+    std::uint64_t bond_value = selfcoin::BOND_AMOUNT;
+    selfcoin::Vote a, b;
+    std::string a_block_hex, a_pub_hex, a_sig_hex, b_block_hex, b_pub_hex, b_sig_hex;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string k = argv[i];
+      if (k == "--bond-txid" && i + 1 < argc) bond_txid_hex = argv[++i];
+      else if (k == "--bond-index" && i + 1 < argc) bond_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (k == "--bond-value" && i + 1 < argc) bond_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (k == "--a-height" && i + 1 < argc) a.height = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (k == "--a-round" && i + 1 < argc) a.round = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (k == "--a-block" && i + 1 < argc) a_block_hex = argv[++i];
+      else if (k == "--a-pub" && i + 1 < argc) a_pub_hex = argv[++i];
+      else if (k == "--a-sig" && i + 1 < argc) a_sig_hex = argv[++i];
+      else if (k == "--b-height" && i + 1 < argc) b.height = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (k == "--b-round" && i + 1 < argc) b.round = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (k == "--b-block" && i + 1 < argc) b_block_hex = argv[++i];
+      else if (k == "--b-pub" && i + 1 < argc) b_pub_hex = argv[++i];
+      else if (k == "--b-sig" && i + 1 < argc) b_sig_hex = argv[++i];
+      else if (k == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto bond_txid = decode_hex32(bond_txid_hex);
+    auto a_block = decode_hex32(a_block_hex);
+    auto a_pub = decode_hex32(a_pub_hex);
+    auto a_sig = decode_hex64(a_sig_hex);
+    auto b_block = decode_hex32(b_block_hex);
+    auto b_pub = decode_hex32(b_pub_hex);
+    auto b_sig = decode_hex64(b_sig_hex);
+    if (!bond_txid || !a_block || !a_pub || !a_sig || !b_block || !b_pub || !b_sig) {
+      std::cerr << "invalid slash args\n";
+      return 1;
+    }
+    a.block_id = *a_block;
+    a.validator_pubkey = *a_pub;
+    a.signature = *a_sig;
+    b.block_id = *b_block;
+    b.validator_pubkey = *b_pub;
+    b.signature = *b_sig;
+
+    selfcoin::OutPoint op{*bond_txid, bond_index};
+    std::string err;
+    auto tx = selfcoin::build_slash_tx(op, bond_value, a, b, fee, &err);
+    if (!tx) {
+      std::cerr << "create slash tx failed: " << err << "\n";
+      return 1;
+    }
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
     return 0;

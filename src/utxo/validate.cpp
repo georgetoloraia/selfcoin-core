@@ -9,6 +9,34 @@
 
 namespace selfcoin {
 
+namespace {
+
+void write_vote_fixed(codec::ByteWriter& w, const Vote& v) {
+  w.u64le(v.height);
+  w.u32le(v.round);
+  w.bytes_fixed(v.block_id);
+  w.bytes_fixed(v.validator_pubkey);
+  w.bytes_fixed(v.signature);
+}
+
+std::optional<Vote> read_vote_fixed(codec::ByteReader& r) {
+  Vote v;
+  auto h = r.u64le();
+  auto round = r.u32le();
+  auto bid = r.bytes_fixed<32>();
+  auto pub = r.bytes_fixed<32>();
+  auto sig = r.bytes_fixed<64>();
+  if (!h || !round || !bid || !pub || !sig) return std::nullopt;
+  v.height = *h;
+  v.round = *round;
+  v.block_id = *bid;
+  v.validator_pubkey = *pub;
+  v.signature = *sig;
+  return v;
+}
+
+}  // namespace
+
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash) {
   if (script_pubkey.size() != 25) return false;
   if (script_pubkey[0] != 0x76 || script_pubkey[1] != 0xA9 || script_pubkey[2] != 0x14 ||
@@ -45,7 +73,61 @@ std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input
   return Bytes(msg.begin(), msg.end());
 }
 
-TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos) {
+std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index) {
+  if (input_index >= tx.inputs.size()) return std::nullopt;
+  Tx signing = tx;
+  for (auto& in : signing.inputs) {
+    in.script_sig.clear();
+  }
+  const Hash32 txh = crypto::sha256d(signing.serialize());
+
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '0'});
+  w.bytes_fixed(txh);
+  w.u32le(input_index);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out) {
+  static const Bytes marker{'S', 'C', 'S', 'L', 'A', 'S', 'H'};
+  if (script_sig.size() < marker.size()) return false;
+  if (!std::equal(marker.begin(), marker.end(), script_sig.begin())) return false;
+
+  Bytes tail(script_sig.begin() + static_cast<long>(marker.size()), script_sig.end());
+  Bytes blob;
+  if (!codec::parse_exact(tail, [&](codec::ByteReader& r) {
+        auto b = r.varbytes();
+        if (!b) return false;
+        blob = *b;
+        return true;
+      })) {
+    return false;
+  }
+
+  Vote a;
+  Vote b;
+  if (!codec::parse_exact(blob, [&](codec::ByteReader& r) {
+        auto v1 = read_vote_fixed(r);
+        auto v2 = read_vote_fixed(r);
+        if (!v1 || !v2) return false;
+        a = *v1;
+        b = *v2;
+        return true;
+      })) {
+    return false;
+  }
+
+  if (out) {
+    out->a = a;
+    out->b = b;
+    out->raw_blob = blob;
+  }
+  return true;
+}
+
+TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const UtxoSet& utxos,
+                               const SpecialValidationContext* ctx) {
   if (tx.version != 1) return {false, "unsupported tx version", 0};
   if (tx.lock_time != 0) return {false, "lock_time must be 0 in v0", 0};
   if (tx.inputs.empty() || tx.outputs.empty()) return {false, "tx inputs/outputs empty", 0};
@@ -58,6 +140,14 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     if (in.sequence != 0xFFFFFFFF) return {false, "coinbase sequence invalid", 0};
     if (in.script_sig.size() > 100) return {false, "coinbase script_sig > 100", 0};
     return {true, "", 0};
+  }
+
+  for (const auto& out : tx.outputs) {
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub) && out.value != BOND_AMOUNT) {
+      (void)pub;
+      return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
+    }
   }
 
   std::uint64_t in_sum = 0;
@@ -73,37 +163,120 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
     auto it = utxos.find(op);
     if (it == utxos.end()) return {false, "missing utxo", 0};
 
+    const TxOut& prev_out = it->second.out;
+
     std::array<std::uint8_t, 20> pkh{};
-    if (!is_p2pkh_script_pubkey(it->second.out.script_pubkey, &pkh)) {
-      return {false, "unsupported prev script_pubkey", 0};
+    if (is_p2pkh_script_pubkey(prev_out.script_pubkey, &pkh)) {
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad script_sig", 0};
+      const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
+      if (!std::equal(derived.begin(), derived.end(), pkh.begin())) {
+        return {false, "pubkey hash mismatch", 0};
+      }
+
+      const auto msg = signing_message_for_input(tx, i);
+      if (!msg.has_value()) return {false, "sighash failed", 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+      in_sum += prev_out.value;
+      continue;
     }
 
-    Sig64 sig{};
-    PubKey32 pub{};
-    if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad script_sig", 0};
-    const auto derived = crypto::h160(Bytes(pub.begin(), pub.end()));
-    if (!std::equal(derived.begin(), derived.end(), pkh.begin())) {
-      return {false, "pubkey hash mismatch", 0};
+    PubKey32 bond_pub{};
+    if (is_validator_register_script(prev_out.script_pubkey, &bond_pub)) {
+      if (!ctx || !ctx->validators) return {false, "bond spend requires validator context", 0};
+
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
+        Hash32 burn_hash{};
+        if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
+        const Hash32 evh = crypto::sha256d(evidence.raw_blob);
+        if (burn_hash != evh) return {false, "slash evidence hash mismatch", 0};
+
+        if (evidence.a.height != evidence.b.height || evidence.a.round != evidence.b.round) {
+          return {false, "invalid equivocation evidence height/round", 0};
+        }
+        if (evidence.a.block_id == evidence.b.block_id) return {false, "invalid equivocation evidence block_id", 0};
+        if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
+        if (evidence.a.validator_pubkey != bond_pub) return {false, "evidence pubkey must match bond", 0};
+
+        Bytes a_bid(evidence.a.block_id.begin(), evidence.a.block_id.end());
+        Bytes b_bid(evidence.b.block_id.begin(), evidence.b.block_id.end());
+        if (!crypto::ed25519_verify(a_bid, evidence.a.signature, evidence.a.validator_pubkey)) {
+          return {false, "invalid evidence signature a", 0};
+        }
+        if (!crypto::ed25519_verify(b_bid, evidence.b.signature, evidence.b.validator_pubkey)) {
+          return {false, "invalid evidence signature b", 0};
+        }
+        if (!ctx->is_committee_member) return {false, "slash spend requires committee context", 0};
+        if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
+          return {false, "slash evidence validator not in committee", 0};
+        }
+      } else {
+        // UNBOND path
+        if (tx.outputs.size() != 1) return {false, "unbond tx must have exactly one output", 0};
+        PubKey32 out_pub{};
+        if (!is_validator_unbond_script(tx.outputs[0].script_pubkey, &out_pub)) {
+          return {false, "unbond tx must output SCVALUNB", 0};
+        }
+        if (out_pub != bond_pub) return {false, "unbond pubkey mismatch", 0};
+
+        Sig64 sig{};
+        PubKey32 pub{};
+        if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond auth script_sig", 0};
+        if (pub != bond_pub) return {false, "unbond auth pubkey mismatch", 0};
+        const auto msg = unbond_message_for_input(tx, i);
+        if (!msg.has_value()) return {false, "unbond sighash failed", 0};
+        if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond signature invalid", 0};
+      }
+
+      in_sum += prev_out.value;
+      continue;
     }
 
-    const auto msg = signing_message_for_input(tx, i);
-    if (!msg.has_value()) return {false, "sighash failed", 0};
-    if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "signature invalid", 0};
+    PubKey32 unbond_pub{};
+    if (is_validator_unbond_script(prev_out.script_pubkey, &unbond_pub)) {
+      if (!ctx || !ctx->validators) return {false, "unbond spend requires validator context", 0};
+      auto info = ctx->validators->get(unbond_pub);
+      if (!info.has_value()) return {false, "unknown validator for unbond output", 0};
+      if (ctx->current_height < info->unbond_height + UNBOND_DELAY_BLOCKS) {
+        return {false, "unbond delay not reached", 0};
+      }
 
-    in_sum += it->second.out.value;
+      Sig64 sig{};
+      PubKey32 pub{};
+      if (!is_p2pkh_script_sig(in.script_sig, &sig, &pub)) return {false, "bad unbond-spend script_sig", 0};
+      if (pub != unbond_pub) return {false, "unbond-spend pubkey mismatch", 0};
+      const auto msg = signing_message_for_input(tx, i);
+      if (!msg.has_value()) return {false, "unbond-spend sighash failed", 0};
+      if (!crypto::ed25519_verify(*msg, sig, pub)) return {false, "unbond-spend signature invalid", 0};
+
+      for (const auto& o : tx.outputs) {
+        if (!is_p2pkh_script_pubkey(o.script_pubkey, nullptr)) {
+          return {false, "unbond output spend must go to P2PKH", 0};
+        }
+      }
+
+      in_sum += prev_out.value;
+      continue;
+    }
+
+    return {false, "unsupported prev script_pubkey", 0};
   }
 
   if (in_sum < out_sum) return {false, "negative fee", 0};
   return {true, "", in_sum - out_sum};
 }
 
-BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward) {
+BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
+                                         const SpecialValidationContext* ctx) {
   if (block.txs.empty()) return {false, "block has no tx", 0};
   UtxoSet work = base_utxos;
 
   std::uint64_t fees = 0;
   for (size_t i = 0; i < block.txs.size(); ++i) {
-    auto r = validate_tx(block.txs[i], i, work);
+    auto r = validate_tx(block.txs[i], i, work, ctx);
     if (!r.ok) return {false, "tx invalid at index " + std::to_string(i) + ": " + r.error, 0};
     fees += r.fee;
 

@@ -5,6 +5,12 @@
 
 namespace selfcoin::crypto {
 
+Hash32 sha256(const Bytes& data) {
+  Hash32 out{};
+  SHA256(data.data(), data.size(), out.data());
+  return out;
+}
+
 Hash32 sha256d(const Bytes& data) {
   unsigned char first[SHA256_DIGEST_LENGTH];
   SHA256(data.data(), data.size(), first);

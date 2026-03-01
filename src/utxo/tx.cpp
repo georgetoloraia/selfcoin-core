@@ -235,4 +235,24 @@ bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey) {
   return true;
 }
 
+bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey) {
+  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'U', 'N', 'B'};
+  if (script.size() != 40) return false;
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  if (out_pubkey) {
+    std::copy(script.begin() + 8, script.end(), out_pubkey->begin());
+  }
+  return true;
+}
+
+bool is_burn_script(const Bytes& script, Hash32* out_evidence_hash) {
+  static const std::array<std::uint8_t, 6> prefix = {'S', 'C', 'B', 'U', 'R', 'N'};
+  if (script.size() != 38) return false;
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  if (out_evidence_hash) {
+    std::copy(script.begin() + 6, script.end(), out_evidence_hash->begin());
+  }
+  return true;
+}
+
 }  // namespace selfcoin

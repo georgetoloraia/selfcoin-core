@@ -120,7 +120,6 @@ bool Server::init() {
     if (!db_.open(cfg_.db_path)) return false;
   }
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
-  if (cfg_.port == 0) cfg_.port = cfg_.network.lightserver_default_port;
   if (cfg_.tx_relay_port == 0) cfg_.tx_relay_port = cfg_.network.p2p_default_port;
   started_at_unix_ = static_cast<std::uint64_t>(::time(nullptr));
   return true;
@@ -137,6 +136,14 @@ bool Server::start() {
   addr.sin_port = htons(cfg_.port);
   if (inet_pton(AF_INET, cfg_.bind_ip.c_str(), &addr.sin_addr) != 1) return false;
   if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+  sockaddr_in bound{};
+  socklen_t blen = sizeof(bound);
+  if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+    bound_port_ = ntohs(bound.sin_port);
+  } else {
+    bound_port_ = cfg_.port;
+  }
+  cfg_.port = bound_port_;
   if (listen(listen_fd_, 64) != 0) return false;
   running_ = true;
   accept_thread_ = std::thread([this]() { accept_loop(); });
@@ -149,6 +156,7 @@ void Server::stop() {
     ::shutdown(listen_fd_, SHUT_RDWR);
     ::close(listen_fd_);
     listen_fd_ = -1;
+    bound_port_ = 0;
   }
   if (accept_thread_.joinable()) accept_thread_.join();
 }
@@ -293,10 +301,14 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
 
   auto tip = db_.get_tip();
   p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg_.network.protocol_version);
+  v.network_id = cfg_.network.network_id;
+  v.feature_flags = cfg_.network.feature_flags;
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
+  v.node_software_version = "selfcoin-lightserver/0.7";
   if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
                           cfg_.network.protocol_version)) {
     ::close(fd);
@@ -337,9 +349,11 @@ std::string Server::handle_rpc_body(const std::string& body) {
     if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
     const std::uint64_t now = static_cast<std::uint64_t>(::time(nullptr));
     std::ostringstream oss;
-    oss << "{\"tip\":{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash)
+    oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"protocol_version\":"
+        << cfg_.network.protocol_version << ",\"feature_flags\":" << cfg_.network.feature_flags
+        << ",\"tip\":{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash)
         << "\"},\"peers\":null,\"mempool_size\":null,\"uptime_s\":" << (now - started_at_unix_)
-        << ",\"version\":\"selfcoin-core/0.4\",\"network\":\"" << cfg_.network.name << "\"}";
+        << ",\"version\":\"selfcoin-core/0.7\"}";
     return make_result(id, oss.str());
   }
 

@@ -6,11 +6,13 @@ namespace selfcoin::p2p {
 
 Bytes ser_version(const VersionMsg& m) {
   codec::ByteWriter w;
-  w.u16le(m.proto_version);
+  w.u32le(m.proto_version);
+  w.bytes_fixed(m.network_id);
+  w.u64le(m.feature_flags);
   w.u64le(m.services);
   w.u64le(m.timestamp);
   w.u32le(m.nonce);
-  w.varbytes(Bytes(m.user_agent.begin(), m.user_agent.end()));
+  w.varbytes(Bytes(m.node_software_version.begin(), m.node_software_version.end()));
   w.u64le(m.start_height);
   w.bytes_fixed(m.start_hash);
   return w.take();
@@ -18,20 +20,47 @@ Bytes ser_version(const VersionMsg& m) {
 
 std::optional<VersionMsg> de_version(const Bytes& b) {
   VersionMsg m;
+  // v0.7 format
+  if (codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto pv = r.u32le();
+        auto nid = r.bytes_fixed<16>();
+        auto ff = r.u64le();
+        auto s = r.u64le();
+        auto ts = r.u64le();
+        auto n = r.u32le();
+        auto sw = r.varbytes();
+        auto h = r.u64le();
+        auto hash = r.bytes_fixed<32>();
+        if (!pv || !nid || !ff || !s || !ts || !n || !sw || !h || !hash) return false;
+        m.proto_version = *pv;
+        m.network_id = *nid;
+        m.feature_flags = *ff;
+        m.services = *s;
+        m.timestamp = *ts;
+        m.nonce = *n;
+        m.node_software_version = std::string(sw->begin(), sw->end());
+        m.start_height = *h;
+        m.start_hash = *hash;
+        return true;
+      })) return m;
+
+  // Backward-aware parse for pre-v0.7 payloads in this repo line.
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
-        auto pv = r.u16le();
+        auto pv16 = r.u16le();
         auto s = r.u64le();
         auto ts = r.u64le();
         auto n = r.u32le();
         auto ua = r.varbytes();
         auto h = r.u64le();
         auto hash = r.bytes_fixed<32>();
-        if (!pv || !s || !ts || !n || !ua || !h || !hash) return false;
-        m.proto_version = *pv;
+        if (!pv16 || !s || !ts || !n || !ua || !h || !hash) return false;
+        m.proto_version = *pv16;
+        m.network_id.fill(0);
+        m.feature_flags = 0;
         m.services = *s;
         m.timestamp = *ts;
         m.nonce = *n;
-        m.user_agent = std::string(ua->begin(), ua->end());
+        m.node_software_version = std::string(ua->begin(), ua->end());
         m.start_height = *h;
         m.start_hash = *hash;
         return true;

@@ -422,3 +422,51 @@ Light clients follow only finalized headers:
   - finalize 100 blocks
   - induce leader failure and ensure round increment finalizes
   - inject equivocation evidence and ensure banning occurs
+## SPEC CLARIFICATION: Monetary Policy (Deterministic Height Schedule)
+
+This clarification defines the monetary schedule and deterministic payout split in integer base units.
+
+- Base unit: `1 SelfCoin = 100,000,000` units.
+- `TOTAL_SUPPLY_COINS = 7,000,000`.
+- `TOTAL_SUPPLY_UNITS = 700,000,000,000,000`.
+- Target block interval is informational only: `180` seconds (3 minutes).
+- Deterministic schedule uses fixed block counts:
+  - `BLOCKS_PER_YEAR_365 = 175,200`
+  - `EMISSION_BLOCKS = 3,504,000` (20 years)
+
+Per-height block reward:
+
+- Let:
+  - `q = TOTAL_SUPPLY_UNITS / EMISSION_BLOCKS = 199,771,689`
+  - `r = TOTAL_SUPPLY_UNITS % EMISSION_BLOCKS = 1,744,000`
+- For height `h`:
+  - if `0 <= h < EMISSION_BLOCKS`:
+    - `reward_units(h) = q + (h < r ? 1 : 0)`
+  - if `h >= EMISSION_BLOCKS`:
+    - `reward_units(h) = 0`
+
+This yields exact total issuance:
+
+- `sum_{h=0..EMISSION_BLOCKS-1} reward_units(h) == TOTAL_SUPPLY_UNITS`.
+
+Deterministic payout split for a finalized block:
+
+- Let:
+  - `R = reward_units(height)`
+  - `F = total_fees_units_in_block` (sum non-coinbase fees)
+  - `T = R + F`
+  - `S = number of distinct signers used for payout split`
+- Compute:
+  - `leader_units = floor(T * 20 / 100)`
+  - `pool = T - leader_units`
+  - `base_signer_units = pool / S`
+  - `rem = pool % S`
+- Signer remainder rule:
+  - sort signer pubkeys ascending by raw bytes
+  - first `rem` signers in sorted order receive `+1` unit
+  - each signer receives `base_signer_units` (+1 if selected by remainder rule)
+
+Coinbase conservation:
+
+- `sum(coinbase_outputs) == T` exactly.
+- After `h >= EMISSION_BLOCKS`, `R = 0`, so `sum(coinbase_outputs) == F`.

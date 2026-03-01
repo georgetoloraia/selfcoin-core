@@ -4,20 +4,14 @@
 #include <set>
 
 #include "codec/bytes.hpp"
+#include "consensus/monetary.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "address/address.hpp"
 
 namespace selfcoin {
 
 namespace {
-
-void write_vote_fixed(codec::ByteWriter& w, const Vote& v) {
-  w.u64le(v.height);
-  w.u32le(v.round);
-  w.bytes_fixed(v.block_id);
-  w.bytes_fixed(v.validator_pubkey);
-  w.bytes_fixed(v.signature);
-}
 
 std::optional<Vote> read_vote_fixed(codec::ByteReader& r) {
   Vote v;
@@ -270,7 +264,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
 }
 
 BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
-                                         const SpecialValidationContext* ctx) {
+                                         const SpecialValidationContext* ctx,
+                                         const std::vector<PubKey32>* reward_signers) {
   if (block.txs.empty()) return {false, "block has no tx", 0};
   UtxoSet work = base_utxos;
 
@@ -291,10 +286,31 @@ BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base
     }
   }
 
+  (void)block_reward;
   std::uint64_t coinbase_sum = 0;
   for (const auto& out : block.txs[0].outputs) coinbase_sum += out.value;
-  if (coinbase_sum != block_reward + fees) {
+  const std::uint64_t reward = consensus::reward_units(block.header.height);
+  if (coinbase_sum != reward + fees) {
     return {false, "coinbase sum mismatch", 0};
+  }
+
+  if (reward_signers) {
+    const auto payout = consensus::compute_payout(block.header.height, fees, block.header.leader_pubkey, *reward_signers);
+    std::vector<TxOut> expected;
+    expected.reserve(1 + payout.signers.size());
+    const auto leader_pkh = crypto::h160(Bytes(block.header.leader_pubkey.begin(), block.header.leader_pubkey.end()));
+    expected.push_back(TxOut{payout.leader, address::p2pkh_script_pubkey(leader_pkh)});
+    for (const auto& [pub, units] : payout.signers) {
+      const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
+      expected.push_back(TxOut{units, address::p2pkh_script_pubkey(pkh)});
+    }
+    if (block.txs[0].outputs.size() != expected.size()) return {false, "coinbase payout distribution mismatch", 0};
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+      if (block.txs[0].outputs[i].value != expected[i].value ||
+          block.txs[0].outputs[i].script_pubkey != expected[i].script_pubkey) {
+        return {false, "coinbase payout distribution mismatch", 0};
+      }
+    }
   }
 
   return {true, "", fees};

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <optional>
 #include <string>
 
@@ -20,11 +21,13 @@ enum MsgType : std::uint16_t {
 };
 
 struct VersionMsg {
-  std::uint16_t proto_version{PROTOCOL_VERSION};
+  std::uint32_t proto_version{PROTOCOL_VERSION};
+  std::array<std::uint8_t, 16> network_id{};
+  std::uint64_t feature_flags{0};
   std::uint64_t services{0};
   std::uint64_t timestamp{0};
   std::uint32_t nonce{0};
-  std::string user_agent{"selfcoin-core/0.1"};
+  std::string node_software_version{"selfcoin-core/0.7"};
   std::uint64_t start_height{0};
   Hash32 start_hash{};
 };

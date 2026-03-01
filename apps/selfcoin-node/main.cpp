@@ -15,7 +15,10 @@ int main(int argc, char** argv) {
   auto cfg = selfcoin::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
     std::cerr << "usage: selfcoin-node [--devnet|--testnet] --node-id <id> --db <dir> [--port <p>] "
-                 "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json]\n";
+                 "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "
+                 "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
+                 "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--ban-seconds <s>] "
+                 "[--min-relay-fee <sats>]\n";
     return 1;
   }
 

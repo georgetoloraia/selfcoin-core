@@ -15,6 +15,7 @@
 #include "p2p/messages.hpp"
 #include "p2p/peer_manager.hpp"
 #include "common/network.hpp"
+#include "p2p/hardening.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
 
@@ -34,6 +35,25 @@ struct NodeConfig {
   bool log_json{false};
   int devnet_initial_active_validators{4};
   std::size_t max_committee{MAX_COMMITTEE};
+  std::uint32_t handshake_timeout_ms{10'000};
+  std::uint32_t frame_timeout_ms{3'000};
+  std::uint32_t idle_timeout_ms{120'000};
+  std::size_t peer_queue_max_bytes{2 * 1024 * 1024};
+  std::size_t peer_queue_max_msgs{2'000};
+  std::uint64_t ban_seconds{600};
+  std::uint64_t min_relay_fee{0};
+  double tx_rate_capacity{200.0};
+  double tx_rate_refill{100.0};
+  double propose_rate_capacity{20.0};
+  double propose_rate_refill{10.0};
+  double vote_rate_capacity{120.0};
+  double vote_rate_refill{60.0};
+  double block_rate_capacity{40.0};
+  double block_rate_refill{20.0};
+  double vote_verify_capacity{60.0};
+  double vote_verify_refill{30.0};
+  double tx_verify_capacity{200.0};
+  double tx_verify_refill{100.0};
 };
 
 struct NodeStatus {
@@ -45,6 +65,9 @@ struct NodeStatus {
   std::size_t peers{0};
   std::size_t mempool_size{0};
   std::size_t committee_size{0};
+  std::uint64_t rejected_network_id{0};
+  std::uint64_t rejected_protocol_version{0};
+  std::uint64_t rejected_pre_handshake{0};
 };
 
 class Node {
@@ -66,10 +89,13 @@ class Node {
   bool mempool_contains_for_test(const Hash32& txid) const;
   std::optional<TxOut> find_utxo_by_pubkey_hash_for_test(const std::array<std::uint8_t, 20>& pkh,
                                                          OutPoint* outpoint = nullptr) const;
+  std::vector<std::pair<OutPoint, TxOut>> find_utxos_by_pubkey_hash_for_test(
+      const std::array<std::uint8_t, 20>& pkh) const;
   bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
+  std::uint16_t p2p_port_for_test() const;
 
   static std::vector<crypto::KeyPair> devnet_keypairs();
 
@@ -81,7 +107,7 @@ class Node {
   void maybe_send_verack(int peer_id);
 
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
-  bool handle_vote(const Vote& vote, bool from_network);
+  bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0);
   bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
 
@@ -100,8 +126,14 @@ class Node {
   void persist_peers() const;
   void try_connect_bootstrap_peers();
   std::size_t peer_count() const;
+  std::string peer_ip_for(int peer_id) const;
+  void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
+  bool should_mute_peer(int peer_id) const;
+  void prune_caches_locked(std::uint64_t height, std::uint32_t round);
+  bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
 
   std::uint64_t now_unix() const;
+  std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
 
   NodeConfig cfg_;
@@ -117,7 +149,16 @@ class Node {
   UtxoSet utxos_;
   mempool::Mempool mempool_;
   consensus::VoteTracker votes_;
-  std::map<int, std::pair<std::uint64_t, std::uint32_t>> tx_rate_state_;
+  p2p::PeerDiscipline discipline_{30, 100, 600};
+  p2p::VoteVerifyCache vote_verify_cache_{20'000};
+  std::map<int, std::map<std::uint16_t, p2p::TokenBucket>> msg_rate_buckets_;
+  std::map<int, p2p::TokenBucket> vote_verify_buckets_;
+  std::map<int, p2p::TokenBucket> tx_verify_buckets_;
+  std::map<Hash32, std::size_t> candidate_block_sizes_;
+  std::map<int, std::string> peer_ip_cache_;
+  std::uint64_t rejected_network_id_{0};
+  std::uint64_t rejected_protocol_version_{0};
+  std::uint64_t rejected_pre_handshake_{0};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

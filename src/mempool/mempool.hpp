@@ -26,7 +26,8 @@ class Mempool {
   static constexpr std::size_t kMaxTxCount = 10'000;
   static constexpr std::size_t kMaxPoolBytes = 10 * 1024 * 1024;
 
-  bool accept_tx(const Tx& tx, const UtxoView& view, std::string* err);
+  bool accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee = 0,
+                 std::uint64_t* accepted_fee = nullptr);
   std::vector<Tx> select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view) const;
   void remove_confirmed(const std::vector<Hash32>& txids);
   void prune_against_utxo(const UtxoView& view);

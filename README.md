@@ -21,6 +21,29 @@ Implemented in this repo:
 - `scripts/observe.py` multi-endpoint observer for divergence checks
 - Unit + integration tests (fault recovery, tx finalization, restart determinism)
 
+## Monetary Policy (7M Hard Cap)
+
+Monetary schedule is deterministic by block height (no wall-clock logic):
+- Base unit: `1 SelfCoin = 100,000,000` units.
+- Total cap: `7,000,000` coins = `700,000,000,000,000` units.
+- Emission length: `3,504,000` blocks (`20 * 175,200`, 3-minute target cadence).
+
+Reward function:
+- `q = 199,771,689`
+- `r = 1,744,000`
+- `reward_units(h) = q + (h < r ? 1 : 0)` for `h < 3,504,000`, else `0`.
+
+Examples:
+- `reward_units(0) = 199,771,690`
+- `reward_units(r-1) = reward_units(1,743,999) = 199,771,690`
+- `reward_units(r) = reward_units(1,744,000) = 199,771,689`
+- `reward_units(3,504,000) = 0`
+
+Per-block payout split (`T = reward + fees`):
+- Leader bonus: `floor(T * 20 / 100)`
+- Remaining `80%` split equally among deterministic signer list
+- Remainder units assigned to lexicographically smallest signer pubkeys first
+
 ## Network Profiles
 
 `selfcoin-node` and `selfcoin-lightserver` support:
@@ -150,6 +173,40 @@ Example tx/mempool logs:
 [node 1] mempool-accept txid=... mempool_size=1
 [node 0] propose-assembled height=41 round=0 txs=1 fees=1000
 [node 2] finalized height=41 round=0 leader=... votes=3/3 txs=2 hash=... included_txid=...
+```
+
+## v0.5 Hardening
+
+Node hardening defaults:
+- handshake timeout: `10000ms`
+- frame read timeout: `3000ms`
+- idle timeout: `120000ms`
+- peer outbound queue cap: `2MB` / `2000` messages
+- soft mute score: `30`, ban score: `100`, ban duration: `600s`
+
+New node flags:
+```bash
+--handshake-timeout-ms <ms>
+--frame-timeout-ms <ms>
+--idle-timeout-ms <ms>
+--peer-queue-max-bytes <n>
+--peer-queue-max-msgs <n>
+--ban-seconds <s>
+--min-relay-fee <sats>   # defaults to 1000 on --testnet, 0 on devnet
+```
+
+Sanitizers:
+```bash
+cmake -S . -B build-asan -DSELFCOIN_SANITIZE=ON
+cmake --build build-asan -j
+```
+
+Fuzz harness targets:
+```bash
+cmake -S . -B build-fuzz -DSELFCOIN_BUILD_FUZZ=ON
+cmake --build build-fuzz -j
+./build-fuzz/fuzz_p2p_frame
+./build-fuzz/fuzz_tx_parse
 ```
 
 ## Lightserver JSON-RPC

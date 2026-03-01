@@ -42,7 +42,8 @@ struct BlockValidationResult {
 };
 
 BlockValidationResult validate_block_txs(const Block& block, const UtxoSet& base_utxos, std::uint64_t block_reward,
-                                         const SpecialValidationContext* ctx = nullptr);
+                                         const SpecialValidationContext* ctx = nullptr,
+                                         const std::vector<PubKey32>* reward_signers = nullptr);
 void apply_block_to_utxo(const Block& block, UtxoSet& utxos);
 
 }  // namespace selfcoin

@@ -4,6 +4,8 @@ project(selfcoin_core LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(SELFCOIN_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
+option(SELFCOIN_BUILD_FUZZ "Build fuzz harness executables" ON)
 
 find_package(OpenSSL REQUIRED)
 
@@ -35,10 +37,12 @@ add_library(selfcoin_core
   src/utxo/validate.cpp
   src/utxo/signing.cpp
   src/mempool/mempool.cpp
+  src/consensus/monetary.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
   src/p2p/framing.cpp
+  src/p2p/hardening.cpp
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
@@ -57,15 +61,33 @@ if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
 endif()
 
 target_compile_options(selfcoin_core PRIVATE -Wall -Wextra -Wpedantic)
+set(SC_SAN_FLAGS "")
+if(SELFCOIN_SANITIZE)
+  set(SC_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_compile_options(selfcoin_core PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(selfcoin_core PRIVATE -fsanitize=address,undefined)
+endif()
 
 add_executable(selfcoin-node apps/selfcoin-node/main.cpp)
 target_link_libraries(selfcoin-node PRIVATE selfcoin_core)
+if(SELFCOIN_SANITIZE)
+  target_compile_options(selfcoin-node PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(selfcoin-node PRIVATE -fsanitize=address,undefined)
+endif()
 
 add_executable(selfcoin-cli apps/selfcoin-cli/main.cpp)
 target_link_libraries(selfcoin-cli PRIVATE selfcoin_core)
+if(SELFCOIN_SANITIZE)
+  target_compile_options(selfcoin-cli PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(selfcoin-cli PRIVATE -fsanitize=address,undefined)
+endif()
 
 add_executable(selfcoin-lightserver apps/selfcoin-lightserver/main.cpp)
 target_link_libraries(selfcoin-lightserver PRIVATE selfcoin_core)
+if(SELFCOIN_SANITIZE)
+  target_compile_options(selfcoin-lightserver PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(selfcoin-lightserver PRIVATE -fsanitize=address,undefined)
+endif()
 
 add_executable(selfcoin-tests
   tests/test_main.cpp
@@ -73,12 +95,33 @@ add_executable(selfcoin-tests
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_monetary.cpp
   tests/test_bonding.cpp
   tests/test_mempool.cpp
+  tests/test_hardening.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp
 )
 target_link_libraries(selfcoin-tests PRIVATE selfcoin_core)
+if(SELFCOIN_SANITIZE)
+  target_compile_options(selfcoin-tests PRIVATE ${SC_SAN_FLAGS})
+  target_link_options(selfcoin-tests PRIVATE -fsanitize=address,undefined)
+endif()
+
+if(SELFCOIN_BUILD_FUZZ)
+  add_executable(fuzz_p2p_frame fuzz/fuzz_p2p_frame.cpp)
+  target_link_libraries(fuzz_p2p_frame PRIVATE selfcoin_core)
+  if(SELFCOIN_SANITIZE)
+    target_compile_options(fuzz_p2p_frame PRIVATE ${SC_SAN_FLAGS})
+    target_link_options(fuzz_p2p_frame PRIVATE -fsanitize=address,undefined)
+  endif()
+  add_executable(fuzz_tx_parse fuzz/fuzz_tx_parse.cpp)
+  target_link_libraries(fuzz_tx_parse PRIVATE selfcoin_core)
+  if(SELFCOIN_SANITIZE)
+    target_compile_options(fuzz_tx_parse PRIVATE ${SC_SAN_FLAGS})
+    target_link_options(fuzz_tx_parse PRIVATE -fsanitize=address,undefined)
+  endif()
+endif()
 
 enable_testing()
 add_test(NAME selfcoin-tests COMMAND selfcoin-tests)

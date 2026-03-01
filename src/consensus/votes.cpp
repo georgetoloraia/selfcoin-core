@@ -6,6 +6,7 @@ VoteTallyResult VoteTracker::add_vote(const Vote& vote) {
   VoteTallyResult out;
   const auto hr = std::make_pair(vote.height, vote.round);
   auto& seen = seen_by_validator_[hr];
+  if (stored_votes_.size() >= limits_.max_votes_global) return out;
 
   const auto it = seen.find(vote.validator_pubkey);
   if (it != seen.end()) {
@@ -29,6 +30,11 @@ VoteTallyResult VoteTracker::add_vote(const Vote& vote) {
   stored_votes_[std::make_tuple(vote.height, vote.round, vote.validator_pubkey)] = vote;
 
   const Key key{vote.height, vote.round, vote.block_id};
+  std::size_t block_keys_for_hr = 0;
+  for (const auto& [k, _] : by_block_) {
+    if (k.height == vote.height && k.round == vote.round) ++block_keys_for_hr;
+  }
+  if (by_block_.find(key) == by_block_.end() && block_keys_for_hr >= limits_.max_blocks_per_height_round) return out;
   by_block_[key][vote.validator_pubkey] = vote.signature;
   out.accepted = true;
   out.votes_for_block = by_block_[key].size();

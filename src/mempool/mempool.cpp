@@ -14,7 +14,8 @@ bool outpoint_exists(const UtxoView& view, const OutPoint& op) {
 
 }  // namespace
 
-bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err) {
+bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, std::uint64_t min_fee,
+                        std::uint64_t* accepted_fee) {
   const Bytes raw = tx.serialize();
   if (raw.size() > kMaxTxBytes) {
     if (err) *err = "tx too large";
@@ -53,6 +54,10 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err) {
     if (err) *err = "tx invalid: " + vr.error;
     return false;
   }
+  if (vr.fee < min_fee) {
+    if (err) *err = "fee below min relay fee";
+    return false;
+  }
 
   TxMeta meta;
   meta.entry = MempoolEntry{tx, txid, vr.fee, raw.size()};
@@ -65,6 +70,7 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err) {
 
   total_bytes_ += raw.size();
   by_txid_[txid] = std::move(meta);
+  if (accepted_fee) *accepted_fee = vr.fee;
   return true;
 }
 

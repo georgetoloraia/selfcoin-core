@@ -6,6 +6,11 @@
 #include "crypto/hash.hpp"
 
 namespace selfcoin {
+namespace {
+constexpr std::uint64_t kMaxTxInputs = 10'000;
+constexpr std::uint64_t kMaxTxOutputs = 10'000;
+constexpr std::size_t kMaxScriptBytes = 256 * 1024;
+}  // namespace
 
 Bytes Tx::serialize() const {
   codec::ByteWriter w;
@@ -28,50 +33,58 @@ Bytes Tx::serialize() const {
 
 std::optional<Tx> Tx::parse(const Bytes& b) {
   Tx tx;
-  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
-        auto version = r.u32le();
-        auto in_count = r.varint();
-        if (!version || !in_count) return false;
-        tx.version = *version;
+  try {
+    if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+          auto version = r.u32le();
+          auto in_count = r.varint();
+          if (!version || !in_count) return false;
+          if (*in_count > kMaxTxInputs) return false;
+          tx.version = *version;
 
-        tx.inputs.clear();
-        tx.inputs.reserve(*in_count);
-        for (std::uint64_t i = 0; i < *in_count; ++i) {
-          TxIn in;
-          auto prev = r.bytes_fixed<32>();
-          auto idx = r.u32le();
-          auto script = r.varbytes();
-          auto seq = r.u32le();
-          if (!prev || !idx || !script || !seq) return false;
-          in.prev_txid = *prev;
-          in.prev_index = *idx;
-          in.script_sig = *script;
-          in.sequence = *seq;
-          tx.inputs.push_back(std::move(in));
-        }
+          tx.inputs.clear();
+          tx.inputs.reserve(*in_count);
+          for (std::uint64_t i = 0; i < *in_count; ++i) {
+            TxIn in;
+            auto prev = r.bytes_fixed<32>();
+            auto idx = r.u32le();
+            auto script = r.varbytes();
+            auto seq = r.u32le();
+            if (!prev || !idx || !script || !seq) return false;
+            if (script->size() > kMaxScriptBytes) return false;
+            in.prev_txid = *prev;
+            in.prev_index = *idx;
+            in.script_sig = *script;
+            in.sequence = *seq;
+            tx.inputs.push_back(std::move(in));
+          }
 
-        auto out_count = r.varint();
-        if (!out_count) return false;
-        tx.outputs.clear();
-        tx.outputs.reserve(*out_count);
-        for (std::uint64_t i = 0; i < *out_count; ++i) {
-          TxOut out;
-          auto value = r.u64le();
-          auto script = r.varbytes();
-          if (!value || !script) return false;
-          out.value = *value;
-          out.script_pubkey = *script;
-          tx.outputs.push_back(std::move(out));
-        }
+          auto out_count = r.varint();
+          if (!out_count) return false;
+          if (*out_count > kMaxTxOutputs) return false;
+          tx.outputs.clear();
+          tx.outputs.reserve(*out_count);
+          for (std::uint64_t i = 0; i < *out_count; ++i) {
+            TxOut out;
+            auto value = r.u64le();
+            auto script = r.varbytes();
+            if (!value || !script) return false;
+            if (script->size() > kMaxScriptBytes) return false;
+            out.value = *value;
+            out.script_pubkey = *script;
+            tx.outputs.push_back(std::move(out));
+          }
 
-        auto lock = r.u32le();
-        if (!lock) return false;
-        tx.lock_time = *lock;
-        return true;
-      })) {
+          auto lock = r.u32le();
+          if (!lock) return false;
+          tx.lock_time = *lock;
+          return true;
+        })) {
+      return std::nullopt;
+    }
+    return tx;
+  } catch (...) {
     return std::nullopt;
   }
-  return tx;
 }
 
 Hash32 Tx::txid() const { return crypto::sha256d(serialize()); }

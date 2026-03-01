@@ -13,6 +13,7 @@
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/validators.hpp"
+#include "consensus/monetary.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "merkle/merkle.hpp"
@@ -22,7 +23,9 @@ namespace {
 
 constexpr std::size_t kMaxBlockTxs = 1000;
 constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
-constexpr std::uint32_t kTxRatePerSec = 100;
+constexpr std::size_t kMaxCandidateBlocks = 512;
+constexpr std::size_t kMaxCandidateBlockBytes = 32 * 1024 * 1024;
+constexpr std::uint32_t kProposalRoundWindow = 32;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
@@ -32,6 +35,12 @@ std::string short_pub_hex(const PubKey32& pub) {
 Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
   std::string msg = "cb:" + std::to_string(h) + ":" + std::to_string(r);
   return Bytes(msg.begin(), msg.end());
+}
+
+std::string endpoint_to_ip(std::string endpoint) {
+  const auto pos = endpoint.find(':');
+  if (pos == std::string::npos) return endpoint;
+  return endpoint.substr(0, pos);
 }
 
 std::mutex g_local_bus_mu;
@@ -59,6 +68,8 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 bool Node::init() {
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   if (cfg_.p2p_port == 0) cfg_.p2p_port = cfg_.network.p2p_default_port;
+  if (cfg_.testnet && cfg_.min_relay_fee == 0) cfg_.min_relay_fee = 1000;
+  discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
@@ -105,8 +116,38 @@ bool Node::init() {
 
   if (!cfg_.disable_p2p) {
     p2p_.configure_network(cfg_.network.magic, cfg_.network.protocol_version, cfg_.network.max_payload_len);
+    p2p_.configure_limits(p2p::PeerManager::Limits{cfg_.handshake_timeout_ms, cfg_.frame_timeout_ms, cfg_.idle_timeout_ms,
+                                                    cfg_.peer_queue_max_bytes, cfg_.peer_queue_max_msgs});
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
+    });
+    p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
+      if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
+        }
+        if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
+          p2p_.disconnect_peer(peer_id);
+        }
+        return;
+      }
+      if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
+        std::lock_guard<std::mutex> lk(mu_);
+        peer_ip_cache_.erase(peer_id);
+        msg_rate_buckets_.erase(peer_id);
+        vote_verify_buckets_.erase(peer_id);
+        tx_verify_buckets_.erase(peer_id);
+        return;
+      }
+      if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
+      } else if (type == p2p::PeerManager::PeerEventType::FRAME_TIMEOUT ||
+                 type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "timeout");
+      } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
+        score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
+      }
     });
     if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
       std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
@@ -154,7 +195,7 @@ NodeStatus Node::status() const {
   return s;
 }
 
-bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false); }
+bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0); }
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
@@ -189,6 +230,18 @@ std::optional<TxOut> Node::find_utxo_by_pubkey_hash_for_test(const std::array<st
     return e.out;
   }
   return std::nullopt;
+}
+std::vector<std::pair<OutPoint, TxOut>> Node::find_utxos_by_pubkey_hash_for_test(
+    const std::array<std::uint8_t, 20>& pkh) const {
+  std::vector<std::pair<OutPoint, TxOut>> out;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& [op, e] : utxos_) {
+    std::array<std::uint8_t, 20> got{};
+    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (got != pkh) continue;
+    out.push_back({op, e.out});
+  }
+  return out;
 }
 bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
   std::lock_guard<std::mutex> lk(mu_);
@@ -234,6 +287,7 @@ void Node::event_loop() {
       }
 
       const auto hr = std::make_pair(h, current_round_);
+      prune_caches_locked(h, current_round_);
       if (logged_committee_rounds_.insert(hr).second) {
         std::ostringstream coss;
         coss << "committee height=" << h << " round=" << current_round_ << " size=" << committee.size()
@@ -302,9 +356,22 @@ void Node::maybe_send_verack(int peer_id) {
 }
 
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {
+  bool rate_limited = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    rate_limited = !check_rate_limit_locked(peer_id, msg_type);
+  }
+  if (rate_limited) {
+    score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "msg-rate");
+    return;
+  }
+
   if (msg_type == p2p::MsgType::VERSION) {
     auto v = p2p::de_version(payload);
-    if (!v.has_value() || v->proto_version != cfg_.network.protocol_version) return;
+    if (!v.has_value() || v->proto_version != cfg_.network.protocol_version) {
+      score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-version");
+      return;
+    }
     p2p_.mark_handshake_rx(peer_id, true, false);
 
     auto info = p2p_.get_peer_info(peer_id);
@@ -325,39 +392,66 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   }
 
   const auto info = p2p_.get_peer_info(peer_id);
-  if (!info.established()) return;
+  if (!info.established()) {
+    score_peer(peer_id, p2p::MisbehaviorReason::PRE_HANDSHAKE_CONSENSUS, "pre-handshake-msg");
+    return;
+  }
 
   switch (msg_type) {
     case p2p::MsgType::GET_FINALIZED_TIP: {
       p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
-      p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
+      (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
       break;
     }
     case p2p::MsgType::FINALIZED_TIP: {
       auto tip = p2p::de_finalized_tip(payload);
-      if (!tip.has_value()) return;
+      if (!tip.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
+        return;
+      }
       if (tip->height > finalized_height_) {
         auto req = p2p::GetBlockMsg{tip->hash};
-        p2p_.send_to(peer_id, p2p::MsgType::GET_BLOCK, p2p::ser_get_block(req));
+        (void)p2p_.send_to(peer_id, p2p::MsgType::GET_BLOCK, p2p::ser_get_block(req));
       }
       break;
     }
     case p2p::MsgType::GET_BLOCK: {
       auto gb = p2p::de_get_block(payload);
-      if (!gb.has_value()) return;
+      if (!gb.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-block");
+        return;
+      }
       auto blk = db_.get_block(gb->hash);
       if (!blk.has_value()) return;
-      p2p_.send_to(peer_id, p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{*blk}));
+      (void)p2p_.send_to(peer_id, p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{*blk}), true);
       break;
     }
     case p2p::MsgType::BLOCK: {
       auto b = p2p::de_block(payload);
-      if (!b.has_value()) return;
+      if (!b.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-msg");
+        return;
+      }
       auto blk = Block::parse(b->block_bytes);
-      if (!blk.has_value()) return;
+      if (!blk.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-parse");
+        return;
+      }
       std::lock_guard<std::mutex> lk(mu_);
       if (blk->header.height == finalized_height_ + 1 && blk->header.prev_finalized_hash == finalized_hash_) {
+        if (candidate_blocks_.size() >= kMaxCandidateBlocks ||
+            (candidate_block_sizes_.size() >= kMaxCandidateBlocks &&
+             candidate_block_sizes_.find(blk->header.block_id()) == candidate_block_sizes_.end())) {
+          return;
+        }
         const auto bid = blk->header.block_id();
+        if (candidate_blocks_.find(bid) == candidate_blocks_.end()) {
+          const std::size_t sz = blk->serialize().size();
+          std::size_t total = 0;
+          for (const auto& [_, s] : candidate_block_sizes_) total += s;
+          if (total + sz > kMaxCandidateBlockBytes) return;
+          candidate_block_sizes_[bid] = sz;
+        }
         const auto committee = committee_for_height(blk->header.height);
         if (committee.empty()) return;
         const std::size_t quorum = consensus::quorum_threshold(committee.size());
@@ -387,6 +481,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             round_started_ms_ = now_unix() * 1000;
             votes_.clear_height(blk->header.height);
             candidate_blocks_.clear();
+            candidate_block_sizes_.clear();
           }
         } else {
           candidate_blocks_[bid] = *blk;
@@ -397,31 +492,40 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     }
     case p2p::MsgType::PROPOSE: {
       auto p = p2p::de_propose(payload);
-      if (!p.has_value()) return;
-      handle_propose(*p, true);
+      if (!p.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-propose-msg");
+        return;
+      }
+      if (!handle_propose(*p, true)) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PROPOSE, "invalid-propose");
+      }
       break;
     }
     case p2p::MsgType::VOTE: {
       auto v = p2p::de_vote(payload);
-      if (!v.has_value()) return;
-      handle_vote(v->vote, true);
+      if (!v.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
+        return;
+      }
+      if (!handle_vote(v->vote, true, peer_id)) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-vote");
+      }
       break;
     }
     case p2p::MsgType::TX: {
-      const std::uint64_t now = now_unix();
-      auto& r = tx_rate_state_[peer_id];
-      if (r.first != now) {
-        r.first = now;
-        r.second = 0;
-      }
-      if (++r.second > kTxRatePerSec) {
+      auto m = p2p::de_tx(payload);
+      if (!m.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-msg");
         return;
       }
-      auto m = p2p::de_tx(payload);
-      if (!m.has_value()) return;
       auto tx = Tx::parse(m->tx_bytes);
-      if (!tx.has_value()) return;
-      handle_tx(*tx, true, peer_id);
+      if (!tx.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-tx-parse");
+        return;
+      }
+      if (!handle_tx(*tx, true, peer_id)) {
+        score_peer(peer_id, p2p::MisbehaviorReason::DUPLICATE_SPAM, "tx-rejected");
+      }
       break;
     }
     default:
@@ -454,11 +558,20 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
                                   [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
                                     return is_committee_member_for(pub, h, round);
                                   }};
-    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx);
+    const auto reward_signers = committee_for_height(msg.height);
+    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
 
     Hash32 bid = blk->header.block_id();
+    if (candidate_blocks_.find(bid) == candidate_blocks_.end()) {
+      const std::size_t sz = msg.block_bytes.size();
+      std::size_t total = 0;
+      for (const auto& [_, s] : candidate_block_sizes_) total += s;
+      if (candidate_blocks_.size() >= kMaxCandidateBlocks || total + sz > kMaxCandidateBlockBytes) return false;
+      candidate_block_sizes_[bid] = sz;
+    }
     candidate_blocks_[bid] = *blk;
+    prune_caches_locked(msg.height, msg.round);
 
     if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       Bytes b_id(bid.begin(), bid.end());
@@ -479,13 +592,22 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
   return true;
 }
 
-bool Node::handle_vote(const Vote& vote, bool from_network) {
+bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id) {
   std::lock_guard<std::mutex> lk(mu_);
   if (vote.height != finalized_height_ + 1) return false;
   if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
 
-  Bytes bid(vote.block_id.begin(), vote.block_id.end());
-  if (!crypto::ed25519_verify(bid, vote.signature, vote.validator_pubkey)) return false;
+  const auto nowm = now_ms();
+  auto& verify_bucket = vote_verify_buckets_[from_peer_id];
+  verify_bucket.configure(cfg_.vote_verify_capacity, cfg_.vote_verify_refill);
+  if (from_network && !verify_bucket.consume(1.0, nowm)) return false;
+
+  const p2p::VoteVerifyCache::Key vkey{vote.height, vote.round, vote.block_id, vote.validator_pubkey};
+  if (!vote_verify_cache_.contains(vkey)) {
+    Bytes bid(vote.block_id.begin(), vote.block_id.end());
+    if (!crypto::ed25519_verify(bid, vote.signature, vote.validator_pubkey)) return false;
+    vote_verify_cache_.insert(vkey);
+  }
 
   auto tr = votes_.add_vote(vote);
   if (tr.equivocation && tr.evidence.has_value()) {
@@ -499,9 +621,11 @@ bool Node::handle_vote(const Vote& vote, bool from_network) {
     }
   }
 
-  if (!tr.accepted) return tr.duplicate;
+  if (!tr.accepted) {
+    return tr.duplicate;
+  }
 
-  if (from_network) {
+  if (from_network && !should_mute_peer(from_peer_id)) {
     broadcast_vote(vote);
   }
 
@@ -512,20 +636,27 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
+    auto& verify_bucket = tx_verify_buckets_[from_peer_id];
+    verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
+    if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, tx.inputs.size())), now_ms())) {
+      return false;
+    }
     mempool_.set_validation_context(
         SpecialValidationContext{&validators_, finalized_height_ + 1,
                                  [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
                                    return is_committee_member_for(pub, h, round);
                                  }});
     std::string err;
-    if (!mempool_.accept_tx(tx, utxos_, &err)) {
+    std::uint64_t fee = 0;
+    if (!mempool_.accept_tx(tx, utxos_, &err, cfg_.min_relay_fee, &fee)) {
       return false;
     }
+    if (cfg_.testnet && fee < cfg_.min_relay_fee) return false;
     txid = tx.txid();
     log_line("mempool-accept txid=" + hex_encode32(txid) + " mempool_size=" + std::to_string(mempool_.size()));
   }
 
-  if (from_network) broadcast_tx(tx, from_peer_id);
+  if (from_network && !should_mute_peer(from_peer_id)) broadcast_tx(tx, from_peer_id);
   return true;
 }
 
@@ -571,7 +702,9 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   round_started_ms_ = now_unix() * 1000;
 
   votes_.clear_height(height);
+  vote_verify_cache_.clear_height(height);
   candidate_blocks_.clear();
+  candidate_block_sizes_.clear();
 
   broadcast_finalized_block(b);
 
@@ -621,11 +754,24 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
     if (vr.ok) total_fees += vr.fee;
   }
 
-  const auto pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
-  TxOut out;
-  out.value = BLOCK_REWARD + total_fees;
-  out.script_pubkey = address::p2pkh_script_pubkey(pkh);
-  coinbase.outputs.push_back(out);
+  const auto committee = committee_for_height(height);
+  const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, committee);
+
+  {
+    const auto pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+    TxOut leader_out;
+    leader_out.value = payout.leader;
+    leader_out.script_pubkey = address::p2pkh_script_pubkey(pkh);
+    coinbase.outputs.push_back(leader_out);
+  }
+  for (const auto& [pub, units] : payout.signers) {
+    const auto pkh = crypto::h160(Bytes(pub.begin(), pub.end()));
+    TxOut so;
+    so.value = units;
+    so.script_pubkey = address::p2pkh_script_pubkey(pkh);
+    coinbase.outputs.push_back(std::move(so));
+  }
+
   b.txs.push_back(coinbase);
   b.txs.insert(b.txs.end(), picked.begin(), picked.end());
 
@@ -713,7 +859,7 @@ void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
     const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
     for (int id : p2p_.peer_ids()) {
       if (id == skip_peer_id) continue;
-      p2p_.send_to(id, p2p::MsgType::TX, payload);
+      (void)p2p_.send_to(id, p2p::MsgType::TX, payload, true);
     }
   }
 }
@@ -918,6 +1064,11 @@ std::uint64_t Node::now_unix() const {
   return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
 }
 
+std::uint64_t Node::now_ms() const {
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 void Node::log_line(const std::string& s) const {
   if (cfg_.log_json) {
     std::cout << "{\"type\":\"log\",\"node_id\":" << cfg_.node_id << ",\"network\":\"" << cfg_.network.name
@@ -960,12 +1111,98 @@ void Node::try_connect_bootstrap_peers() {
     if (pos == std::string::npos) continue;
     const std::string host = peer.substr(0, pos);
     const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+    if (discipline_.is_banned(host, now_unix())) continue;
     if (!p2p_.connect_to(host, port)) continue;
     for (int pid : p2p_.peer_ids()) send_version(pid);
   }
 }
 
 std::size_t Node::peer_count() const { return static_cast<std::size_t>(p2p_.peer_ids().size()); }
+
+std::string Node::peer_ip_for(int peer_id) const {
+  auto it = peer_ip_cache_.find(peer_id);
+  if (it != peer_ip_cache_.end()) return it->second;
+  const auto pi = p2p_.get_peer_info(peer_id);
+  if (!pi.ip.empty()) return pi.ip;
+  return endpoint_to_ip(pi.endpoint);
+}
+
+void Node::score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note) {
+  std::string ip;
+  p2p::PeerScoreStatus st;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ip = peer_ip_for(peer_id);
+    if (ip.empty()) return;
+    st = discipline_.add_score(ip, reason, now_unix());
+  }
+  if (st.banned) {
+    log_line("peer-banned ip=" + ip + " score=" + std::to_string(st.score) + " note=" + note);
+    p2p_.disconnect_peer(peer_id);
+  } else if (st.soft_muted) {
+    log_line("peer-soft-muted ip=" + ip + " score=" + std::to_string(st.score) + " note=" + note);
+  }
+}
+
+bool Node::should_mute_peer(int peer_id) const {
+  if (peer_id <= 0) return false;
+  std::lock_guard<std::mutex> lk(mu_);
+  const std::string ip = peer_ip_for(peer_id);
+  if (ip.empty()) return false;
+  return discipline_.status(ip, now_unix()).soft_muted;
+}
+
+void Node::prune_caches_locked(std::uint64_t height, std::uint32_t round) {
+  const std::uint64_t min_h = (height > 2) ? (height - 2) : 0;
+  for (auto it = candidate_blocks_.begin(); it != candidate_blocks_.end();) {
+    if (it->second.header.height < min_h) {
+      candidate_block_sizes_.erase(it->first);
+      it = candidate_blocks_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = proposed_in_round_.begin(); it != proposed_in_round_.end();) {
+    if (it->first.first < height || (it->first.first == height && it->first.second + kProposalRoundWindow < round)) {
+      it = proposed_in_round_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = logged_committee_rounds_.begin(); it != logged_committee_rounds_.end();) {
+    if (it->first < height || (it->first == height && it->second + kProposalRoundWindow < round)) {
+      it = logged_committee_rounds_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
+  if (peer_id <= 0) return true;
+  auto& buckets = msg_rate_buckets_[peer_id];
+  auto get = [&](std::uint16_t type, double cap, double refill) -> p2p::TokenBucket& {
+    auto it = buckets.find(type);
+    if (it == buckets.end()) {
+      it = buckets.emplace(type, p2p::TokenBucket(cap, refill)).first;
+    }
+    return it->second;
+  };
+
+  const auto nms = now_ms();
+  switch (msg_type) {
+    case p2p::MsgType::TX:
+      return get(msg_type, cfg_.tx_rate_capacity, cfg_.tx_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::PROPOSE:
+      return get(msg_type, cfg_.propose_rate_capacity, cfg_.propose_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::VOTE:
+      return get(msg_type, cfg_.vote_rate_capacity, cfg_.vote_rate_refill).consume(1.0, nms);
+    case p2p::MsgType::BLOCK:
+      return get(msg_type, cfg_.block_rate_capacity, cfg_.block_rate_refill).consume(1.0, nms);
+    default:
+      return true;
+  }
+}
 
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
@@ -1039,6 +1276,34 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       committee_explicit = true;
     } else if (a == "--log-json") {
       cfg.log_json = true;
+    } else if (a == "--handshake-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.handshake_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--frame-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.frame_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--idle-timeout-ms") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.idle_timeout_ms = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--peer-queue-max-bytes") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.peer_queue_max_bytes = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--peer-queue-max-msgs") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.peer_queue_max_msgs = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--ban-seconds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.ban_seconds = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--min-relay-fee") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

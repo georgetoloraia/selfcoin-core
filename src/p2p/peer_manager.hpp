@@ -28,6 +28,7 @@ class PeerManager {
  public:
   using MessageHandler = std::function<void(int peer_id, std::uint16_t msg_type, const Bytes& payload)>;
 
+  void configure_network(std::uint32_t magic, std::uint16_t proto_version, std::size_t max_payload_len);
   bool start_listener(const std::string& bind_ip, std::uint16_t port);
   bool connect_to(const std::string& host, std::uint16_t port);
   void stop();
@@ -62,6 +63,9 @@ class PeerManager {
   std::map<int, std::shared_ptr<PeerConn>> peers_;
 
   MessageHandler on_message_;
+  std::uint32_t magic_{MAGIC};
+  std::uint16_t proto_version_{PROTOCOL_VERSION};
+  std::size_t max_payload_len_{8 * 1024 * 1024};
 };
 
 }  // namespace selfcoin::p2p

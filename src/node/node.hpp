@@ -14,6 +14,7 @@
 #include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
 #include "p2p/peer_manager.hpp"
+#include "common/network.hpp"
 #include "storage/db.hpp"
 #include "utxo/validate.hpp"
 
@@ -21,12 +22,16 @@ namespace selfcoin::node {
 
 struct NodeConfig {
   bool devnet{true};
+  bool testnet{false};
+  NetworkConfig network{devnet_network()};
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
   std::uint16_t p2p_port{18444};
   std::vector<std::string> peers;
+  std::vector<std::string> seeds;
   std::string db_path{"./data/node"};
   bool disable_p2p{false};
+  bool log_json{false};
   int devnet_initial_active_validators{4};
   std::size_t max_committee{MAX_COMMITTEE};
 };
@@ -37,6 +42,9 @@ struct NodeStatus {
   Hash32 tip_hash{};
   PubKey32 leader{};
   std::size_t votes_for_current{0};
+  std::size_t peers{0};
+  std::size_t mempool_size{0};
+  std::size_t committee_size{0};
 };
 
 class Node {
@@ -88,6 +96,10 @@ class Node {
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
   std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
+  void load_persisted_peers();
+  void persist_peers() const;
+  void try_connect_bootstrap_peers();
+  std::size_t peer_count() const;
 
   std::uint64_t now_unix() const;
   void log_line(const std::string& s) const;
@@ -119,6 +131,8 @@ class Node {
   p2p::PeerManager p2p_;
 
   bool pause_proposals_{false};
+  std::uint64_t last_seed_attempt_ms_{0};
+  std::vector<std::string> bootstrap_peers_;
 };
 
 std::optional<NodeConfig> parse_args(int argc, char** argv);

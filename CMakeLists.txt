@@ -24,6 +24,7 @@ endif()
 
 add_library(selfcoin_core
   src/common/types.cpp
+  src/common/network.cpp
   src/codec/bytes.cpp
   src/codec/varint.cpp
   src/crypto/hash.cpp

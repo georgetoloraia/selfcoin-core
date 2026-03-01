@@ -1,7 +1,14 @@
 #include "test_framework.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <array>
 
@@ -9,6 +16,7 @@
 #include "consensus/validators.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "lightserver/server.hpp"
 #include "node/node.hpp"
 #include "utxo/signing.hpp"
 
@@ -100,6 +108,21 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
   }
   for (auto& n : c.nodes) n->start();
   return c;
+}
+
+std::optional<std::uint16_t> find_free_port(std::uint16_t from, std::uint16_t to) {
+  for (std::uint16_t p = from; p <= to; ++p) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) continue;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(p);
+    bool ok = (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    ::close(fd);
+    if (ok) return p;
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -499,6 +522,120 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
     }
     return true;
   }, std::chrono::seconds(120)));
+}
+
+TEST(test_testnet_seed_bootstrap_and_catchup) {
+  const std::string base = "/tmp/selfcoin_it_testnet_bootstrap";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  auto p0 = find_free_port(31000, 32000);
+  auto p1 = find_free_port(32001, 33000);
+  auto p2 = find_free_port(33001, 34000);
+  auto p3 = find_free_port(34001, 35000);
+  auto p4 = find_free_port(35001, 36000);
+  ASSERT_TRUE(p0.has_value() && p1.has_value() && p2.has_value() && p3.has_value() && p4.has_value());
+
+  std::vector<std::unique_ptr<node::Node>> nodes;
+  for (int i = 0; i < 4; ++i) {
+    node::NodeConfig cfg;
+    cfg.devnet = false;
+    cfg.testnet = true;
+    cfg.network = testnet_network();
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.p2p_port = (i == 0) ? *p0 : (i == 1) ? *p1 : (i == 2) ? *p2 : *p3;
+    if (i > 0) cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+    auto n = std::make_unique<node::Node>(cfg);
+    ASSERT_TRUE(n->init());
+    nodes.push_back(std::move(n));
+  }
+  for (auto& n : nodes) n->start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 8) return false;
+    }
+    return true;
+  }, std::chrono::seconds(90)));
+
+  node::NodeConfig join_cfg;
+  join_cfg.devnet = false;
+  join_cfg.testnet = true;
+  join_cfg.network = testnet_network();
+  join_cfg.node_id = 7;
+  join_cfg.db_path = base + "/joiner";
+  join_cfg.p2p_port = *p4;
+  join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+  auto joiner = std::make_unique<node::Node>(join_cfg);
+  ASSERT_TRUE(joiner->init());
+  joiner->start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto jh = joiner->status().height;
+    std::uint64_t min_h = UINT64_MAX;
+    for (const auto& n : nodes) min_h = std::min(min_h, n->status().height);
+    return jh >= min_h;
+  }, std::chrono::seconds(90)));
+
+  joiner->stop();
+  for (auto& n : nodes) n->stop();
+}
+
+TEST(test_observer_reports_ok_on_two_lightservers) {
+  const std::string base = "/tmp/selfcoin_it_observer";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig ncfg;
+  ncfg.devnet = true;
+  ncfg.testnet = false;
+  ncfg.network = devnet_network();
+  ncfg.node_id = 0;
+  ncfg.disable_p2p = true;
+  ncfg.devnet_initial_active_validators = 1;
+  ncfg.max_committee = 1;
+  ncfg.db_path = base + "/node0";
+  node::Node n(ncfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 10; }, std::chrono::seconds(60)));
+  n.stop();
+
+  auto p1 = find_free_port(42000, 50000);
+  auto p2 = find_free_port(50001, 58000);
+  ASSERT_TRUE(p1.has_value() && p2.has_value());
+
+  lightserver::Config l1;
+  l1.devnet = true;
+  l1.testnet = false;
+  l1.network = devnet_network();
+  l1.db_path = ncfg.db_path;
+  l1.bind_ip = "127.0.0.1";
+  l1.port = *p1;
+  lightserver::Server s1(l1);
+  ASSERT_TRUE(s1.init());
+  ASSERT_TRUE(s1.start());
+
+  lightserver::Config l2 = l1;
+  l2.port = *p2;
+  lightserver::Server s2(l2);
+  ASSERT_TRUE(s2.init());
+  ASSERT_TRUE(s2.start());
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  const std::string out_file = base + "/observer.out";
+  const std::string cmd = "python3 scripts/observe.py --interval 0.2 --max-intervals 2 --mismatch-threshold 2 " +
+                          std::string("http://127.0.0.1:") + std::to_string(*p1) + "/rpc " +
+                          "http://127.0.0.1:" + std::to_string(*p2) + "/rpc > " + out_file + " 2>&1";
+  const int rc = std::system(cmd.c_str());
+  s2.stop();
+  s1.stop();
+  ASSERT_TRUE(rc == 0);
+
+  std::ifstream in(out_file);
+  std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  ASSERT_TRUE(content.find("mismatch") == std::string::npos);
 }
 
 void register_integration_tests() {}

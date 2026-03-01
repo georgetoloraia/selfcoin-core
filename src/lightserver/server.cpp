@@ -119,7 +119,10 @@ bool Server::init() {
   if (!db_.open_readonly(cfg_.db_path)) {
     if (!db_.open(cfg_.db_path)) return false;
   }
-  if (cfg_.max_committee == 0) cfg_.max_committee = 1;
+  if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
+  if (cfg_.port == 0) cfg_.port = cfg_.network.lightserver_default_port;
+  if (cfg_.tx_relay_port == 0) cfg_.tx_relay_port = cfg_.network.p2p_default_port;
+  started_at_unix_ = static_cast<std::uint64_t>(::time(nullptr));
   return true;
 }
 
@@ -294,17 +297,19 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
   v.start_hash = tip ? tip->hash : zero_hash();
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 424242;
-  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)})) {
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, cfg_.network.magic,
+                          cfg_.network.protocol_version)) {
     ::close(fd);
     if (err) *err = "send VERSION failed";
     return false;
   }
-  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}})) {
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, cfg_.network.magic, cfg_.network.protocol_version)) {
     ::close(fd);
     if (err) *err = "send VERACK failed";
     return false;
   }
-  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})})) {
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})}, cfg_.network.magic,
+                          cfg_.network.protocol_version)) {
     ::close(fd);
     if (err) *err = "send TX failed";
     return false;
@@ -324,6 +329,17 @@ std::string Server::handle_rpc_body(const std::string& body) {
     if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
     std::ostringstream oss;
     oss << "{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash) << "\"}";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_status") {
+    auto tip = db_.get_tip();
+    if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
+    const std::uint64_t now = static_cast<std::uint64_t>(::time(nullptr));
+    std::ostringstream oss;
+    oss << "{\"tip\":{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash)
+        << "\"},\"peers\":null,\"mempool_size\":null,\"uptime_s\":" << (now - started_at_unix_)
+        << ",\"version\":\"selfcoin-core/0.4\",\"network\":\"" << cfg_.network.name << "\"}";
     return make_result(id, oss.str());
   }
 
@@ -445,6 +461,13 @@ std::string Server::handle_rpc_body(const std::string& body) {
 
 std::optional<Config> parse_args(int argc, char** argv) {
   Config cfg;
+  cfg.network = devnet_network();
+  cfg.port = cfg.network.lightserver_default_port;
+  cfg.tx_relay_port = cfg.network.p2p_default_port;
+  cfg.max_committee = cfg.network.max_committee;
+  bool port_explicit = false;
+  bool relay_port_explicit = false;
+  bool committee_explicit = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&](const std::string& name) -> std::optional<std::string> {
@@ -463,6 +486,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.port = static_cast<std::uint16_t>(std::stoul(*v));
+      port_explicit = true;
     } else if (a == "--relay-host") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -471,8 +495,21 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
+      relay_port_explicit = true;
     } else if (a == "--devnet") {
       cfg.devnet = true;
+      cfg.testnet = false;
+      cfg.network = devnet_network();
+      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
+      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--testnet") {
+      cfg.testnet = true;
+      cfg.devnet = false;
+      cfg.network = testnet_network();
+      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
+      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--devnet-initial-active") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -481,6 +518,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
+      committee_explicit = true;
     } else {
       return std::nullopt;
     }

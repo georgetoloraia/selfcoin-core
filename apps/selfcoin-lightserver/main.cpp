@@ -14,8 +14,8 @@ int main(int argc, char** argv) {
   auto cfg = selfcoin::lightserver::parse_args(argc, argv);
   if (!cfg.has_value()) {
     std::cerr
-        << "usage: selfcoin-lightserver --db <dir> [--bind 127.0.0.1] [--port 19444] [--relay-host 127.0.0.1] "
-           "[--relay-port 18444] [--devnet] [--devnet-initial-active N] [--max-committee N]\n";
+        << "usage: selfcoin-lightserver --db <dir> [--bind 127.0.0.1] [--port <p>] [--relay-host 127.0.0.1] "
+           "[--relay-port <p2p>] [--devnet|--testnet] [--devnet-initial-active N] [--max-committee N]\n";
     return 1;
   }
 

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <set>
@@ -55,7 +57,8 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 }
 
 bool Node::init() {
-  if (cfg_.max_committee == 0) cfg_.max_committee = 1;
+  if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
+  if (cfg_.p2p_port == 0) cfg_.p2p_port = cfg_.network.p2p_default_port;
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
@@ -65,15 +68,16 @@ bool Node::init() {
     return false;
   }
 
-  if (cfg_.devnet) {
+  {
     const auto keys = devnet_keypairs();
-    if (cfg_.node_id < 0 || cfg_.node_id >= static_cast<int>(keys.size())) {
-      std::cerr << "invalid node_id " << cfg_.node_id << "\n";
+    if (keys.empty()) {
+      std::cerr << "no key material available\n";
       return false;
     }
-    local_key_ = keys[cfg_.node_id];
+    const int safe_node_id = std::max(0, cfg_.node_id);
+    local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
 
-    if (validators_.all().empty()) {
+    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet)) {
       const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
       for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
         const auto& kp = keys[idx];
@@ -92,7 +96,15 @@ bool Node::init() {
 
   round_started_ms_ = now_unix() * 1000;
 
+  load_persisted_peers();
+  for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
+  for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
+  if (cfg_.testnet && cfg_.seeds.empty()) {
+    for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
+  }
+
   if (!cfg_.disable_p2p) {
+    p2p_.configure_network(cfg_.network.magic, cfg_.network.protocol_version, cfg_.network.max_payload_len);
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
     });
@@ -100,17 +112,7 @@ bool Node::init() {
       std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
       return false;
     }
-    for (const auto& peer : cfg_.peers) {
-      const auto pos = peer.find(':');
-      if (pos == std::string::npos) continue;
-      const std::string host = peer.substr(0, pos);
-      const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
-      if (p2p_.connect_to(host, port)) {
-        for (int pid : p2p_.peer_ids()) {
-          send_version(pid);
-        }
-      }
-    }
+    try_connect_bootstrap_peers();
   }
 
   return true;
@@ -128,6 +130,7 @@ void Node::start() {
 void Node::stop() {
   if (!running_.exchange(false)) return;
   if (loop_thread_.joinable()) loop_thread_.join();
+  persist_peers();
   p2p_.stop();
   if (cfg_.disable_p2p) {
     std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -145,6 +148,9 @@ NodeStatus Node::status() const {
   auto leader = consensus::select_leader(finalized_hash_, finalized_height_ + 1, current_round_, active);
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
+  s.peers = peer_count();
+  s.mempool_size = mempool_.size();
+  s.committee_size = committee_for_height(finalized_height_ + 1).size();
   return s;
 }
 
@@ -221,7 +227,7 @@ void Node::event_loop() {
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
 
       const std::uint64_t now_ms = now_unix() * 1000;
-      if (now_ms > round_started_ms_ + ROUND_TIMEOUT_MS) {
+      if (now_ms > round_started_ms_ + cfg_.network.round_timeout_ms) {
         ++current_round_;
         round_started_ms_ = now_ms;
         log_line("round-timeout height=" + std::to_string(h) + " new_round=" + std::to_string(current_round_));
@@ -237,6 +243,14 @@ void Node::event_loop() {
           coss << short_pub_hex(committee[i]);
         }
         log_line(coss.str());
+        if (cfg_.log_json) {
+          std::ostringstream j;
+          j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
+            << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
+            << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
+            << ",\"committee_size\":" << committee.size() << "}";
+          std::cout << j.str() << "\n";
+        }
       }
 
       if (!pause_proposals_ && leader.has_value() && *leader == local_key_.public_key) {
@@ -260,6 +274,13 @@ void Node::event_loop() {
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!cfg_.disable_p2p && cfg_.testnet) {
+      const std::uint64_t now_ms = now_unix() * 1000;
+      if (peer_count() == 0 && now_ms > last_seed_attempt_ms_ + 3000) {
+        try_connect_bootstrap_peers();
+        last_seed_attempt_ms_ = now_ms;
+      }
+    }
   }
 }
 
@@ -283,7 +304,7 @@ void Node::maybe_send_verack(int peer_id) {
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {
   if (msg_type == p2p::MsgType::VERSION) {
     auto v = p2p::de_version(payload);
-    if (!v.has_value() || v->proto_version != PROTOCOL_VERSION) return;
+    if (!v.has_value() || v->proto_version != cfg_.network.protocol_version) return;
     p2p_.mark_handshake_rx(peer_id, true, false);
 
     auto info = p2p_.get_peer_info(peer_id);
@@ -782,7 +803,7 @@ std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
   consensus::ValidatorRegistry replay_validators;
   UtxoSet replay_utxos;
 
-  if (cfg_.devnet) {
+  if (cfg_.devnet || cfg_.testnet) {
     const auto keys = devnet_keypairs();
     const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
     for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
@@ -898,11 +919,61 @@ std::uint64_t Node::now_unix() const {
 }
 
 void Node::log_line(const std::string& s) const {
+  if (cfg_.log_json) {
+    std::cout << "{\"type\":\"log\",\"node_id\":" << cfg_.node_id << ",\"network\":\"" << cfg_.network.name
+              << "\",\"msg\":\"" << s << "\"}\n";
+    return;
+  }
   std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
 }
 
+void Node::load_persisted_peers() {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "peers.dat";
+  std::ifstream in(p);
+  if (!in.good()) return;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    cfg_.peers.push_back(line);
+  }
+}
+
+void Node::persist_peers() const {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "peers.dat";
+  std::ofstream out(p, std::ios::trunc);
+  if (!out.good()) return;
+
+  std::set<std::string> seen;
+  for (const auto& ep : cfg_.peers) seen.insert(ep);
+  for (const auto& ep : cfg_.seeds) seen.insert(ep);
+  for (int id : p2p_.peer_ids()) {
+    auto pi = p2p_.get_peer_info(id);
+    if (!pi.endpoint.empty()) seen.insert(pi.endpoint);
+  }
+  for (const auto& ep : seen) out << ep << "\n";
+}
+
+void Node::try_connect_bootstrap_peers() {
+  std::set<std::string> uniq(bootstrap_peers_.begin(), bootstrap_peers_.end());
+  for (const auto& peer : uniq) {
+    const auto pos = peer.find(':');
+    if (pos == std::string::npos) continue;
+    const std::string host = peer.substr(0, pos);
+    const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+    if (!p2p_.connect_to(host, port)) continue;
+    for (int pid : p2p_.peer_ids()) send_version(pid);
+  }
+}
+
+std::size_t Node::peer_count() const { return static_cast<std::size_t>(p2p_.peer_ids().size()); }
+
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
+  cfg.network = devnet_network();
+  cfg.p2p_port = cfg.network.p2p_default_port;
+  cfg.max_committee = cfg.network.max_committee;
+  bool port_explicit = false;
+  bool committee_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -916,6 +987,16 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
 
     if (a == "--devnet") {
       cfg.devnet = true;
+      cfg.testnet = false;
+      cfg.network = devnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--testnet") {
+      cfg.testnet = true;
+      cfg.devnet = false;
+      cfg.network = testnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -924,6 +1005,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.p2p_port = static_cast<std::uint16_t>(std::stoi(*v));
+      port_explicit = true;
     } else if (a == "--db") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -938,6 +1020,14 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       }
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--seeds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      std::stringstream ss(*v);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        if (!item.empty()) cfg.seeds.push_back(item);
+      }
     } else if (a == "--devnet-initial-active") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -946,6 +1036,9 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
+      committee_explicit = true;
+    } else if (a == "--log-json") {
+      cfg.log_json = true;
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

@@ -14,7 +14,8 @@ void on_sigint(int) { g_stop = 1; }
 int main(int argc, char** argv) {
   auto cfg = selfcoin::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: selfcoin-node --devnet --node-id <0..3> --port <p> --db <dir> [--peers host:port,...] [--disable-p2p]\n";
+    std::cerr << "usage: selfcoin-node [--devnet|--testnet] --node-id <id> --db <dir> [--port <p>] "
+                 "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json]\n";
     return 1;
   }
 

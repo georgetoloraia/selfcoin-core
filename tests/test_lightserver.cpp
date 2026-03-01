@@ -170,6 +170,9 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   auto tip_resp = ls->handle_rpc_for_test(R"({"jsonrpc":"2.0","id":1,"method":"get_tip","params":{}})");
   ASSERT_TRUE(tip_resp.find("\"height\"") != std::string::npos);
   ASSERT_TRUE(tip_resp.find("\"hash\"") != std::string::npos);
+  auto status_resp = ls->handle_rpc_for_test(R"({"jsonrpc":"2.0","id":11,"method":"get_status","params":{}})");
+  ASSERT_TRUE(status_resp.find("\"uptime_s\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"version\"") != std::string::npos);
 
   auto headers_resp = ls->handle_rpc_for_test(
       R"({"jsonrpc":"2.0","id":2,"method":"get_headers","params":{"from_height":1,"count":2}})");

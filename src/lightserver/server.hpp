@@ -7,19 +7,22 @@
 #include <thread>
 #include <vector>
 
+#include "common/network.hpp"
 #include "storage/db.hpp"
 
 namespace selfcoin::lightserver {
 
 struct Config {
-  std::string bind_ip{"127.0.0.1"};
-  std::uint16_t port{19444};
-  std::string db_path{"./data/node"};
   bool devnet{true};
+  bool testnet{false};
+  NetworkConfig network{devnet_network()};
+  std::string bind_ip{"127.0.0.1"};
+  std::uint16_t port{0};
+  std::string db_path{"./data/node"};
   int devnet_initial_active_validators{4};
   std::size_t max_committee{MAX_COMMITTEE};
   std::string tx_relay_host{"127.0.0.1"};
-  std::uint16_t tx_relay_port{18444};
+  std::uint16_t tx_relay_port{0};
 };
 
 class Server {
@@ -48,6 +51,7 @@ class Server {
   int listen_fd_{-1};
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
+  std::uint64_t started_at_unix_{0};
 };
 
 std::optional<Config> parse_args(int argc, char** argv);

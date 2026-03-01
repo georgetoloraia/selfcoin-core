@@ -8,10 +8,10 @@
 
 namespace selfcoin::p2p {
 
-Bytes encode_frame(const Frame& f) {
+Bytes encode_frame(const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
   codec::ByteWriter w;
-  w.u32le(MAGIC);
-  w.u16le(PROTOCOL_VERSION);
+  w.u32le(magic);
+  w.u16le(proto_version);
   w.u16le(f.msg_type);
   w.u32le(static_cast<std::uint32_t>(f.payload.size()));
   w.bytes(f.payload);
@@ -20,7 +20,8 @@ Bytes encode_frame(const Frame& f) {
   return w.take();
 }
 
-std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len) {
+std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len, std::uint32_t expected_magic,
+                                  std::uint16_t expected_proto_version) {
   Frame f;
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto magic = r.u32le();
@@ -28,7 +29,7 @@ std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len) {
         auto msg_type = r.u16le();
         auto payload_len = r.u32le();
         if (!magic || !version || !msg_type || !payload_len) return false;
-        if (*magic != MAGIC || *version != PROTOCOL_VERSION) return false;
+        if (*magic != expected_magic || *version != expected_proto_version) return false;
         if (*payload_len > max_payload_len) return false;
         auto payload = r.bytes(*payload_len);
         auto checksum = r.bytes_fixed<32>();
@@ -63,7 +64,8 @@ bool write_all(int fd, const std::uint8_t* src, std::size_t n) {
   return true;
 }
 
-std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len) {
+std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len, std::uint32_t expected_magic,
+                                   std::uint16_t expected_proto_version) {
   std::array<std::uint8_t, 12> hdr{};
   if (!read_exact(fd, hdr.data(), hdr.size())) return std::nullopt;
 
@@ -73,7 +75,7 @@ std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len) {
   auto msg = r.u16le();
   auto len = r.u32le();
   if (!magic || !version || !msg || !len) return std::nullopt;
-  if (*magic != MAGIC || *version != PROTOCOL_VERSION || *len > max_payload_len) return std::nullopt;
+  if (*magic != expected_magic || *version != expected_proto_version || *len > max_payload_len) return std::nullopt;
 
   Bytes payload(*len);
   if (*len > 0 && !read_exact(fd, payload.data(), payload.size())) return std::nullopt;
@@ -84,8 +86,8 @@ std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len) {
   return Frame{*msg, payload};
 }
 
-bool write_frame_fd(int fd, const Frame& f) {
-  const Bytes raw = encode_frame(f);
+bool write_frame_fd(int fd, const Frame& f, std::uint32_t magic, std::uint16_t proto_version) {
+  const Bytes raw = encode_frame(f, magic, proto_version);
   return write_all(fd, raw.data(), raw.size());
 }
 

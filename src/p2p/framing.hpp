@@ -1,0 +1,23 @@
+#pragma once
+
+#include <cstdint>
+#include <optional>
+
+#include "common/types.hpp"
+
+namespace selfcoin::p2p {
+
+struct Frame {
+  std::uint16_t msg_type{0};
+  Bytes payload;
+};
+
+Bytes encode_frame(const Frame& f);
+std::optional<Frame> decode_frame(const Bytes& b, std::size_t max_payload_len = 8 * 1024 * 1024);
+
+bool read_exact(int fd, std::uint8_t* dst, std::size_t n);
+bool write_all(int fd, const std::uint8_t* src, std::size_t n);
+std::optional<Frame> read_frame_fd(int fd, std::size_t max_payload_len = 8 * 1024 * 1024);
+bool write_frame_fd(int fd, const Frame& f);
+
+}  // namespace selfcoin::p2p

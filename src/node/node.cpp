@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <set>
 #include <sstream>
 
 #include "address/address.hpp"
@@ -15,6 +16,10 @@
 
 namespace selfcoin::node {
 namespace {
+
+constexpr std::size_t kMaxBlockTxs = 1000;
+constexpr std::size_t kMaxBlockBytes = 1 * 1024 * 1024;
+constexpr std::uint32_t kTxRatePerSec = 100;
 
 Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
   std::string msg = "cb:" + std::to_string(h) + ":" + std::to_string(r);
@@ -129,9 +134,46 @@ NodeStatus Node::status() const {
 }
 
 bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false); }
+bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
+  if (relay) return handle_tx(tx, true);
+  std::lock_guard<std::mutex> lk(mu_);
+  std::string err;
+  return mempool_.accept_tx(tx, utxos_, &err);
+}
 bool Node::pause_proposals_for_test(bool pause) {
   pause_proposals_ = pause;
   return true;
+}
+std::size_t Node::mempool_size_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return mempool_.size();
+}
+bool Node::mempool_contains_for_test(const Hash32& txid) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return mempool_.contains(txid);
+}
+std::optional<TxOut> Node::find_utxo_by_pubkey_hash_for_test(const std::array<std::uint8_t, 20>& pkh,
+                                                              OutPoint* outpoint) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& [op, e] : utxos_) {
+    std::array<std::uint8_t, 20> got{};
+    if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+    if (got != pkh) continue;
+    if (outpoint) *outpoint = op;
+    return e.out;
+  }
+  return std::nullopt;
+}
+bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = utxos_.find(op);
+  if (it == utxos_.end()) return false;
+  if (out) *out = it->second.out;
+  return true;
+}
+std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return validators_.active_sorted(finalized_height_ + 1);
 }
 
 void Node::event_loop() {
@@ -262,7 +304,12 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         }
         if (valid_sigs >= quorum) {
           if (persist_finalized_block(*blk)) {
+            std::vector<Hash32> confirmed_txids;
+            confirmed_txids.reserve(blk->txs.size());
+            for (const auto& tx : blk->txs) confirmed_txids.push_back(tx.txid());
+            mempool_.remove_confirmed(confirmed_txids);
             apply_block_to_utxo(*blk, utxos_);
+            mempool_.prune_against_utxo(utxos_);
             apply_validator_registrations(*blk, blk->header.height);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
@@ -288,6 +335,23 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       auto v = p2p::de_vote(payload);
       if (!v.has_value()) return;
       handle_vote(v->vote, true);
+      break;
+    }
+    case p2p::MsgType::TX: {
+      const std::uint64_t now = now_unix();
+      auto& r = tx_rate_state_[peer_id];
+      if (r.first != now) {
+        r.first = now;
+        r.second = 0;
+      }
+      if (++r.second > kTxRatePerSec) {
+        return;
+      }
+      auto m = p2p::de_tx(payload);
+      if (!m.has_value()) return;
+      auto tx = Tx::parse(m->tx_bytes);
+      if (!tx.has_value()) return;
+      handle_tx(*tx, true, peer_id);
       break;
     }
     default:
@@ -366,6 +430,22 @@ bool Node::handle_vote(const Vote& vote, bool from_network) {
   return finalize_if_quorum(vote.block_id, vote.height, vote.round);
 }
 
+bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
+  Hash32 txid{};
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string err;
+    if (!mempool_.accept_tx(tx, utxos_, &err)) {
+      return false;
+    }
+    txid = tx.txid();
+    log_line("mempool-accept txid=" + hex_encode32(txid) + " mempool_size=" + std::to_string(mempool_.size()));
+  }
+
+  if (from_network) broadcast_tx(tx, from_peer_id);
+  return true;
+}
+
 bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std::uint32_t round) {
   auto blk_it = candidate_blocks_.find(block_id);
   if (blk_it == candidate_blocks_.end()) return false;
@@ -391,7 +471,12 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   if (!persist_finalized_block(b)) return false;
 
+  std::vector<Hash32> confirmed_txids;
+  confirmed_txids.reserve(b.txs.size());
+  for (const auto& tx : b.txs) confirmed_txids.push_back(tx.txid());
+  mempool_.remove_confirmed(confirmed_txids);
   apply_block_to_utxo(b, utxos_);
+  mempool_.prune_against_utxo(utxos_);
   apply_validator_registrations(b, height);
 
   finalized_height_ = b.header.height;
@@ -407,7 +492,11 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   std::ostringstream oss;
   oss << "finalized height=" << finalized_height_ << " round=" << round << " leader="
       << hex_encode(Bytes(b.header.leader_pubkey.begin(), b.header.leader_pubkey.end()))
-      << " votes=" << filtered.size() << "/" << quorum << " hash=" << hex_encode32(block_id);
+      << " votes=" << filtered.size() << "/" << quorum << " txs=" << b.txs.size()
+      << " hash=" << hex_encode32(block_id);
+  if (b.txs.size() > 1) {
+    oss << " included_txid=" << hex_encode32(b.txs[1].txid());
+  }
   log_line(oss.str());
 
   return true;
@@ -431,18 +520,35 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   in.script_sig = make_coinbase_script_sig(height, round);
   coinbase.inputs.push_back(in);
 
+  std::vector<Tx> picked;
+  {
+    picked = mempool_.select_for_block(kMaxBlockTxs, kMaxBlockBytes, utxos_);
+  }
+
+  std::uint64_t total_fees = 0;
+  for (const auto& tx : picked) {
+    auto vr = validate_tx(tx, 1, utxos_);
+    if (vr.ok) total_fees += vr.fee;
+  }
+
   const auto pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
   TxOut out;
-  out.value = BLOCK_REWARD;
+  out.value = BLOCK_REWARD + total_fees;
   out.script_pubkey = address::p2pkh_script_pubkey(pkh);
   coinbase.outputs.push_back(out);
   b.txs.push_back(coinbase);
+  b.txs.insert(b.txs.end(), picked.begin(), picked.end());
 
   std::vector<Bytes> tx_bytes;
-  tx_bytes.push_back(coinbase.serialize());
+  tx_bytes.reserve(b.txs.size());
+  for (const auto& tx : b.txs) tx_bytes.push_back(tx.serialize());
   auto m = merkle::compute_merkle_root_from_txs(tx_bytes);
   if (!m.has_value()) return std::nullopt;
   b.header.merkle_root = *m;
+  if (!picked.empty()) {
+    log_line("propose-assembled height=" + std::to_string(height) + " round=" + std::to_string(round) +
+             " txs=" + std::to_string(picked.size()) + " fees=" + std::to_string(total_fees));
+  }
   return b;
 }
 
@@ -499,6 +605,26 @@ void Node::broadcast_finalized_block(const Block& block) {
     }
   } else {
     p2p_.broadcast(p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{block.serialize()}));
+  }
+}
+
+void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
+  if (cfg_.disable_p2p) {
+    std::vector<Node*> peers;
+    {
+      std::lock_guard<std::mutex> lk(g_local_bus_mu);
+      peers = g_local_bus_nodes;
+    }
+    for (Node* peer : peers) {
+      if (peer == this) continue;
+      std::thread([peer, tx]() { peer->handle_tx(tx, true); }).detach();
+    }
+  } else {
+    const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
+    for (int id : p2p_.peer_ids()) {
+      if (id == skip_peer_id) continue;
+      p2p_.send_to(id, p2p::MsgType::TX, payload);
+    }
   }
 }
 

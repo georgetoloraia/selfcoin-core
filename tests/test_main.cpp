@@ -14,6 +14,7 @@ void register_codec_tests();
 void register_crypto_tests();
 void register_address_tests();
 void register_consensus_tests();
+void register_mempool_tests();
 void register_integration_tests();
 
 int main() {
@@ -21,6 +22,7 @@ int main() {
   register_crypto_tests();
   register_address_tests();
   register_consensus_tests();
+  register_mempool_tests();
   register_integration_tests();
 
   int failed = 0;

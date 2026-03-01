@@ -144,4 +144,21 @@ std::optional<BlockMsg> de_block(const Bytes& b) {
   return m;
 }
 
+Bytes ser_tx(const TxMsg& m) {
+  codec::ByteWriter w;
+  w.varbytes(m.tx_bytes);
+  return w.take();
+}
+
+std::optional<TxMsg> de_tx(const Bytes& b) {
+  TxMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto tx = r.varbytes();
+        if (!tx) return false;
+        m.tx_bytes = *tx;
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
 }  // namespace selfcoin::p2p

@@ -1,6 +1,7 @@
 #include "utxo/validate.hpp"
 
 #include <algorithm>
+#include <set>
 
 #include "codec/bytes.hpp"
 #include "crypto/ed25519.hpp"
@@ -61,12 +62,14 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
 
   std::uint64_t in_sum = 0;
   std::uint64_t out_sum = 0;
+  std::set<OutPoint> seen_inputs;
   for (const auto& out : tx.outputs) out_sum += out.value;
 
   for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
     const auto& in = tx.inputs[i];
     if (in.sequence != 0xFFFFFFFF) return {false, "sequence must be FFFFFFFF", 0};
     OutPoint op{in.prev_txid, in.prev_index};
+    if (!seen_inputs.insert(op).second) return {false, "duplicate input outpoint", 0};
     auto it = utxos.find(op);
     if (it == utxos.end()) return {false, "missing utxo", 0};
 

@@ -1,0 +1,1 @@
+# selfcoin-core

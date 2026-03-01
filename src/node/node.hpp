@@ -10,6 +10,7 @@
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
+#include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
 #include "p2p/peer_manager.hpp"
 #include "storage/db.hpp"
@@ -48,7 +49,14 @@ class Node {
 
   // Test hooks.
   bool inject_vote_for_test(const Vote& vote);
+  bool inject_tx_for_test(const Tx& tx, bool relay);
   bool pause_proposals_for_test(bool pause);
+  std::size_t mempool_size_for_test() const;
+  bool mempool_contains_for_test(const Hash32& txid) const;
+  std::optional<TxOut> find_utxo_by_pubkey_hash_for_test(const std::array<std::uint8_t, 20>& pkh,
+                                                         OutPoint* outpoint = nullptr) const;
+  bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
+  std::vector<PubKey32> active_validators_for_next_height_for_test() const;
 
   static std::vector<crypto::KeyPair> devnet_keypairs();
 
@@ -61,12 +69,14 @@ class Node {
 
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
   bool handle_vote(const Vote& vote, bool from_network);
+  bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
 
   std::optional<Block> build_proposal_block(std::uint64_t height, std::uint32_t round);
   void broadcast_propose(const Block& block);
   void broadcast_vote(const Vote& vote);
   void broadcast_finalized_block(const Block& block);
+  void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_block(const Block& block);
   bool load_state();
@@ -86,7 +96,9 @@ class Node {
 
   consensus::ValidatorRegistry validators_;
   UtxoSet utxos_;
+  mempool::Mempool mempool_;
   consensus::VoteTracker votes_;
+  std::map<int, std::pair<std::uint64_t, std::uint32_t>> tx_rate_state_;
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

@@ -1,15 +1,102 @@
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <array>
+#include <chrono>
+#include <ctime>
 #include <iostream>
+#include <optional>
+#include <random>
 #include <string>
+#include <algorithm>
 
 #include "address/address.hpp"
+#include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "p2p/framing.hpp"
+#include "p2p/messages.hpp"
 #include "storage/db.hpp"
+#include "utxo/signing.hpp"
+
+namespace {
+
+std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* res = nullptr;
+  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return std::nullopt;
+
+  int fd = -1;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) continue;
+    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    ::close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) return std::nullopt;
+  return fd;
+}
+
+bool do_handshake_v0(int fd) {
+  selfcoin::p2p::VersionMsg v;
+  v.timestamp = static_cast<std::uint64_t>(std::time(nullptr));
+  v.nonce = 0xC011CAFE;
+  v.start_height = 0;
+  v.start_hash = selfcoin::zero_hash();
+
+  if (!selfcoin::p2p::write_frame_fd(fd, selfcoin::p2p::Frame{selfcoin::p2p::MsgType::VERSION, selfcoin::p2p::ser_version(v)})) {
+    return false;
+  }
+
+  bool got_version = false;
+  bool got_verack = false;
+  bool sent_verack = false;
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < deadline && (!got_version || !got_verack)) {
+    auto f = selfcoin::p2p::read_frame_fd(fd);
+    if (!f.has_value()) return false;
+    if (f->msg_type == selfcoin::p2p::MsgType::VERSION) {
+      auto pv = selfcoin::p2p::de_version(f->payload);
+      if (!pv.has_value()) return false;
+      got_version = true;
+      if (!sent_verack) {
+        if (!selfcoin::p2p::write_frame_fd(fd, selfcoin::p2p::Frame{selfcoin::p2p::MsgType::VERACK, {}})) {
+          return false;
+        }
+        sent_verack = true;
+      }
+    } else if (f->msg_type == selfcoin::p2p::MsgType::VERACK) {
+      got_verack = true;
+    }
+  }
+
+  return got_version && got_verack;
+}
+
+std::optional<std::array<std::uint8_t, 32>> decode_hex32(const std::string& hex) {
+  auto b = selfcoin::hex_decode(hex);
+  if (!b.has_value() || b->size() != 32) return std::nullopt;
+  std::array<std::uint8_t, 32> out{};
+  std::copy(b->begin(), b->end(), out.begin());
+  return out;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage:\n"
               << "  selfcoin-cli tip --db <dir>\n"
-              << "  selfcoin-cli addr --hrp <sc|tsc> --pubkey <hex32>\n";
+              << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp tsc]\n"
+              << "  selfcoin-cli address_from_pubkey --hrp <sc|tsc> --pubkey <hex32>\n"
+              << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
+              << "  selfcoin-cli broadcast_tx --host <ip> --port <p> --tx-hex <hex>\n";
     return 1;
   }
 
@@ -35,7 +122,43 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (cmd == "addr") {
+  if (cmd == "create_keypair") {
+    std::string seed_hex;
+    std::string hrp = "tsc";
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--seed-hex" && i + 1 < argc) seed_hex = argv[++i];
+      if (a == "--hrp" && i + 1 < argc) hrp = argv[++i];
+    }
+
+    std::array<std::uint8_t, 32> seed{};
+    if (!seed_hex.empty()) {
+      auto s = decode_hex32(seed_hex);
+      if (!s.has_value()) {
+        std::cerr << "--seed-hex must be 32 bytes hex\n";
+        return 1;
+      }
+      seed = *s;
+    } else {
+      std::random_device rd;
+      for (auto& b : seed) b = static_cast<std::uint8_t>(rd());
+    }
+
+    auto kp = selfcoin::crypto::keypair_from_seed32(seed);
+    if (!kp.has_value()) {
+      std::cerr << "failed to create keypair\n";
+      return 1;
+    }
+    auto pkh = selfcoin::crypto::h160(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end()));
+    auto addr = selfcoin::address::encode_p2pkh(hrp, pkh);
+
+    std::cout << "privkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(seed.begin(), seed.end())) << "\n";
+    std::cout << "pubkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end())) << "\n";
+    if (addr.has_value()) std::cout << "address=" << *addr << "\n";
+    return 0;
+  }
+
+  if (cmd == "address_from_pubkey" || cmd == "addr") {
     std::string hrp = "tsc";
     std::string pub_hex;
     for (int i = 2; i < argc; ++i) {
@@ -60,6 +183,124 @@ int main(int argc, char** argv) {
       return 1;
     }
     std::cout << *addr << "\n";
+    return 0;
+  }
+
+  if (cmd == "build_p2pkh_tx") {
+    std::string prev_txid_hex;
+    std::uint32_t prev_index = 0;
+    std::uint64_t prev_value = 0;
+    std::string from_priv_hex;
+    std::string to_addr;
+    std::string change_addr;
+    std::uint64_t amount = 0;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
+      else if (a == "--to-address" && i + 1 < argc) to_addr = argv[++i];
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto prev_txid = decode_hex32(prev_txid_hex);
+    auto priv = decode_hex32(from_priv_hex);
+    auto to = selfcoin::address::decode(to_addr);
+    if (!prev_txid.has_value() || !priv.has_value() || !to.has_value()) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+    if (prev_value < amount + fee) {
+      std::cerr << "insufficient prev output value\n";
+      return 1;
+    }
+
+    selfcoin::OutPoint op{*prev_txid, prev_index};
+
+    auto kp = selfcoin::crypto::keypair_from_seed32(*priv);
+    if (!kp.has_value()) {
+      std::cerr << "invalid private key\n";
+      return 1;
+    }
+    auto from_pkh = selfcoin::crypto::h160(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end()));
+    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(from_pkh)};
+
+    std::vector<selfcoin::TxOut> outputs;
+    outputs.push_back(selfcoin::TxOut{amount, selfcoin::address::p2pkh_script_pubkey(to->pubkey_hash)});
+
+    const std::uint64_t change = prev_value - amount - fee;
+    if (change > 0) {
+      if (!change_addr.empty()) {
+        auto ch = selfcoin::address::decode(change_addr);
+        if (!ch.has_value()) {
+          std::cerr << "invalid --change-address\n";
+          return 1;
+        }
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash)});
+      } else {
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(from_pkh)});
+      }
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_signed_p2pkh_tx_single_input(op, prev_out, selfcoin::Bytes(priv->begin(), priv->end()), outputs, &err);
+    if (!tx.has_value()) {
+      std::cerr << "build tx failed: " << err << "\n";
+      return 1;
+    }
+
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "broadcast_tx") {
+    std::string host = "127.0.0.1";
+    std::uint16_t port = 18444;
+    std::string tx_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--host" && i + 1 < argc) host = argv[++i];
+      else if (a == "--port" && i + 1 < argc) port = static_cast<std::uint16_t>(std::stoi(argv[++i]));
+      else if (a == "--tx-hex" && i + 1 < argc) tx_hex = argv[++i];
+    }
+    if (tx_hex.empty()) {
+      std::cerr << "--tx-hex is required\n";
+      return 1;
+    }
+
+    auto raw = selfcoin::hex_decode(tx_hex);
+    if (!raw.has_value() || !selfcoin::Tx::parse(*raw).has_value()) {
+      std::cerr << "invalid tx hex\n";
+      return 1;
+    }
+
+    auto fd_opt = connect_tcp(host, port);
+    if (!fd_opt.has_value()) {
+      std::cerr << "connect failed\n";
+      return 1;
+    }
+    const int fd = *fd_opt;
+
+    bool ok = do_handshake_v0(fd);
+    if (!ok) {
+      ::close(fd);
+      std::cerr << "handshake failed\n";
+      return 1;
+    }
+
+    ok = selfcoin::p2p::write_frame_fd(fd, selfcoin::p2p::Frame{selfcoin::p2p::MsgType::TX, selfcoin::p2p::ser_tx(selfcoin::p2p::TxMsg{*raw})});
+    ::close(fd);
+    if (!ok) {
+      std::cerr << "send tx failed\n";
+      return 1;
+    }
+    std::cout << "broadcasted tx\n";
     return 0;
   }
 

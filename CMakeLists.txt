@@ -32,6 +32,8 @@ add_library(selfcoin_core
   src/address/address.cpp
   src/utxo/tx.cpp
   src/utxo/validate.cpp
+  src/utxo/signing.cpp
+  src/mempool/mempool.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
@@ -66,6 +68,7 @@ add_executable(selfcoin-tests
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_mempool.cpp
   tests/test_integration.cpp
 )
 target_link_libraries(selfcoin-tests PRIVATE selfcoin_core)

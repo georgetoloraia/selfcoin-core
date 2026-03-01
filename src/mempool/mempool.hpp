@@ -1,0 +1,45 @@
+#pragma once
+
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "utxo/tx.hpp"
+
+namespace selfcoin::mempool {
+
+using UtxoView = UtxoSet;
+
+struct MempoolEntry {
+  Tx tx;
+  Hash32 txid;
+  std::uint64_t fee{0};
+  std::size_t size_bytes{0};
+};
+
+class Mempool {
+ public:
+  static constexpr std::size_t kMaxTxBytes = 100 * 1024;
+  static constexpr std::size_t kMaxTxCount = 10'000;
+  static constexpr std::size_t kMaxPoolBytes = 10 * 1024 * 1024;
+
+  bool accept_tx(const Tx& tx, const UtxoView& view, std::string* err);
+  std::vector<Tx> select_for_block(std::size_t max_txs, std::size_t max_bytes, const UtxoView& view) const;
+  void remove_confirmed(const std::vector<Hash32>& txids);
+  void prune_against_utxo(const UtxoView& view);
+  std::size_t size() const;
+  bool contains(const Hash32& txid) const;
+
+ private:
+  struct TxMeta {
+    MempoolEntry entry;
+    std::vector<OutPoint> spent;
+  };
+
+  std::map<Hash32, TxMeta> by_txid_;
+  std::map<OutPoint, Hash32> spent_outpoints_;
+  std::size_t total_bytes_{0};
+};
+
+}  // namespace selfcoin::mempool

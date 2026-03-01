@@ -16,6 +16,7 @@ enum MsgType : std::uint16_t {
   VOTE = 6,
   GET_BLOCK = 7,
   BLOCK = 8,
+  TX = 9,
 };
 
 struct VersionMsg {
@@ -52,6 +53,10 @@ struct BlockMsg {
   Bytes block_bytes;
 };
 
+struct TxMsg {
+  Bytes tx_bytes;
+};
+
 Bytes ser_version(const VersionMsg& m);
 std::optional<VersionMsg> de_version(const Bytes& b);
 Bytes ser_finalized_tip(const FinalizedTipMsg& m);
@@ -64,5 +69,7 @@ Bytes ser_get_block(const GetBlockMsg& m);
 std::optional<GetBlockMsg> de_get_block(const Bytes& b);
 Bytes ser_block(const BlockMsg& m);
 std::optional<BlockMsg> de_block(const Bytes& b);
+Bytes ser_tx(const TxMsg& m);
+std::optional<TxMsg> de_tx(const Bytes& b);
 
 }  // namespace selfcoin::p2p

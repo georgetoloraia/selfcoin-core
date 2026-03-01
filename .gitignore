@@ -39,3 +39,6 @@
 
 # debug information files
 *.dwo
+
+# build and binary files
+build/

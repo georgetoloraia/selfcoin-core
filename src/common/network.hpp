@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
 
 #include "common/types.hpp"
 
@@ -11,8 +12,10 @@ namespace selfcoin {
 
 struct NetworkConfig {
   std::string name;
+  std::array<std::uint8_t, 16> network_id{};
   std::uint32_t magic{MAGIC};
   std::uint16_t protocol_version{PROTOCOL_VERSION};
+  std::uint64_t feature_flags{0};
   std::uint16_t p2p_default_port{18444};
   std::uint16_t lightserver_default_port{19444};
   std::size_t max_committee{MAX_COMMITTEE};
@@ -29,4 +32,3 @@ const NetworkConfig& testnet_network();
 const NetworkConfig& network_by_name(const std::string& name);
 
 }  // namespace selfcoin
-

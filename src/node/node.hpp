@@ -65,6 +65,9 @@ struct NodeStatus {
   std::size_t peers{0};
   std::size_t mempool_size{0};
   std::size_t committee_size{0};
+  std::uint64_t rejected_network_id{0};
+  std::uint64_t rejected_protocol_version{0};
+  std::uint64_t rejected_pre_handshake{0};
 };
 
 class Node {
@@ -92,6 +95,7 @@ class Node {
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
+  std::uint16_t p2p_port_for_test() const;
 
   static std::vector<crypto::KeyPair> devnet_keypairs();
 
@@ -152,6 +156,9 @@ class Node {
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
   std::map<int, std::string> peer_ip_cache_;
+  std::uint64_t rejected_network_id_{0};
+  std::uint64_t rejected_protocol_version_{0};
+  std::uint64_t rejected_pre_handshake_{0};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

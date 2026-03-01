@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <functional>
 #include <map>
 #include <memory>
@@ -21,6 +22,9 @@ struct PeerInfo {
   bool verack_rx{false};
   bool version_tx{false};
   bool verack_tx{false};
+  std::uint32_t proto_version{0};
+  std::array<std::uint8_t, 16> network_id{};
+  std::uint64_t feature_flags{0};
 
   bool established() const { return version_rx && verack_rx && version_tx && verack_tx; }
 };
@@ -60,8 +64,11 @@ class PeerManager {
 
   std::vector<int> peer_ids() const;
   PeerInfo get_peer_info(int peer_id) const;
+  std::uint16_t listener_port() const { return listen_port_; }
   bool mark_handshake_tx(int peer_id, bool version, bool verack);
   bool mark_handshake_rx(int peer_id, bool version, bool verack);
+  bool set_peer_handshake_meta(int peer_id, std::uint32_t proto_version, const std::array<std::uint8_t, 16>& network_id,
+                               std::uint64_t feature_flags);
 
  private:
   struct PeerConn {
@@ -79,6 +86,7 @@ class PeerManager {
   void emit_event(int peer_id, PeerEventType type, const std::string& detail) const;
 
   int listen_fd_{-1};
+  std::uint16_t listen_port_{0};
   std::thread accept_thread_;
   std::atomic<bool> running_{false};
 

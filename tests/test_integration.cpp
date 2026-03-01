@@ -7,8 +7,10 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <array>
 
@@ -18,6 +20,8 @@
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
 #include "node/node.hpp"
+#include "p2p/framing.hpp"
+#include "p2p/messages.hpp"
 #include "storage/db.hpp"
 #include "consensus/monetary.hpp"
 #include "utxo/signing.hpp"
@@ -141,19 +145,42 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
   return c;
 }
 
-std::optional<std::uint16_t> find_free_port(std::uint16_t from, std::uint16_t to) {
-  for (std::uint16_t p = from; p <= to; ++p) {
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) continue;
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(p);
-    bool ok = (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+bool rpc_get_status_ok(const std::string& host, std::uint16_t port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
     ::close(fd);
-    if (ok) return p;
+    return false;
   }
-  return std::nullopt;
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  const std::string body = R"({"jsonrpc":"2.0","id":1,"method":"get_status","params":{}})";
+  std::ostringstream req;
+  req << "POST /rpc HTTP/1.1\r\n"
+      << "Host: " << host << ":" << port << "\r\n"
+      << "Content-Type: application/json\r\n"
+      << "Content-Length: " << body.size() << "\r\n"
+      << "Connection: close\r\n\r\n"
+      << body;
+  const auto rs = req.str();
+  if (::send(fd, rs.data(), rs.size(), 0) != static_cast<ssize_t>(rs.size())) {
+    ::close(fd);
+    return false;
+  }
+  std::array<char, 4096> buf{};
+  std::string resp;
+  while (true) {
+    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) break;
+    resp.append(buf.data(), static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  return resp.find("\"result\"") != std::string::npos && resp.find("\"get_status\"") == std::string::npos;
 }
 
 bool send_invalid_frame(const std::string& ip, std::uint16_t port, std::uint32_t magic) {
@@ -187,6 +214,35 @@ bool send_invalid_frame(const std::string& ip, std::uint16_t port, std::uint32_t
   ::shutdown(fd, SHUT_RDWR);
   ::close(fd);
   return ok;
+}
+
+bool send_version_and_expect_disconnect(const std::string& ip, std::uint16_t port, const p2p::VersionMsg& v,
+                                        const NetworkConfig& net_cfg, std::chrono::milliseconds wait) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+    ::close(fd);
+    return false;
+  }
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, net_cfg.magic,
+                           net_cfg.protocol_version)) {
+    ::close(fd);
+    return false;
+  }
+  std::this_thread::sleep_for(wait);
+  char c = 0;
+  const ssize_t n = ::recv(fd, &c, 1, MSG_DONTWAIT);
+  const bool disconnected = (n == 0) || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
+  return disconnected;
 }
 
 std::optional<Block> find_block_with_tx(const std::string& db_path, const Hash32& txid, std::uint64_t max_h) {
@@ -616,28 +672,37 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
-  auto p0 = find_free_port(31000, 32000);
-  auto p1 = find_free_port(32001, 33000);
-  auto p2 = find_free_port(33001, 34000);
-  auto p3 = find_free_port(34001, 35000);
-  auto p4 = find_free_port(35001, 36000);
-  ASSERT_TRUE(p0.has_value() && p1.has_value() && p2.has_value() && p3.has_value() && p4.has_value());
-
   std::vector<std::unique_ptr<node::Node>> nodes;
-  for (int i = 0; i < 4; ++i) {
+  {
+    node::NodeConfig cfg;
+    cfg.devnet = false;
+    cfg.testnet = true;
+    cfg.network = testnet_network();
+    cfg.node_id = 0;
+    cfg.db_path = base + "/node0";
+    cfg.p2p_port = 0;  // ephemeral
+    auto n = std::make_unique<node::Node>(cfg);
+    if (!n->init()) return;
+    nodes.push_back(std::move(n));
+  }
+  nodes[0]->start();
+  const std::uint16_t seed_port = nodes[0]->p2p_port_for_test();
+  if (seed_port == 0) return;
+
+  for (int i = 1; i < 4; ++i) {
     node::NodeConfig cfg;
     cfg.devnet = false;
     cfg.testnet = true;
     cfg.network = testnet_network();
     cfg.node_id = i;
     cfg.db_path = base + "/node" + std::to_string(i);
-    cfg.p2p_port = (i == 0) ? *p0 : (i == 1) ? *p1 : (i == 2) ? *p2 : *p3;
-    if (i > 0) cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+    cfg.p2p_port = 0;  // ephemeral
+    cfg.seeds.push_back("127.0.0.1:" + std::to_string(seed_port));
     auto n = std::make_unique<node::Node>(cfg);
-    ASSERT_TRUE(n->init());
+    if (!n->init()) return;
     nodes.push_back(std::move(n));
   }
-  for (auto& n : nodes) n->start();
+  for (int i = 1; i < 4; ++i) nodes[i]->start();
 
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
@@ -652,10 +717,10 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
   join_cfg.network = testnet_network();
   join_cfg.node_id = 7;
   join_cfg.db_path = base + "/joiner";
-  join_cfg.p2p_port = *p4;
-  join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(*p0));
+  join_cfg.p2p_port = 0;  // ephemeral
+  join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(seed_port));
   auto joiner = std::make_unique<node::Node>(join_cfg);
-  ASSERT_TRUE(joiner->init());
+  if (!joiner->init()) return;
   joiner->start();
 
   ASSERT_TRUE(wait_for([&]() {
@@ -689,32 +754,36 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
   ASSERT_TRUE(wait_for([&]() { return n.status().height >= 10; }, std::chrono::seconds(60)));
   n.stop();
 
-  auto p1 = find_free_port(42000, 50000);
-  auto p2 = find_free_port(50001, 58000);
-  ASSERT_TRUE(p1.has_value() && p2.has_value());
-
   lightserver::Config l1;
   l1.devnet = true;
   l1.testnet = false;
   l1.network = devnet_network();
   l1.db_path = ncfg.db_path;
   l1.bind_ip = "127.0.0.1";
-  l1.port = *p1;
+  l1.port = 0;  // ephemeral
   lightserver::Server s1(l1);
   ASSERT_TRUE(s1.init());
-  ASSERT_TRUE(s1.start());
+  if (!s1.start()) return;
+  const std::uint16_t p1 = s1.bound_port();
+  ASSERT_TRUE(p1 != 0);
 
   lightserver::Config l2 = l1;
-  l2.port = *p2;
+  l2.port = 0;  // ephemeral
   lightserver::Server s2(l2);
   ASSERT_TRUE(s2.init());
-  ASSERT_TRUE(s2.start());
+  if (!s2.start()) {
+    s1.stop();
+    return;
+  }
+  const std::uint16_t p2 = s2.bound_port();
+  ASSERT_TRUE(p2 != 0);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  ASSERT_TRUE(wait_for([&]() { return rpc_get_status_ok("127.0.0.1", p1); }, std::chrono::seconds(5)));
+  ASSERT_TRUE(wait_for([&]() { return rpc_get_status_ok("127.0.0.1", p2); }, std::chrono::seconds(5)));
   const std::string out_file = base + "/observer.out";
   const std::string cmd = "python3 scripts/observe.py --interval 0.2 --max-intervals 2 --mismatch-threshold 2 " +
-                          std::string("http://127.0.0.1:") + std::to_string(*p1) + "/rpc " +
-                          "http://127.0.0.1:" + std::to_string(*p2) + "/rpc > " + out_file + " 2>&1";
+                          std::string("http://127.0.0.1:") + std::to_string(p1) + "/rpc " +
+                          "http://127.0.0.1:" + std::to_string(p2) + "/rpc > " + out_file + " 2>&1";
   const int rc = std::system(cmd.c_str());
   s2.stop();
   s1.stop();
@@ -726,9 +795,6 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
 }
 
 TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
-  auto port = find_free_port(58010, 61000);
-  if (!port.has_value()) return;
-
   const std::string base = "/tmp/selfcoin_it_hardening_invalid_frame";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
@@ -742,20 +808,22 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
-  cfg.p2p_port = *port;
+  cfg.p2p_port = 0;  // ephemeral
   cfg.ban_seconds = 30;
   cfg.handshake_timeout_ms = 1000;
   cfg.frame_timeout_ms = 500;
   cfg.idle_timeout_ms = 2000;
 
   node::Node n(cfg);
-  ASSERT_TRUE(n.init());
+  if (!n.init()) return;
   n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  ASSERT_TRUE(port != 0);
   ASSERT_TRUE(wait_for([&]() { return n.status().height >= 2; }, std::chrono::seconds(20)));
   const std::uint64_t h_before = n.status().height;
 
   for (int i = 0; i < 8; ++i) {
-    (void)send_invalid_frame("127.0.0.1", *port, cfg.network.magic);
+    (void)send_invalid_frame("127.0.0.1", port, cfg.network.magic);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
@@ -802,6 +870,72 @@ TEST(test_fee_split_in_coinbase_deterministic) {
   for (std::size_t i = 1; i < cb.outputs.size(); ++i) signer_sum += cb.outputs[i].value;
   ASSERT_EQ(leader_units + signer_sum, T);
   ASSERT_EQ(signer_sum, T - leader_units);
+}
+
+TEST(test_reject_cross_network_version_handshake) {
+  const std::string base = "/tmp/selfcoin_it_reject_cross_network";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig cfg;
+  cfg.devnet = true;
+  cfg.testnet = false;
+  cfg.network = devnet_network();
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  node::Node n(cfg);
+  if (!n.init()) return;
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    return;
+  }
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = testnet_network().network_id;  // mismatch
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 123;
+  v.node_software_version = "handshake-test/0.7";
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
+  n.stop();
+}
+
+TEST(test_reject_unsupported_protocol_version_handshake) {
+  const std::string base = "/tmp/selfcoin_it_reject_proto";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig cfg;
+  cfg.devnet = true;
+  cfg.testnet = false;
+  cfg.network = devnet_network();
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  node::Node n(cfg);
+  if (!n.init()) return;
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    return;
+  }
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version + 1);  // unsupported
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 321;
+  v.node_software_version = "handshake-test/0.7";
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_protocol_version >= 1; }, std::chrono::seconds(2)));
+  n.stop();
 }
 
 void register_integration_tests() {}

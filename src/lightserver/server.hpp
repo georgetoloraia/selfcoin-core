@@ -34,6 +34,7 @@ class Server {
   bool start();
   void stop();
   std::string handle_rpc_for_test(const std::string& body);
+  std::uint16_t bound_port() const { return bound_port_; }
 
  private:
   void accept_loop();
@@ -49,6 +50,7 @@ class Server {
   Config cfg_;
   storage::DB db_;
   int listen_fd_{-1};
+  std::uint16_t bound_port_{0};
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
   std::uint64_t started_at_unix_{0};

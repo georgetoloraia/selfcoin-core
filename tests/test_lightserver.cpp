@@ -173,6 +173,9 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   auto status_resp = ls->handle_rpc_for_test(R"({"jsonrpc":"2.0","id":11,"method":"get_status","params":{}})");
   ASSERT_TRUE(status_resp.find("\"uptime_s\"") != std::string::npos);
   ASSERT_TRUE(status_resp.find("\"version\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"network_name\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"protocol_version\"") != std::string::npos);
+  ASSERT_TRUE(status_resp.find("\"feature_flags\"") != std::string::npos);
 
   auto headers_resp = ls->handle_rpc_for_test(
       R"({"jsonrpc":"2.0","id":2,"method":"get_headers","params":{"from_height":1,"count":2}})");

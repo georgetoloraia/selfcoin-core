@@ -38,6 +38,13 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
     listen_fd_ = -1;
     return false;
   }
+  sockaddr_in bound{};
+  socklen_t blen = sizeof(bound);
+  if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+    listen_port_ = ntohs(bound.sin_port);
+  } else {
+    listen_port_ = port;
+  }
   if (listen(listen_fd_, 64) != 0) {
     ::close(listen_fd_);
     listen_fd_ = -1;
@@ -78,6 +85,7 @@ void PeerManager::stop() {
     ::shutdown(listen_fd_, SHUT_RDWR);
     ::close(listen_fd_);
     listen_fd_ = -1;
+    listen_port_ = 0;
   }
 
   if (accept_thread_.joinable()) accept_thread_.join();
@@ -183,6 +191,17 @@ bool PeerManager::mark_handshake_rx(int peer_id, bool version, bool verack) {
   if (it == peers_.end()) return false;
   if (version) it->second->info.version_rx = true;
   if (verack) it->second->info.verack_rx = true;
+  return true;
+}
+
+bool PeerManager::set_peer_handshake_meta(int peer_id, std::uint32_t proto_version,
+                                          const std::array<std::uint8_t, 16>& network_id, std::uint64_t feature_flags) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = peers_.find(peer_id);
+  if (it == peers_.end()) return false;
+  it->second->info.proto_version = proto_version;
+  it->second->info.network_id = network_id;
+  it->second->info.feature_flags = feature_flags;
   return true;
 }
 

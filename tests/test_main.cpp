@@ -14,6 +14,7 @@ void register_codec_tests();
 void register_crypto_tests();
 void register_address_tests();
 void register_consensus_tests();
+void register_p2p_tests();
 void register_monetary_tests();
 void register_bonding_tests();
 void register_mempool_tests();
@@ -26,6 +27,7 @@ int main() {
   register_crypto_tests();
   register_address_tests();
   register_consensus_tests();
+  register_p2p_tests();
   register_monetary_tests();
   register_bonding_tests();
   register_mempool_tests();

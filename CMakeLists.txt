@@ -95,6 +95,7 @@ add_executable(selfcoin-tests
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_p2p.cpp
   tests/test_monetary.cpp
   tests/test_bonding.cpp
   tests/test_mempool.cpp
@@ -125,3 +126,4 @@ endif()
 
 enable_testing()
 add_test(NAME selfcoin-tests COMMAND selfcoin-tests)
+set_tests_properties(selfcoin-tests PROPERTIES RESOURCE_LOCK ports)

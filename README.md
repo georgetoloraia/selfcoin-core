@@ -61,6 +61,21 @@ Testnet bootstrap:
 - built-in default seeds are used when `--testnet` is set and `--seeds` is omitted
 - peer cache persisted at `<db>/peers.dat`
 
+## Handshake Version Policy (v0.7)
+
+`VERSION` payload now carries explicit network/protocol identity:
+- `protocol_version` (`u32`)
+- `network_id` (`16 bytes`)
+- `feature_flags` (`u64`)
+- `node_software_version` (`varbytes string`)
+- plus existing tip/time fields
+
+Handshake acceptance policy:
+- framing `magic` mismatch: reject/disconnect
+- `network_id` mismatch: reject/disconnect (counted as peer rejection)
+- unsupported `protocol_version`: reject/disconnect (graceful, no ban score)
+- consensus messages are ignored/rejected before full `VERSION`/`VERACK`
+
 ## Build
 
 Requirements:
@@ -168,6 +183,11 @@ Or with CTest:
 cd build && ctest --output-on-failure
 ```
 
+Network regression loop (10 runs for flaky-port checks):
+```bash
+./scripts/run_network_regression.sh
+```
+
 Example tx/mempool logs:
 ```text
 [node 1] mempool-accept txid=... mempool_size=1
@@ -230,7 +250,7 @@ curl -s http://127.0.0.1:19444/rpc -d '{"jsonrpc":"2.0","id":7,"method":"broadca
 
 `get_status` response shape:
 ```json
-{"tip":{"height":123,"hash":"..."}, "peers":null, "mempool_size":null, "uptime_s":42, "version":"selfcoin-core/0.4", "network":"testnet"}
+{"network_name":"testnet","protocol_version":1,"feature_flags":1,"tip":{"height":123,"hash":"..."},"peers":null,"mempool_size":null,"uptime_s":42,"version":"selfcoin-core/0.7"}
 ```
 
 ## Observer

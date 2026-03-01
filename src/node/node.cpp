@@ -67,7 +67,6 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 
 bool Node::init() {
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
-  if (cfg_.p2p_port == 0) cfg_.p2p_port = cfg_.network.p2p_default_port;
   if (cfg_.testnet && cfg_.min_relay_fee == 0) cfg_.min_relay_fee = 1000;
   discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds);
   if (!db_.open(cfg_.db_path)) {
@@ -153,6 +152,7 @@ bool Node::init() {
       std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
       return false;
     }
+    cfg_.p2p_port = p2p_.listener_port();
     try_connect_bootstrap_peers();
   }
 
@@ -192,6 +192,9 @@ NodeStatus Node::status() const {
   s.peers = peer_count();
   s.mempool_size = mempool_.size();
   s.committee_size = committee_for_height(finalized_height_ + 1).size();
+  s.rejected_network_id = rejected_network_id_;
+  s.rejected_protocol_version = rejected_protocol_version_;
+  s.rejected_pre_handshake = rejected_pre_handshake_;
   return s;
 }
 
@@ -262,6 +265,7 @@ std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubK
   std::lock_guard<std::mutex> lk(mu_);
   return validators_.get(pub);
 }
+std::uint16_t Node::p2p_port_for_test() const { return cfg_.p2p_port; }
 
 void Node::event_loop() {
   while (running_) {
@@ -302,7 +306,10 @@ void Node::event_loop() {
           j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
             << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
-            << ",\"committee_size\":" << committee.size() << "}";
+            << ",\"committee_size\":" << committee.size()
+            << ",\"rejected_network_id\":" << rejected_network_id_
+            << ",\"rejected_protocol_version\":" << rejected_protocol_version_
+            << ",\"rejected_pre_handshake\":" << rejected_pre_handshake_ << "}";
           std::cout << j.str() << "\n";
         }
       }
@@ -342,16 +349,20 @@ void Node::send_version(int peer_id) {
   auto tip = db_.get_tip();
   p2p::VersionMsg v;
   v.timestamp = now_unix();
+  v.proto_version = static_cast<std::uint32_t>(cfg_.network.protocol_version);
+  v.network_id = cfg_.network.network_id;
+  v.feature_flags = cfg_.network.feature_flags;
   v.nonce = static_cast<std::uint32_t>(cfg_.node_id + 1000);
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
+  v.node_software_version = "selfcoin-node/0.7";
 
-  p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
+  (void)p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   p2p_.mark_handshake_tx(peer_id, true, false);
 }
 
 void Node::maybe_send_verack(int peer_id) {
-  p2p_.send_to(peer_id, p2p::MsgType::VERACK, {});
+  (void)p2p_.send_to(peer_id, p2p::MsgType::VERACK, {});
   p2p_.mark_handshake_tx(peer_id, false, true);
 }
 
@@ -368,10 +379,31 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   if (msg_type == p2p::MsgType::VERSION) {
     auto v = p2p::de_version(payload);
-    if (!v.has_value() || v->proto_version != cfg_.network.protocol_version) {
+    if (!v.has_value()) {
       score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-version");
       return;
     }
+    if (v->network_id != cfg_.network.network_id) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++rejected_network_id_;
+      }
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-mismatch");
+      score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "network-id-mismatch");
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    if (v->proto_version != static_cast<std::uint32_t>(cfg_.network.protocol_version)) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++rejected_protocol_version_;
+      }
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=unsupported-protocol peer_proto=" +
+               std::to_string(v->proto_version) + " local_proto=" + std::to_string(cfg_.network.protocol_version));
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    p2p_.set_peer_handshake_meta(peer_id, v->proto_version, v->network_id, v->feature_flags);
     p2p_.mark_handshake_rx(peer_id, true, false);
 
     auto info = p2p_.get_peer_info(peer_id);
@@ -393,6 +425,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++rejected_pre_handshake_;
+    }
     score_peer(peer_id, p2p::MisbehaviorReason::PRE_HANDSHAKE_CONSENSUS, "pre-handshake-msg");
     return;
   }

@@ -1,12 +1,26 @@
 #include "common/network.hpp"
 
+#include <algorithm>
+
+#include "crypto/hash.hpp"
+
 namespace selfcoin {
 namespace {
 
+std::array<std::uint8_t, 16> network_id_for_name(const std::string& name) {
+  const std::string s = "selfcoin:" + name;
+  const Hash32 h = crypto::sha256(Bytes(s.begin(), s.end()));
+  std::array<std::uint8_t, 16> out{};
+  std::copy(h.begin(), h.begin() + 16, out.begin());
+  return out;
+}
+
 const NetworkConfig kDevnet{
     .name = "devnet",
+    .network_id = network_id_for_name("devnet"),
     .magic = MAGIC,
     .protocol_version = PROTOCOL_VERSION,
+    .feature_flags = 1ULL,  // bit0: strict-version-handshake-v0.7
     .p2p_default_port = 18444,
     .lightserver_default_port = 19444,
     .max_committee = MAX_COMMITTEE,
@@ -20,8 +34,10 @@ const NetworkConfig kDevnet{
 
 const NetworkConfig kTestnet{
     .name = "testnet",
+    .network_id = network_id_for_name("testnet"),
     .magic = 0x5343544E,  // "SCTN"
     .protocol_version = PROTOCOL_VERSION,
+    .feature_flags = 1ULL,  // bit0: strict-version-handshake-v0.7
     .p2p_default_port = 28444,
     .lightserver_default_port = 29444,
     .max_committee = MAX_COMMITTEE,
@@ -49,4 +65,3 @@ const NetworkConfig& network_by_name(const std::string& name) {
 }
 
 }  // namespace selfcoin
-

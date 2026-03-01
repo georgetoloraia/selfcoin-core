@@ -95,5 +95,7 @@ struct UtxoEntry {
 using UtxoSet = std::map<OutPoint, UtxoEntry>;
 
 bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
+bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
+bool is_burn_script(const Bytes& script, Hash32* out_evidence_hash = nullptr);
 
 }  // namespace selfcoin

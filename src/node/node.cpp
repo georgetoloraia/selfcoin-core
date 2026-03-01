@@ -67,9 +67,17 @@ bool Node::init() {
     local_key_ = keys[cfg_.node_id];
 
     if (validators_.all().empty()) {
-      for (const auto& kp : keys) {
-        validators_.upsert(kp.public_key, consensus::ValidatorInfo{consensus::ValidatorStatus::ACTIVE, 0});
-        db_.put_validator(kp.public_key, consensus::ValidatorInfo{consensus::ValidatorStatus::ACTIVE, 0});
+      const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
+      for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
+        const auto& kp = keys[idx];
+        consensus::ValidatorInfo vi;
+        vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
+        vi.joined_height = 0;
+        vi.has_bond = (idx < n_active);
+        vi.bond_outpoint = OutPoint{zero_hash(), 0};
+        vi.unbond_height = 0;
+        validators_.upsert(kp.public_key, vi);
+        db_.put_validator(kp.public_key, vi);
       }
     }
     is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
@@ -137,6 +145,7 @@ bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, fal
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
+  mempool_.set_validation_context(SpecialValidationContext{&validators_, finalized_height_ + 1});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -175,6 +184,10 @@ std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return validators_.active_sorted(finalized_height_ + 1);
 }
+std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return validators_.get(pub);
+}
 
 void Node::event_loop() {
   while (running_) {
@@ -183,6 +196,7 @@ void Node::event_loop() {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
+      mempool_.set_validation_context(SpecialValidationContext{&validators_, h});
       const auto active = validators_.active_sorted(h);
       const auto leader = consensus::select_leader(finalized_hash_, h, current_round_, active);
 
@@ -308,9 +322,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             confirmed_txids.reserve(blk->txs.size());
             for (const auto& tx : blk->txs) confirmed_txids.push_back(tx.txid());
             mempool_.remove_confirmed(confirmed_txids);
+            UtxoSet pre_utxos = utxos_;
+            apply_validator_state_changes(*blk, pre_utxos, blk->header.height);
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
-            apply_validator_registrations(*blk, blk->header.height);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             current_round_ = 0;
@@ -380,7 +395,8 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto merkle_root = merkle::compute_merkle_root_from_txs(tx_bytes);
     if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) return false;
 
-    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD);
+    SpecialValidationContext vctx{&validators_, msg.height};
+    auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx);
     if (!valid.ok) return false;
 
     Hash32 bid = blk->header.block_id();
@@ -416,7 +432,8 @@ bool Node::handle_vote(const Vote& vote, bool from_network) {
   auto tr = votes_.add_vote(vote);
   if (tr.equivocation && tr.evidence.has_value()) {
     validators_.ban(vote.validator_pubkey);
-    db_.put_validator(vote.validator_pubkey, consensus::ValidatorInfo{consensus::ValidatorStatus::BANNED, vote.height});
+    auto vi = validators_.get(vote.validator_pubkey);
+    if (vi.has_value()) db_.put_validator(vote.validator_pubkey, *vi);
     log_line("equivocation-banned validator=" + hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
              " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
   }
@@ -434,6 +451,7 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
+    mempool_.set_validation_context(SpecialValidationContext{&validators_, finalized_height_ + 1});
     std::string err;
     if (!mempool_.accept_tx(tx, utxos_, &err)) {
       return false;
@@ -475,9 +493,10 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   confirmed_txids.reserve(b.txs.size());
   for (const auto& tx : b.txs) confirmed_txids.push_back(tx.txid());
   mempool_.remove_confirmed(confirmed_txids);
+  UtxoSet pre_utxos = utxos_;
+  apply_validator_state_changes(b, pre_utxos, height);
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
-  apply_validator_registrations(b, height);
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
@@ -526,8 +545,9 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   }
 
   std::uint64_t total_fees = 0;
+  SpecialValidationContext vctx{&validators_, height};
   for (const auto& tx : picked) {
-    auto vr = validate_tx(tx, 1, utxos_);
+    auto vr = validate_tx(tx, 1, utxos_, &vctx);
     if (vr.ok) total_fees += vr.fee;
   }
 
@@ -667,16 +687,50 @@ bool Node::load_state() {
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
 
+  if (validators_.all().empty() && finalized_height_ > 0) {
+    UtxoSet replay_utxos;
+    for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) continue;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) continue;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) continue;
+      apply_validator_state_changes(*blk, replay_utxos, h);
+      apply_block_to_utxo(*blk, replay_utxos);
+    }
+  }
+
   return true;
 }
 
-void Node::apply_validator_registrations(const Block& block, std::uint64_t height) {
-  for (const auto& tx : block.txs) {
-    for (const auto& out : tx.outputs) {
+void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
+  for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    for (const auto& in : tx.inputs) {
+      OutPoint op{in.prev_txid, in.prev_index};
+      auto it = pre_utxos.find(op);
+      if (it == pre_utxos.end()) continue;
+      PubKey32 pub{};
+      if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        validators_.ban(pub);
+      } else {
+        validators_.request_unbond(pub, height);
+      }
+    }
+  }
+
+  for (size_t txi = 0; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-        validators_.register_pending(pub, height);
-        db_.put_validator(pub, consensus::ValidatorInfo{consensus::ValidatorStatus::PENDING, height});
+        validators_.register_bond(pub, OutPoint{txid, out_i}, height);
       }
     }
   }
@@ -733,6 +787,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       }
     } else if (a == "--disable-p2p") {
       cfg.disable_p2p = true;
+    } else if (a == "--devnet-initial-active") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.devnet_initial_active_validators = std::stoi(*v);
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

@@ -26,6 +26,7 @@ struct NodeConfig {
   std::vector<std::string> peers;
   std::string db_path{"./data/node"};
   bool disable_p2p{false};
+  int devnet_initial_active_validators{4};
 };
 
 struct NodeStatus {
@@ -57,6 +58,7 @@ class Node {
                                                          OutPoint* outpoint = nullptr) const;
   bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
+  std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
 
   static std::vector<crypto::KeyPair> devnet_keypairs();
 
@@ -80,7 +82,7 @@ class Node {
 
   bool persist_finalized_block(const Block& block);
   bool load_state();
-  void apply_validator_registrations(const Block& block, std::uint64_t height);
+  void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
 
   std::uint64_t now_unix() const;
   void log_line(const std::string& s) const;

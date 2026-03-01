@@ -68,6 +68,7 @@ add_executable(selfcoin-tests
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_bonding.cpp
   tests/test_mempool.cpp
   tests/test_integration.cpp
 )

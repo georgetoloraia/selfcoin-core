@@ -84,6 +84,10 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(info.status));
   w.u64le(info.joined_height);
+  w.u8(info.has_bond ? 1 : 0);
+  w.bytes_fixed(info.bond_outpoint.txid);
+  w.u32le(info.bond_outpoint.index);
+  w.u64le(info.unbond_height);
   return w.take();
 }
 
@@ -95,6 +99,20 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         if (!st || !h) return false;
         info.status = static_cast<consensus::ValidatorStatus>(*st);
         info.joined_height = *h;
+        if (r.eof()) {
+          // Backward compatibility for v0 records.
+          info.has_bond = true;
+          info.unbond_height = 0;
+          return true;
+        }
+        auto has_bond = r.u8();
+        auto txid = r.bytes_fixed<32>();
+        auto idx = r.u32le();
+        auto unbond = r.u64le();
+        if (!has_bond || !txid || !idx || !unbond) return false;
+        info.has_bond = (*has_bond != 0);
+        info.bond_outpoint = OutPoint{*txid, *idx};
+        info.unbond_height = *unbond;
         return true;
       })) {
     return std::nullopt;

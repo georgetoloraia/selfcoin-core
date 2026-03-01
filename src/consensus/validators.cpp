@@ -9,17 +9,30 @@ namespace selfcoin::consensus {
 
 void ValidatorRegistry::upsert(PubKey32 pub, ValidatorInfo info) { validators_[pub] = info; }
 
-void ValidatorRegistry::register_pending(const PubKey32& pub, std::uint64_t joined_height) {
+void ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
   auto& v = validators_[pub];
-  if (v.status == ValidatorStatus::BANNED) return;
   v.status = ValidatorStatus::PENDING;
   v.joined_height = joined_height;
+  v.has_bond = true;
+  v.bond_outpoint = bond_outpoint;
+  v.unbond_height = 0;
+}
+
+bool ValidatorRegistry::request_unbond(const PubKey32& pub, std::uint64_t height) {
+  auto it = validators_.find(pub);
+  if (it == validators_.end()) return false;
+  if (it->second.status == ValidatorStatus::BANNED) return false;
+  if (!it->second.has_bond) return false;
+  it->second.status = ValidatorStatus::EXITING;
+  it->second.unbond_height = height;
+  return true;
 }
 
 void ValidatorRegistry::ban(const PubKey32& pub) {
   auto it = validators_.find(pub);
   if (it != validators_.end()) {
     it->second.status = ValidatorStatus::BANNED;
+    it->second.has_bond = false;
   }
 }
 
@@ -34,7 +47,7 @@ void ValidatorRegistry::advance_height(std::uint64_t height) {
 std::vector<PubKey32> ValidatorRegistry::active_sorted(std::uint64_t height) const {
   std::vector<PubKey32> out;
   for (const auto& [pub, info] : validators_) {
-    if (info.status == ValidatorStatus::ACTIVE ||
+    if ((info.status == ValidatorStatus::ACTIVE && info.has_bond) ||
         (info.status == ValidatorStatus::PENDING && height >= info.joined_height + WARMUP_BLOCKS)) {
       out.push_back(pub);
     }
@@ -46,8 +59,9 @@ std::vector<PubKey32> ValidatorRegistry::active_sorted(std::uint64_t height) con
 bool ValidatorRegistry::is_active_for_height(const PubKey32& pub, std::uint64_t height) const {
   auto it = validators_.find(pub);
   if (it == validators_.end()) return false;
-  if (it->second.status == ValidatorStatus::BANNED) return false;
-  if (it->second.status == ValidatorStatus::ACTIVE) return true;
+  if (!it->second.has_bond) return false;
+  if (it->second.status == ValidatorStatus::BANNED || it->second.status == ValidatorStatus::EXITING) return false;
+  if (it->second.status == ValidatorStatus::ACTIVE && it->second.has_bond) return true;
   return height >= it->second.joined_height + WARMUP_BLOCKS;
 }
 
@@ -55,6 +69,14 @@ std::optional<ValidatorInfo> ValidatorRegistry::get(const PubKey32& pub) const {
   auto it = validators_.find(pub);
   if (it == validators_.end()) return std::nullopt;
   return it->second;
+}
+
+std::optional<PubKey32> ValidatorRegistry::pubkey_by_bond_outpoint(const OutPoint& op) const {
+  for (const auto& [pub, info] : validators_) {
+    if (!info.has_bond) continue;
+    if (info.bond_outpoint.txid == op.txid && info.bond_outpoint.index == op.index) return pub;
+  }
+  return std::nullopt;
 }
 
 std::size_t quorum_threshold(std::size_t n_active) { return (2 * n_active) / 3 + 1; }

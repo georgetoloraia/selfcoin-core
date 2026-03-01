@@ -1,10 +1,12 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
 
 namespace selfcoin::mempool {
@@ -30,6 +32,7 @@ class Mempool {
   void prune_against_utxo(const UtxoView& view);
   std::size_t size() const;
   bool contains(const Hash32& txid) const;
+  void set_validation_context(SpecialValidationContext ctx) { ctx_ = ctx; }
 
  private:
   struct TxMeta {
@@ -40,6 +43,7 @@ class Mempool {
   std::map<Hash32, TxMeta> by_txid_;
   std::map<OutPoint, Hash32> spent_outpoints_;
   std::size_t total_bytes_{0};
+  std::optional<SpecialValidationContext> ctx_;
 };
 
 }  // namespace selfcoin::mempool

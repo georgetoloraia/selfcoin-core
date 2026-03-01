@@ -41,6 +41,7 @@ add_library(selfcoin_core
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
+  src/lightserver/server.cpp
 )
 
 target_include_directories(selfcoin_core PUBLIC src)
@@ -62,6 +63,9 @@ target_link_libraries(selfcoin-node PRIVATE selfcoin_core)
 add_executable(selfcoin-cli apps/selfcoin-cli/main.cpp)
 target_link_libraries(selfcoin-cli PRIVATE selfcoin_core)
 
+add_executable(selfcoin-lightserver apps/selfcoin-lightserver/main.cpp)
+target_link_libraries(selfcoin-lightserver PRIVATE selfcoin_core)
+
 add_executable(selfcoin-tests
   tests/test_main.cpp
   tests/test_codec.cpp
@@ -71,6 +75,7 @@ add_executable(selfcoin-tests
   tests/test_bonding.cpp
   tests/test_mempool.cpp
   tests/test_integration.cpp
+  tests/test_lightserver.cpp
 )
 target_link_libraries(selfcoin-tests PRIVATE selfcoin_core)
 

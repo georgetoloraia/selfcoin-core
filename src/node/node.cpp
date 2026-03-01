@@ -703,18 +703,36 @@ bool Node::persist_finalized_block(const Block& block) {
   if (!db_.set_height_hash(block.header.height, h)) return false;
   if (!db_.set_tip(storage::TipState{block.header.height, h})) return false;
 
-  // Persist UTXOs for finalized state.
+  // Persist tx index + UTXOs + lightserver indexes for finalized state.
+  for (std::uint32_t tx_i = 0; tx_i < block.txs.size(); ++tx_i) {
+    const auto& tx = block.txs[tx_i];
+    if (!db_.put_tx_index(tx.txid(), block.header.height, tx_i, tx.serialize())) return false;
+  }
+
   if (block.txs.size() > 1) {
     for (size_t i = 1; i < block.txs.size(); ++i) {
+      const auto spending_txid = block.txs[i].txid();
       for (const auto& in : block.txs[i].inputs) {
-        db_.erase_utxo(OutPoint{in.prev_txid, in.prev_index});
+        const OutPoint op{in.prev_txid, in.prev_index};
+        auto prev = utxos_.find(op);
+        if (prev != utxos_.end()) {
+          const Hash32 sh = crypto::sha256(prev->second.out.script_pubkey);
+          if (!db_.erase_script_utxo(sh, op)) return false;
+          if (!db_.add_script_history(sh, block.header.height, spending_txid)) return false;
+        }
+        if (!db_.erase_utxo(op)) return false;
       }
     }
   }
   for (const auto& tx : block.txs) {
     const Hash32 txid = tx.txid();
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-      db_.put_utxo(OutPoint{txid, out_i}, tx.outputs[out_i]);
+      const OutPoint op{txid, out_i};
+      const auto& out = tx.outputs[out_i];
+      const Hash32 sh = crypto::sha256(out.script_pubkey);
+      if (!db_.put_utxo(op, out)) return false;
+      if (!db_.put_script_utxo(sh, op, out, block.header.height)) return false;
+      if (!db_.add_script_history(sh, block.header.height, txid)) return false;
     }
   }
   return true;

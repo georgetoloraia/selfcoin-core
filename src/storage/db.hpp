@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "consensus/validators.hpp"
 #include "utxo/tx.hpp"
@@ -18,6 +19,7 @@ struct TipState {
 class DB {
  public:
   bool open(const std::string& path);
+  bool open_readonly(const std::string& path);
 
   bool put(const std::string& key, const Bytes& value);
   std::optional<Bytes> get(const std::string& key) const;
@@ -39,8 +41,34 @@ class DB {
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
   std::map<PubKey32, consensus::ValidatorInfo> load_validators() const;
 
+  struct TxLocation {
+    std::uint64_t height{0};
+    std::uint32_t tx_index{0};
+    Bytes tx_bytes;
+  };
+  bool put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes);
+  std::optional<TxLocation> get_tx_index(const Hash32& txid) const;
+
+  struct ScriptUtxoEntry {
+    OutPoint outpoint;
+    std::uint64_t value{0};
+    Bytes script_pubkey;
+    std::uint64_t height{0};
+  };
+  bool put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxOut& out, std::uint64_t height);
+  bool erase_script_utxo(const Hash32& scripthash, const OutPoint& op);
+  std::vector<ScriptUtxoEntry> get_script_utxos(const Hash32& scripthash) const;
+
+  struct ScriptHistoryEntry {
+    Hash32 txid{};
+    std::uint64_t height{0};
+  };
+  bool add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
+  std::vector<ScriptHistoryEntry> get_script_history(const Hash32& scripthash) const;
+
  private:
   std::string path_;
+  bool readonly_{false};
 
 #ifdef SC_HAS_ROCKSDB
   class RocksImpl;

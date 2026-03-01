@@ -1,5 +1,6 @@
 #include "storage/db.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -120,6 +121,14 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
   return info;
 }
 
+Bytes u64be_bytes(std::uint64_t v) {
+  Bytes out(8);
+  for (int i = 7; i >= 0; --i) {
+    out[7 - i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
+  }
+  return out;
+}
+
 }  // namespace
 
 std::string key_block(const Hash32& hash) { return "B:" + hex_encode(Bytes(hash.begin(), hash.end())); }
@@ -130,6 +139,19 @@ std::string key_height(std::uint64_t height) {
 }
 std::string key_utxo(const OutPoint& op) { return "U:" + hex_encode(serialize_outpoint(op)); }
 std::string key_validator(const PubKey32& pub) { return "V:" + hex_encode(Bytes(pub.begin(), pub.end())); }
+std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
+std::string key_su_prefix(const Hash32& scripthash) {
+  return "SU:" + hex_encode(Bytes(scripthash.begin(), scripthash.end())) + ":";
+}
+std::string key_su(const Hash32& scripthash, const OutPoint& op) {
+  return key_su_prefix(scripthash) + hex_encode(serialize_outpoint(op));
+}
+std::string key_sh_prefix(const Hash32& scripthash) {
+  return "SH:" + hex_encode(Bytes(scripthash.begin(), scripthash.end())) + ":";
+}
+std::string key_sh(const Hash32& scripthash, std::uint64_t height, const Hash32& txid) {
+  return key_sh_prefix(scripthash) + hex_encode(u64be_bytes(height)) + ":" + hex_encode(Bytes(txid.begin(), txid.end()));
+}
 
 #ifdef SC_HAS_ROCKSDB
 class DB::RocksImpl {
@@ -140,6 +162,7 @@ class DB::RocksImpl {
 
 bool DB::open(const std::string& path) {
   path_ = path;
+  readonly_ = false;
 #ifdef SC_HAS_ROCKSDB
   rocks_ = std::make_unique<RocksImpl>();
   rocksdb::Options options;
@@ -155,7 +178,26 @@ bool DB::open(const std::string& path) {
 #endif
 }
 
+bool DB::open_readonly(const std::string& path) {
+  path_ = path;
+  readonly_ = true;
+#ifdef SC_HAS_ROCKSDB
+  rocks_ = std::make_unique<RocksImpl>();
+  rocksdb::Options options;
+  options.create_if_missing = false;
+  rocksdb::DB* raw = nullptr;
+  auto s = rocksdb::DB::OpenForReadOnly(options, path, &raw);
+  if (!s.ok()) return false;
+  rocks_->db.reset(raw);
+  return true;
+#else
+  std::filesystem::create_directories(path_);
+  return load_file();
+#endif
+}
+
 bool DB::put(const std::string& key, const Bytes& value) {
+  if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
   auto s = rocks_->db->Put(rocksdb::WriteOptions(), key, rocksdb::Slice(reinterpret_cast<const char*>(value.data()), value.size()));
   return s.ok();
@@ -220,6 +262,7 @@ std::optional<Hash32> DB::get_height_hash(std::uint64_t height) const {
 
 bool DB::put_utxo(const OutPoint& op, const TxOut& out) { return put(key_utxo(op), serialize_txout(out)); }
 bool DB::erase_utxo(const OutPoint& op) {
+  if (readonly_) return false;
 #ifdef SC_HAS_ROCKSDB
   auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_utxo(op));
   return s.ok();
@@ -258,6 +301,117 @@ std::map<PubKey32, consensus::ValidatorInfo> DB::load_validators() const {
     std::copy(b->begin(), b->end(), pub.begin());
     out[pub] = *info;
   }
+  return out;
+}
+
+bool DB::put_tx_index(const Hash32& txid, std::uint64_t height, std::uint32_t tx_index, const Bytes& tx_bytes) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.u32le(tx_index);
+  w.varbytes(tx_bytes);
+  return put(key_txidx(txid), w.take());
+}
+
+std::optional<DB::TxLocation> DB::get_tx_index(const Hash32& txid) const {
+  auto b = get(key_txidx(txid));
+  if (!b.has_value()) return std::nullopt;
+  TxLocation out;
+  if (!codec::parse_exact(*b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto i = r.u32le();
+        auto tx = r.varbytes();
+        if (!h || !i || !tx) return false;
+        out.height = *h;
+        out.tx_index = *i;
+        out.tx_bytes = *tx;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+bool DB::put_script_utxo(const Hash32& scripthash, const OutPoint& op, const TxOut& out, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.u64le(out.value);
+  w.varbytes(out.script_pubkey);
+  return put(key_su(scripthash, op), w.take());
+}
+
+bool DB::erase_script_utxo(const Hash32& scripthash, const OutPoint& op) {
+  if (readonly_) return false;
+#ifdef SC_HAS_ROCKSDB
+  auto s = rocks_->db->Delete(rocksdb::WriteOptions(), key_su(scripthash, op));
+  return s.ok();
+#else
+  mem_.erase(key_su(scripthash, op));
+  return flush_file();
+#endif
+}
+
+std::vector<DB::ScriptUtxoEntry> DB::get_script_utxos(const Hash32& scripthash) const {
+  std::vector<ScriptUtxoEntry> out;
+  const std::string prefix = key_su_prefix(scripthash);
+  for (const auto& [k, v] : scan_prefix(prefix)) {
+    const std::string op_hex = k.substr(prefix.size());
+    auto op_b = hex_decode(op_hex);
+    if (!op_b.has_value()) continue;
+    auto op = parse_outpoint(*op_b);
+    if (!op.has_value()) continue;
+
+    ScriptUtxoEntry e;
+    e.outpoint = *op;
+    if (!codec::parse_exact(v, [&](codec::ByteReader& r) {
+          auto h = r.u64le();
+          auto val = r.u64le();
+          auto spk = r.varbytes();
+          if (!h || !val || !spk) return false;
+          e.height = *h;
+          e.value = *val;
+          e.script_pubkey = *spk;
+          return true;
+        })) {
+      continue;
+    }
+    out.push_back(std::move(e));
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    if (a.height != b.height) return a.height < b.height;
+    return std::tie(a.outpoint.txid, a.outpoint.index) < std::tie(b.outpoint.txid, b.outpoint.index);
+  });
+  return out;
+}
+
+bool DB::add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid) {
+  return put(key_sh(scripthash, height, txid), {});
+}
+
+std::vector<DB::ScriptHistoryEntry> DB::get_script_history(const Hash32& scripthash) const {
+  std::vector<ScriptHistoryEntry> out;
+  const std::string prefix = key_sh_prefix(scripthash);
+  for (const auto& [k, _] : scan_prefix(prefix)) {
+    const std::string rest = k.substr(prefix.size());
+    const auto pos = rest.find(':');
+    if (pos == std::string::npos) continue;
+    const std::string h_hex = rest.substr(0, pos);
+    const std::string txid_hex = rest.substr(pos + 1);
+    auto hb = hex_decode(h_hex);
+    auto tb = hex_decode(txid_hex);
+    if (!hb.has_value() || hb->size() != 8 || !tb.has_value() || tb->size() != 32) continue;
+
+    std::uint64_t height = 0;
+    for (size_t i = 0; i < 8; ++i) {
+      height = (height << 8) | (*hb)[i];
+    }
+    Hash32 txid{};
+    std::copy(tb->begin(), tb->end(), txid.begin());
+    out.push_back(ScriptHistoryEntry{txid, height});
+  }
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+    if (a.height != b.height) return a.height < b.height;
+    return a.txid < b.txid;
+  });
   return out;
 }
 

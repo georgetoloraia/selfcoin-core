@@ -1,0 +1,491 @@
+#include "lightserver/server.hpp"
+
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cctype>
+#include <ctime>
+#include <cstring>
+#include <map>
+#include <regex>
+#include <set>
+#include <sstream>
+
+#include "codec/bytes.hpp"
+#include "consensus/validators.hpp"
+#include "crypto/hash.hpp"
+#include "node/node.hpp"
+#include "p2p/framing.hpp"
+#include "p2p/messages.hpp"
+#include "utxo/validate.hpp"
+
+namespace selfcoin::lightserver {
+namespace {
+
+std::string json_escape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char c : in) {
+    if (c == '"' || c == '\\') {
+      out.push_back('\\');
+      out.push_back(c);
+    } else if (c == '\n') {
+      out += "\\n";
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+std::optional<Hash32> parse_hex32(const std::string& s) {
+  auto b = hex_decode(s);
+  if (!b.has_value() || b->size() != 32) return std::nullopt;
+  Hash32 out{};
+  std::copy(b->begin(), b->end(), out.begin());
+  return out;
+}
+
+std::optional<std::uint64_t> find_u64(const std::string& body, const std::string& key) {
+  std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+  std::smatch m;
+  if (!std::regex_search(body, m, re)) return std::nullopt;
+  return static_cast<std::uint64_t>(std::stoull(m[1].str()));
+}
+
+std::optional<std::string> find_string(const std::string& body, const std::string& key) {
+  std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+  std::smatch m;
+  if (!std::regex_search(body, m, re)) return std::nullopt;
+  return m[1].str();
+}
+
+std::string find_id_token(const std::string& body) {
+  std::regex re("\"id\"\\s*:\\s*([^,}\\s][^,}]*)");
+  std::smatch m;
+  if (!std::regex_search(body, m, re)) return "null";
+  std::string t = m[1].str();
+  while (!t.empty() && std::isspace(static_cast<unsigned char>(t.back()))) t.pop_back();
+  return t.empty() ? "null" : t;
+}
+
+bool read_http_request(int fd, std::string* out_req) {
+  std::string req;
+  std::array<char, 4096> buf{};
+  while (req.find("\r\n\r\n") == std::string::npos) {
+    ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) return false;
+    req.append(buf.data(), static_cast<size_t>(n));
+    if (req.size() > 2 * 1024 * 1024) return false;
+  }
+
+  const auto hdr_end = req.find("\r\n\r\n");
+  const std::string headers = req.substr(0, hdr_end);
+  std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
+  std::smatch m;
+  size_t content_len = 0;
+  if (std::regex_search(headers, m, cl_re)) {
+    content_len = static_cast<size_t>(std::stoull(m[1].str()));
+  }
+  while (req.size() < hdr_end + 4 + content_len) {
+    ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) return false;
+    req.append(buf.data(), static_cast<size_t>(n));
+  }
+  *out_req = req;
+  return true;
+}
+
+std::string http_response_json(const std::string& body, int status = 200) {
+  const char* status_text = (status == 200) ? "OK" : "Bad Request";
+  std::ostringstream oss;
+  oss << "HTTP/1.1 " << status << " " << status_text << "\r\n"
+      << "Content-Type: application/json\r\n"
+      << "Content-Length: " << body.size() << "\r\n"
+      << "Connection: close\r\n\r\n"
+      << body;
+  return oss.str();
+}
+
+}  // namespace
+
+Server::Server(Config cfg) : cfg_(std::move(cfg)) {}
+Server::~Server() { stop(); }
+
+bool Server::init() {
+  if (!db_.open_readonly(cfg_.db_path)) {
+    if (!db_.open(cfg_.db_path)) return false;
+  }
+  if (cfg_.max_committee == 0) cfg_.max_committee = 1;
+  return true;
+}
+
+bool Server::start() {
+  listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd_ < 0) return false;
+  int one = 1;
+  setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(cfg_.port);
+  if (inet_pton(AF_INET, cfg_.bind_ip.c_str(), &addr.sin_addr) != 1) return false;
+  if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+  if (listen(listen_fd_, 64) != 0) return false;
+  running_ = true;
+  accept_thread_ = std::thread([this]() { accept_loop(); });
+  return true;
+}
+
+void Server::stop() {
+  if (!running_.exchange(false)) return;
+  if (listen_fd_ >= 0) {
+    ::shutdown(listen_fd_, SHUT_RDWR);
+    ::close(listen_fd_);
+    listen_fd_ = -1;
+  }
+  if (accept_thread_.joinable()) accept_thread_.join();
+}
+
+std::string Server::handle_rpc_for_test(const std::string& body) { return handle_rpc_body(body); }
+
+void Server::accept_loop() {
+  while (running_) {
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    int fd = accept(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    if (fd < 0) {
+      if (!running_) break;
+      continue;
+    }
+    handle_client(fd);
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+  }
+}
+
+void Server::handle_client(int fd) {
+  std::string req;
+  if (!read_http_request(fd, &req)) return;
+  const auto first_line_end = req.find("\r\n");
+  if (first_line_end == std::string::npos) return;
+  const std::string first = req.substr(0, first_line_end);
+  if (first.rfind("POST /rpc ", 0) != 0) {
+    const std::string body = R"({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid endpoint"}})";
+    const auto resp = http_response_json(body, 400);
+    (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(resp.data()), resp.size());
+    return;
+  }
+  const auto hdr_end = req.find("\r\n\r\n");
+  if (hdr_end == std::string::npos) return;
+  const std::string body = req.substr(hdr_end + 4);
+  const std::string out = handle_rpc_body(body);
+  const auto resp = http_response_json(out, 200);
+  (void)p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(resp.data()), resp.size());
+}
+
+std::string Server::make_error(const std::string& id_token, int code, const std::string& msg) const {
+  std::ostringstream oss;
+  oss << "{\"jsonrpc\":\"2.0\",\"id\":" << id_token << ",\"error\":{\"code\":" << code << ",\"message\":\""
+      << json_escape(msg) << "\"}}";
+  return oss.str();
+}
+
+std::string Server::make_result(const std::string& id_token, const std::string& result_json) const {
+  std::ostringstream oss;
+  oss << "{\"jsonrpc\":\"2.0\",\"id\":" << id_token << ",\"result\":" << result_json << "}";
+  return oss.str();
+}
+
+std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t height) {
+  auto tip = db_.get_tip();
+  if (!tip.has_value()) return std::nullopt;
+  if (height == 0 || height > tip->height + 1) return std::nullopt;
+
+  consensus::ValidatorRegistry vr;
+  UtxoSet utxos;
+  if (cfg_.devnet) {
+    const auto keys = node::Node::devnet_keypairs();
+    const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
+    for (int i = 0; i < static_cast<int>(keys.size()); ++i) {
+      consensus::ValidatorInfo vi;
+      vi.status = (i < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
+      vi.has_bond = (i < n_active);
+      vi.joined_height = 0;
+      vr.upsert(keys[i].public_key, vi);
+    }
+  }
+
+  auto apply_validator_changes = [&](const Block& block, std::uint64_t h) {
+    for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+      for (const auto& in : block.txs[txi].inputs) {
+        const OutPoint op{in.prev_txid, in.prev_index};
+        auto it = utxos.find(op);
+        if (it == utxos.end()) continue;
+        PubKey32 pub{};
+        if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+        SlashEvidence ev;
+        if (parse_slash_script_sig(in.script_sig, &ev)) vr.ban(pub);
+        else vr.request_unbond(pub, h);
+      }
+    }
+    for (const auto& tx : block.txs) {
+      const Hash32 txid = tx.txid();
+      for (std::uint32_t i = 0; i < tx.outputs.size(); ++i) {
+        PubKey32 pub{};
+        if (tx.outputs[i].value == BOND_AMOUNT && is_validator_register_script(tx.outputs[i].script_pubkey, &pub)) {
+          vr.register_bond(pub, OutPoint{txid, i}, h);
+        }
+      }
+    }
+    vr.advance_height(h + 1);
+  };
+
+  for (std::uint64_t h = 1; h < height; ++h) {
+    auto bh = db_.get_height_hash(h);
+    if (!bh.has_value()) return std::nullopt;
+    auto bb = db_.get_block(*bh);
+    if (!bb.has_value()) return std::nullopt;
+    auto blk = Block::parse(*bb);
+    if (!blk.has_value()) return std::nullopt;
+    apply_validator_changes(*blk, h);
+    apply_block_to_utxo(*blk, utxos);
+  }
+
+  Hash32 prev = zero_hash();
+  if (height > 1) {
+    auto p = db_.get_height_hash(height - 1);
+    if (!p.has_value()) return std::nullopt;
+    prev = *p;
+  }
+  const auto active = vr.active_sorted(height);
+  return consensus::select_committee(prev, height, active, cfg_.max_committee);
+}
+
+bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* res = nullptr;
+  if (getaddrinfo(cfg_.tx_relay_host.c_str(), std::to_string(cfg_.tx_relay_port).c_str(), &hints, &res) != 0) {
+    if (err) *err = "getaddrinfo failed";
+    return false;
+  }
+  int fd = -1;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) continue;
+    if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    ::close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) {
+    if (err) *err = "connect relay peer failed";
+    return false;
+  }
+
+  auto tip = db_.get_tip();
+  p2p::VersionMsg v;
+  v.start_height = tip ? tip->height : 0;
+  v.start_hash = tip ? tip->hash : zero_hash();
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 424242;
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)})) {
+    ::close(fd);
+    if (err) *err = "send VERSION failed";
+    return false;
+  }
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}})) {
+    ::close(fd);
+    if (err) *err = "send VERACK failed";
+    return false;
+  }
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::TX, p2p::ser_tx(p2p::TxMsg{tx_bytes})})) {
+    ::close(fd);
+    if (err) *err = "send TX failed";
+    return false;
+  }
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
+  return true;
+}
+
+std::string Server::handle_rpc_body(const std::string& body) {
+  const std::string id = find_id_token(body);
+  auto method = find_string(body, "method");
+  if (!method.has_value()) return make_error(id, -32600, "missing method");
+
+  if (*method == "get_tip") {
+    auto tip = db_.get_tip();
+    if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
+    std::ostringstream oss;
+    oss << "{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash) << "\"}";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_headers") {
+    auto from = find_u64(body, "from_height");
+    auto count = find_u64(body, "count");
+    if (!from || !count) return make_error(id, -32602, "missing from_height/count");
+    std::ostringstream arr;
+    arr << "[";
+    bool first = true;
+    for (std::uint64_t h = *from; h < *from + *count; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) break;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) break;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) break;
+      if (!first) arr << ",";
+      first = false;
+      arr << "{\"height\":" << h << ",\"header_hex\":\"" << hex_encode(blk->header.serialize())
+          << "\",\"block_hash\":\"" << hex_encode32(*bh) << "\",\"finality_proof\":[";
+      for (size_t i = 0; i < blk->finality_proof.sigs.size(); ++i) {
+        if (i) arr << ",";
+        const auto& s = blk->finality_proof.sigs[i];
+        arr << "{\"pubkey_hex\":\"" << hex_encode(Bytes(s.validator_pubkey.begin(), s.validator_pubkey.end()))
+            << "\",\"sig_hex\":\"" << hex_encode(Bytes(s.signature.begin(), s.signature.end())) << "\"}";
+      }
+      arr << "]}";
+    }
+    arr << "]";
+    return make_result(id, arr.str());
+  }
+
+  if (*method == "get_block") {
+    auto hash_hex = find_string(body, "hash");
+    if (!hash_hex) return make_error(id, -32602, "missing hash");
+    auto h = parse_hex32(*hash_hex);
+    if (!h) return make_error(id, -32602, "bad hash");
+    auto bb = db_.get_block(*h);
+    if (!bb.has_value()) return make_error(id, -32001, "not found");
+    return make_result(id, std::string("{\"block_hex\":\"") + hex_encode(*bb) + "\"}");
+  }
+
+  if (*method == "get_tx") {
+    auto txid_hex = find_string(body, "txid");
+    if (!txid_hex) return make_error(id, -32602, "missing txid");
+    auto txid = parse_hex32(*txid_hex);
+    if (!txid) return make_error(id, -32602, "bad txid");
+    auto loc = db_.get_tx_index(*txid);
+    if (!loc.has_value()) return make_error(id, -32001, "not found");
+    std::ostringstream oss;
+    oss << "{\"height\":" << loc->height << ",\"tx_hex\":\"" << hex_encode(loc->tx_bytes) << "\"}";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_utxos") {
+    auto sh_hex = find_string(body, "scripthash_hex");
+    if (!sh_hex) return make_error(id, -32602, "missing scripthash_hex");
+    auto sh = parse_hex32(*sh_hex);
+    if (!sh) return make_error(id, -32602, "bad scripthash");
+    auto utxos = db_.get_script_utxos(*sh);
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < utxos.size(); ++i) {
+      if (i) oss << ",";
+      const auto& u = utxos[i];
+      oss << "{\"txid\":\"" << hex_encode32(u.outpoint.txid) << "\",\"vout\":" << u.outpoint.index
+          << ",\"value\":" << u.value << ",\"height\":" << u.height
+          << ",\"script_pubkey_hex\":\"" << hex_encode(u.script_pubkey) << "\"}";
+    }
+    oss << "]";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_committee") {
+    auto h = find_u64(body, "height");
+    if (!h) return make_error(id, -32602, "missing height");
+    auto committee = committee_for_height(*h);
+    if (!committee.has_value()) return make_error(id, -32001, "height unavailable");
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < committee->size(); ++i) {
+      if (i) oss << ",";
+      oss << "\"" << hex_encode(Bytes((*committee)[i].begin(), (*committee)[i].end())) << "\"";
+    }
+    oss << "]";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "broadcast_tx") {
+    auto tx_hex = find_string(body, "tx_hex");
+    if (!tx_hex) return make_error(id, -32602, "missing tx_hex");
+    auto tx_bytes = hex_decode(*tx_hex);
+    if (!tx_bytes) return make_result(id, R"({"accepted":false,"error":"bad tx hex"})");
+    auto tx = Tx::parse(*tx_bytes);
+    if (!tx.has_value()) return make_result(id, R"({"accepted":false,"error":"tx parse failed"})");
+    const Hash32 txid = tx->txid();
+    const auto utxos = db_.load_utxos();
+    const auto validators = db_.load_validators();
+    consensus::ValidatorRegistry vr;
+    for (const auto& [pub, info] : validators) vr.upsert(pub, info);
+    auto tip = db_.get_tip();
+    SpecialValidationContext ctx{&vr, tip ? (tip->height + 1) : 1};
+    auto vrx = validate_tx(*tx, 1, utxos, &ctx);
+    if (!vrx.ok) {
+      return make_result(id, std::string("{\"accepted\":false,\"txid\":\"") + hex_encode32(txid) +
+                                 "\",\"error\":\"" + json_escape(vrx.error) + "\"}");
+    }
+    std::string err;
+    if (!relay_tx_to_peer(*tx_bytes, &err)) {
+      return make_result(id, std::string("{\"accepted\":false,\"txid\":\"") + hex_encode32(txid) +
+                                 "\",\"error\":\"" + json_escape(err) + "\"}");
+    }
+    return make_result(id, std::string("{\"accepted\":true,\"txid\":\"") + hex_encode32(txid) + "\"}");
+  }
+
+  return make_error(id, -32601, "method not found");
+}
+
+std::optional<Config> parse_args(int argc, char** argv) {
+  Config cfg;
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto next = [&](const std::string& name) -> std::optional<std::string> {
+      if (i + 1 >= argc) return std::nullopt;
+      return std::string(argv[++i]);
+    };
+    if (a == "--db") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.db_path = *v;
+    } else if (a == "--bind") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.bind_ip = *v;
+    } else if (a == "--port") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.port = static_cast<std::uint16_t>(std::stoul(*v));
+    } else if (a == "--relay-host") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.tx_relay_host = *v;
+    } else if (a == "--relay-port") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
+    } else if (a == "--devnet") {
+      cfg.devnet = true;
+    } else if (a == "--devnet-initial-active") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.devnet_initial_active_validators = std::stoi(*v);
+    } else if (a == "--max-committee") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
+    } else {
+      return std::nullopt;
+    }
+  }
+  return cfg;
+}
+
+}  // namespace selfcoin::lightserver

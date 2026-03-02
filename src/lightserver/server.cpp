@@ -456,7 +456,16 @@ std::string Server::handle_rpc_body(const std::string& body) {
     consensus::ValidatorRegistry vr;
     for (const auto& [pub, info] : validators) vr.upsert(pub, info);
     auto tip = db_.get_tip();
-    SpecialValidationContext ctx{&vr, tip ? (tip->height + 1) : 1};
+    SpecialValidationContext ctx{
+        .validators = &vr,
+        .current_height = tip ? (tip->height + 1) : 1,
+        .is_committee_member =
+            [this](const PubKey32& pk, std::uint64_t h, std::uint32_t /*round*/) {
+              auto committee = committee_for_height(h);
+              if (!committee.has_value()) return false;
+              return std::find(committee->begin(), committee->end(), pk) != committee->end();
+            },
+    };
     auto vrx = validate_tx(*tx, 1, utxos, &ctx);
     if (!vrx.ok) {
       return make_result(id, std::string("{\"accepted\":false,\"txid\":\"") + hex_encode32(txid) +
@@ -484,29 +493,29 @@ std::optional<Config> parse_args(int argc, char** argv) {
   bool committee_explicit = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
-    auto next = [&](const std::string& name) -> std::optional<std::string> {
+    auto next = [&]() -> std::optional<std::string> {
       if (i + 1 >= argc) return std::nullopt;
       return std::string(argv[++i]);
     };
     if (a == "--db") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.db_path = *v;
     } else if (a == "--bind") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.bind_ip = *v;
     } else if (a == "--port") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.port = static_cast<std::uint16_t>(std::stoul(*v));
       port_explicit = true;
     } else if (a == "--relay-host") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.tx_relay_host = *v;
     } else if (a == "--relay-port") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
       relay_port_explicit = true;
@@ -535,11 +544,11 @@ std::optional<Config> parse_args(int argc, char** argv) {
       if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--devnet-initial-active") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.devnet_initial_active_validators = std::stoi(*v);
     } else if (a == "--max-committee") {
-      auto v = next(a);
+      auto v = next();
       if (!v) return std::nullopt;
       cfg.max_committee = static_cast<std::size_t>(std::stoull(*v));
       committee_explicit = true;

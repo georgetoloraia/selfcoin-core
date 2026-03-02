@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <functional>
 
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
@@ -135,6 +136,8 @@ class Node {
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
+  void spawn_local_bus_task(std::function<void()> fn);
+  void join_local_bus_tasks();
 
   NodeConfig cfg_;
   storage::DB db_;
@@ -169,11 +172,14 @@ class Node {
 
   std::atomic<bool> running_{false};
   std::thread loop_thread_;
+  mutable std::mutex local_bus_tasks_mu_;
+  std::vector<std::thread> local_bus_tasks_;
   p2p::PeerManager p2p_;
 
-  bool pause_proposals_{false};
+  std::atomic<bool> pause_proposals_{false};
   std::uint64_t last_seed_attempt_ms_{0};
   std::vector<std::string> bootstrap_peers_;
+  bool restart_debug_{false};
 };
 
 std::optional<NodeConfig> parse_args(int argc, char** argv);

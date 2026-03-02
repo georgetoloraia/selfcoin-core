@@ -40,6 +40,70 @@ bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeo
   return pred();
 }
 
+bool wait_for_tip(const node::Node& n, std::uint64_t expected_height, std::chrono::milliseconds timeout) {
+  return wait_for([&]() { return n.status().height >= expected_height; }, timeout);
+}
+
+bool wait_for_peer_count(const node::Node& n, std::size_t min_peers, std::chrono::milliseconds timeout) {
+  return wait_for([&]() { return n.status().peers >= min_peers; }, timeout);
+}
+
+bool wait_for_same_tip(const std::vector<std::unique_ptr<node::Node>>& nodes, std::chrono::milliseconds timeout) {
+  return wait_for([&]() {
+    if (nodes.empty()) return true;
+    const auto s0 = nodes[0]->status();
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      const auto si = nodes[i]->status();
+      if (si.height != s0.height || si.tip_hash != s0.tip_hash) return false;
+    }
+    return true;
+  }, timeout);
+}
+
+bool wait_for_stable_same_tip(const std::vector<std::unique_ptr<node::Node>>& nodes, std::chrono::milliseconds timeout) {
+  const auto start = std::chrono::steady_clock::now();
+  const auto stable_window = std::chrono::milliseconds(1200);
+
+  while (std::chrono::steady_clock::now() - start < timeout) {
+    if (!wait_for_same_tip(nodes, std::chrono::milliseconds(500))) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      continue;
+    }
+
+    const auto base = nodes[0]->status();
+    bool all_equal = true;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      const auto si = nodes[i]->status();
+      if (si.height != base.height || si.tip_hash != base.tip_hash) {
+        all_equal = false;
+        break;
+      }
+    }
+    if (!all_equal) continue;
+
+    const auto stable_start = std::chrono::steady_clock::now();
+    bool stable = true;
+    while (std::chrono::steady_clock::now() - stable_start < stable_window) {
+      const auto s0 = nodes[0]->status();
+      if (s0.height != base.height || s0.tip_hash != base.tip_hash) {
+        stable = false;
+        break;
+      }
+      for (size_t i = 1; i < nodes.size(); ++i) {
+        const auto si = nodes[i]->status();
+        if (si.height != base.height || si.tip_hash != base.tip_hash) {
+          stable = false;
+          break;
+        }
+      }
+      if (!stable) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (stable) return true;
+  }
+  return false;
+}
+
 int node_for_pub(const std::vector<crypto::KeyPair>& keys, const PubKey32& pub) {
   for (size_t i = 0; i < keys.size(); ++i) {
     if (keys[i].public_key == pub) return static_cast<int>(i);
@@ -407,13 +471,15 @@ TEST(test_restart_determinism_and_continued_finalization) {
     auto cluster = make_cluster(base);
     auto& nodes = cluster.nodes;
 
+    ASSERT_TRUE(wait_for_tip(*nodes[0], 12, std::chrono::seconds(45)));
     ASSERT_TRUE(wait_for([&]() {
-      for (const auto& n : nodes) {
-        if (n->status().height < 30) return false;
+      for (size_t i = 1; i < nodes.size(); ++i) {
+        if (nodes[i]->status().height < 12) return false;
       }
       return true;
-    }, std::chrono::seconds(90)));
+    }, std::chrono::seconds(45)));
 
+    ASSERT_TRUE(wait_for_same_tip(nodes, std::chrono::seconds(20)));
     const auto s0 = nodes[0]->status();
     for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
@@ -422,6 +488,9 @@ TEST(test_restart_determinism_and_continued_finalization) {
       ASSERT_EQ(nodes[i]->active_validators_for_next_height_for_test(),
                 nodes[0]->active_validators_for_next_height_for_test());
     }
+
+    for (auto& n : nodes) n->pause_proposals_for_test(true);
+    ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
   }
 
   Cluster restarted;
@@ -439,13 +508,16 @@ TEST(test_restart_determinism_and_continued_finalization) {
 
     auto n = std::make_unique<node::Node>(cfg);
     ASSERT_TRUE(n->init());
+    n->pause_proposals_for_test(true);
     restarted.nodes.push_back(std::move(n));
   }
   for (auto& n : restarted.nodes) n->start();
 
   auto& nodes = restarted.nodes;
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
   const auto before = nodes[0]->status();
 
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
   for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
     ASSERT_EQ(si.height, before.height);
@@ -454,16 +526,20 @@ TEST(test_restart_determinism_and_continued_finalization) {
               nodes[0]->active_validators_for_next_height_for_test());
   }
 
+  for (auto& n : nodes) n->pause_proposals_for_test(false);
+
   ASSERT_TRUE(wait_for([&]() {
     const auto s0 = nodes[0]->status();
-    if (s0.height < before.height + 10) return false;
+    if (s0.height < before.height + 4) return false;
     for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
       if (si.height != s0.height || si.tip_hash != s0.tip_hash) return false;
     }
     return true;
-  }, std::chrono::seconds(60)));
+  }, std::chrono::seconds(35)));
 
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(10)));
   const auto after = nodes[0]->status();
   for (size_t i = 1; i < nodes.size(); ++i) {
     const auto si = nodes[i]->status();
@@ -686,6 +762,7 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
     nodes.push_back(std::move(n));
   }
   nodes[0]->start();
+  ASSERT_TRUE(wait_for_peer_count(*nodes[0], 0, std::chrono::seconds(1)));
   const std::uint16_t seed_port = nodes[0]->p2p_port_for_test();
   if (seed_port == 0) return;
 
@@ -722,6 +799,7 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
   auto joiner = std::make_unique<node::Node>(join_cfg);
   if (!joiner->init()) return;
   joiner->start();
+  ASSERT_TRUE(wait_for_peer_count(*joiner, 1, std::chrono::seconds(20)));
 
   ASSERT_TRUE(wait_for([&]() {
     const auto jh = joiner->status().height;

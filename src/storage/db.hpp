@@ -20,6 +20,8 @@ class DB {
  public:
   bool open(const std::string& path);
   bool open_readonly(const std::string& path);
+  bool flush();
+  void close();
 
   bool put(const std::string& key, const Bytes& value);
   std::optional<Bytes> get(const std::string& key) const;

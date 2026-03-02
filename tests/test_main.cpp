@@ -1,5 +1,6 @@
 #include "test_framework.hpp"
 
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 
@@ -36,7 +37,9 @@ int main() {
   register_lightserver_tests();
 
   int failed = 0;
+  const char* filter = std::getenv("SELFCOIN_TEST_FILTER");
   for (const auto& [name, fn] : tests()) {
+    if (filter && std::string(name).find(filter) == std::string::npos) continue;
     try {
       fn();
       std::cout << "[ok] " << name << "\n";

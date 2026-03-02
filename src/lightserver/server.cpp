@@ -513,6 +513,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
     } else if (a == "--devnet") {
       cfg.devnet = true;
       cfg.testnet = false;
+      cfg.mainnet = false;
       cfg.network = devnet_network();
       if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
       if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
@@ -520,7 +521,16 @@ std::optional<Config> parse_args(int argc, char** argv) {
     } else if (a == "--testnet") {
       cfg.testnet = true;
       cfg.devnet = false;
+      cfg.mainnet = false;
       cfg.network = testnet_network();
+      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
+      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--mainnet") {
+      cfg.mainnet = true;
+      cfg.devnet = false;
+      cfg.testnet = false;
+      cfg.network = mainnet_network();
       if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
       if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;

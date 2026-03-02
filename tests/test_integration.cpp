@@ -24,6 +24,7 @@
 #include "p2p/messages.hpp"
 #include "storage/db.hpp"
 #include "consensus/monetary.hpp"
+#include "genesis/genesis.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/validate.hpp"
 
@@ -324,6 +325,36 @@ std::optional<Block> find_block_with_tx(const std::string& db_path, const Hash32
     }
   }
   return std::nullopt;
+}
+
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 4) {
+  const auto keys = node::Node::devnet_keypairs();
+  if (keys.size() < n_validators) return false;
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = static_cast<std::uint32_t>(n_validators);
+  d.initial_committee_params.min_committee = static_cast<std::uint32_t>(n_validators);
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
+  d.seeds = mainnet_network().default_seeds;
+  d.note = "integration-mainnet";
+  d.initial_validators.clear();
+  for (std::size_t i = 0; i < n_validators; ++i) d.initial_validators.push_back(keys[i].public_key);
+
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+  std::ofstream out(path, std::ios::trunc);
+  if (!out.good()) return false;
+  out << genesis::to_json(d);
+  return out.good();
 }
 
 }  // namespace
@@ -1013,6 +1044,79 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   v.node_software_version = "handshake-test/0.7";
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_protocol_version >= 1; }, std::chrono::seconds(2)));
+  n.stop();
+}
+
+TEST(test_mainnet_bootstrap_with_genesis) {
+  const std::string base = "/tmp/selfcoin_it_mainnet_bootstrap";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
+
+  Cluster c;
+  c.nodes.reserve(4);
+  for (int i = 0; i < 4; ++i) {
+    node::NodeConfig cfg;
+    cfg.devnet = false;
+    cfg.testnet = false;
+    cfg.mainnet = true;
+    cfg.network = mainnet_network();
+    cfg.disable_p2p = true;
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.genesis_path = gpath;
+    cfg.max_committee = 4;
+    auto n = std::make_unique<node::Node>(cfg);
+    ASSERT_TRUE(n->init());
+    c.nodes.push_back(std::move(n));
+  }
+  for (auto& n : c.nodes) n->start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : c.nodes) {
+      if (n->status().height < 5) return false;
+    }
+    return true;
+  }, std::chrono::seconds(45)));
+
+  ASSERT_TRUE(wait_for_same_tip(c.nodes, std::chrono::seconds(10)));
+}
+
+TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
+  const std::string base = "/tmp/selfcoin_it_reject_mainnet_vs_testnet";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
+
+  node::NodeConfig cfg;
+  cfg.devnet = false;
+  cfg.testnet = false;
+  cfg.mainnet = true;
+  cfg.network = mainnet_network();
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  cfg.genesis_path = gpath;
+  node::Node n(cfg);
+  if (!n.init()) return;
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    return;
+  }
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = testnet_network().network_id;  // mismatch
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 987;
+  v.node_software_version = "handshake-test/0.7";
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
 }
 

@@ -42,3 +42,11 @@
 
 # build and binary files
 build/
+data/
+Testing/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+sdk/selfcoin-wallet-js/node_modules/
+sdk/selfcoin-wallet-js/dist/

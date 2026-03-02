@@ -15,6 +15,7 @@ namespace selfcoin::lightserver {
 struct Config {
   bool devnet{true};
   bool testnet{false};
+  bool mainnet{false};
   NetworkConfig network{devnet_network()};
   std::string bind_ip{"127.0.0.1"};
   std::uint16_t port{0};

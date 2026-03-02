@@ -17,6 +17,7 @@
 #include "consensus/monetary.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "genesis/genesis.hpp"
 #include "merkle/merkle.hpp"
 
 namespace selfcoin::node {
@@ -81,6 +82,10 @@ bool Node::init() {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
   }
+  if (cfg_.mainnet && !init_mainnet_genesis()) {
+    std::cerr << "mainnet genesis init failed\n";
+    return false;
+  }
   if (!load_state()) {
     std::cerr << "load_state failed\n";
     return false;
@@ -133,7 +138,7 @@ bool Node::init() {
   load_persisted_peers();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
-  if (cfg_.testnet && cfg_.seeds.empty()) {
+  if ((cfg_.testnet || cfg_.mainnet) && cfg_.seeds.empty()) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
   }
 
@@ -1011,6 +1016,64 @@ bool Node::persist_finalized_block(const Block& block) {
   return true;
 }
 
+bool Node::init_mainnet_genesis() {
+  std::string path = cfg_.genesis_path.empty() ? "mainnet/genesis.json" : cfg_.genesis_path;
+  std::string err;
+  auto doc = genesis::load_from_path(path, &err);
+  if (!doc.has_value()) {
+    std::cerr << "genesis load failed: " << err << "\n";
+    return false;
+  }
+  if (!genesis::validate_document(*doc, cfg_.network, &err, 4)) {
+    std::cerr << "genesis validation failed: " << err << "\n";
+    return false;
+  }
+
+  const Hash32 ghash = genesis::hash_doc(*doc);
+  const Bytes ghash_b(ghash.begin(), ghash.end());
+  const Hash32 gblock = genesis::block_id(*doc);
+  const Bytes gblock_b(gblock.begin(), gblock.end());
+  const auto stored = db_.get("G:");
+  if (stored.has_value()) {
+    if (stored->size() != 32 || !std::equal(stored->begin(), stored->end(), ghash_b.begin())) {
+      std::cerr << "genesis mismatch against existing database\n";
+      return false;
+    }
+    const auto tip = db_.get_tip();
+    if (tip.has_value() && tip->height == 0 && tip->hash != gblock) {
+      std::cerr << "genesis block id mismatch against existing database tip\n";
+      return false;
+    }
+    return true;
+  }
+
+  if (!db_.put("G:", ghash_b)) return false;
+  if (!db_.put("GB:", gblock_b)) return false;
+  auto tip = db_.get_tip();
+  if (!tip.has_value()) {
+    if (!db_.set_tip(storage::TipState{0, gblock})) return false;
+  } else if (!(tip->height == 0 && tip->hash == zero_hash()) && tip->height != 0) {
+    std::cerr << "existing non-empty database is missing genesis marker\n";
+    return false;
+  } else if (tip->height == 0 && tip->hash == zero_hash()) {
+    if (!db_.set_tip(storage::TipState{0, gblock})) return false;
+  } else if (tip->height == 0 && tip->hash != gblock) {
+    std::cerr << "height-0 tip does not match provided genesis\n";
+    return false;
+  }
+
+  for (const auto& pub : doc->initial_validators) {
+    consensus::ValidatorInfo vi;
+    vi.status = consensus::ValidatorStatus::ACTIVE;
+    vi.joined_height = 0;
+    vi.has_bond = true;
+    vi.bond_outpoint = OutPoint{zero_hash(), 0};
+    vi.unbond_height = 0;
+    if (!db_.put_validator(pub, vi)) return false;
+  }
+  return db_.flush();
+}
+
 bool Node::load_state() {
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
@@ -1347,13 +1410,22 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     if (a == "--devnet") {
       cfg.devnet = true;
       cfg.testnet = false;
+      cfg.mainnet = false;
       cfg.network = devnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--testnet") {
       cfg.testnet = true;
       cfg.devnet = false;
+      cfg.mainnet = false;
       cfg.network = testnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--mainnet") {
+      cfg.mainnet = true;
+      cfg.devnet = false;
+      cfg.testnet = false;
+      cfg.network = mainnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {
@@ -1369,6 +1441,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.db_path = *v;
+    } else if (a == "--genesis") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.genesis_path = *v;
     } else if (a == "--peers") {
       auto v = next(a);
       if (!v) return std::nullopt;

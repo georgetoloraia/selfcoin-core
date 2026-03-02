@@ -29,6 +29,7 @@ struct NetworkConfig {
 
 const NetworkConfig& devnet_network();
 const NetworkConfig& testnet_network();
+const NetworkConfig& mainnet_network();
 const NetworkConfig& network_by_name(const std::string& name);
 
 }  // namespace selfcoin

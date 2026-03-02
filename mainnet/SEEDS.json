@@ -1,0 +1,7 @@
+{
+  "network": "mainnet",
+  "seeds": [
+    "seed1.mainnet.selfcoin.example:19440",
+    "seed2.mainnet.selfcoin.example:19440"
+  ]
+}

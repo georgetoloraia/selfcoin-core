@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <random>
@@ -13,8 +14,10 @@
 #include <algorithm>
 
 #include "address/address.hpp"
+#include "common/network.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "genesis/genesis.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "storage/db.hpp"
@@ -107,6 +110,9 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
+              << "  selfcoin-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
+              << "  selfcoin-cli genesis_hash --in <genesis.bin>\n"
+              << "  selfcoin-cli genesis_verify --json <genesis.json> --bin <genesis.bin>\n"
               << "  selfcoin-cli broadcast_tx --host <ip> --port <p> --tx-hex <hex>\n";
     return 1;
   }
@@ -130,6 +136,114 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::cout << "height=" << tip->height << " hash=" << selfcoin::hex_encode32(tip->hash) << "\n";
+    return 0;
+  }
+
+  if (cmd == "genesis_build") {
+    std::string in_path;
+    std::string out_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--in" && i + 1 < argc) in_path = argv[++i];
+      else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    }
+    if (in_path.empty() || out_path.empty()) {
+      std::cerr << "genesis_build requires --in and --out\n";
+      return 1;
+    }
+    std::string err;
+    auto doc = selfcoin::genesis::load_from_path(in_path, &err);
+    if (!doc) {
+      std::cerr << "failed to load genesis json: " << err << "\n";
+      return 1;
+    }
+    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 4)) {
+      std::cerr << "genesis validation failed: " << err << "\n";
+      return 1;
+    }
+    const auto bin = selfcoin::genesis::encode_bin(*doc);
+    if (!selfcoin::genesis::write_bin_to_path(out_path, bin, &err)) {
+      std::cerr << "failed to write genesis bin: " << err << "\n";
+      return 1;
+    }
+    const auto ghash = selfcoin::genesis::hash_bin(bin);
+    const auto gbid = selfcoin::genesis::block_id(*doc);
+    std::cout << "network_id=" << selfcoin::hex_encode(selfcoin::Bytes(doc->network_id.begin(), doc->network_id.end())) << "\n";
+    std::cout << "magic=" << doc->magic << "\n";
+    std::cout << "validator_count=" << doc->initial_validators.size() << "\n";
+    std::cout << "genesis_hash=" << selfcoin::hex_encode32(ghash) << "\n";
+    std::cout << "genesis_block_id=" << selfcoin::hex_encode32(gbid) << "\n";
+    return 0;
+  }
+
+  if (cmd == "genesis_hash") {
+    std::string in_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--in" && i + 1 < argc) in_path = argv[++i];
+    }
+    if (in_path.empty()) {
+      std::cerr << "genesis_hash requires --in\n";
+      return 1;
+    }
+    std::string err;
+    auto bin = selfcoin::genesis::load_bin_from_path(in_path, &err);
+    if (!bin) {
+      std::cerr << "failed to load genesis bin: " << err << "\n";
+      return 1;
+    }
+    auto doc = selfcoin::genesis::decode_bin(*bin, &err);
+    if (!doc) {
+      std::cerr << "failed to decode genesis bin: " << err << "\n";
+      return 1;
+    }
+    const auto ghash = selfcoin::genesis::hash_bin(*bin);
+    const auto gbid = selfcoin::genesis::block_id(*doc);
+    std::cout << "network_id=" << selfcoin::hex_encode(selfcoin::Bytes(doc->network_id.begin(), doc->network_id.end())) << "\n";
+    std::cout << "magic=" << doc->magic << "\n";
+    std::cout << "validator_count=" << doc->initial_validators.size() << "\n";
+    std::cout << "genesis_hash=" << selfcoin::hex_encode32(ghash) << "\n";
+    std::cout << "genesis_block_id=" << selfcoin::hex_encode32(gbid) << "\n";
+    return 0;
+  }
+
+  if (cmd == "genesis_verify") {
+    std::string json_path;
+    std::string bin_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--json" && i + 1 < argc) json_path = argv[++i];
+      else if (a == "--bin" && i + 1 < argc) bin_path = argv[++i];
+    }
+    if (json_path.empty() || bin_path.empty()) {
+      std::cerr << "genesis_verify requires --json and --bin\n";
+      return 1;
+    }
+    std::string err;
+    auto doc = selfcoin::genesis::load_from_path(json_path, &err);
+    if (!doc) {
+      std::cerr << "failed to load genesis json: " << err << "\n";
+      return 1;
+    }
+    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 4)) {
+      std::cerr << "genesis validation failed: " << err << "\n";
+      return 1;
+    }
+    auto existing = selfcoin::genesis::load_bin_from_path(bin_path, &err);
+    if (!existing) {
+      std::cerr << "failed to read genesis bin: " << err << "\n";
+      return 1;
+    }
+    const auto rebuilt = selfcoin::genesis::encode_bin(*doc);
+    if (*existing != rebuilt) {
+      std::cerr << "genesis verify failed: binary mismatch\n";
+      return 1;
+    }
+    const auto ghash = selfcoin::genesis::hash_bin(rebuilt);
+    const auto gbid = selfcoin::genesis::block_id(*doc);
+    std::cout << "verified=1\n";
+    std::cout << "genesis_hash=" << selfcoin::hex_encode32(ghash) << "\n";
+    std::cout << "genesis_block_id=" << selfcoin::hex_encode32(gbid) << "\n";
     return 0;
   }
 

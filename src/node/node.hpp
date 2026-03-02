@@ -25,6 +25,7 @@ namespace selfcoin::node {
 struct NodeConfig {
   bool devnet{true};
   bool testnet{false};
+  bool mainnet{false};
   NetworkConfig network{devnet_network()};
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
@@ -32,6 +33,7 @@ struct NodeConfig {
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"./data/node"};
+  std::string genesis_path;
   bool disable_p2p{false};
   bool log_json{false};
   int devnet_initial_active_validators{4};
@@ -119,6 +121,7 @@ class Node {
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_block(const Block& block);
+  bool init_mainnet_genesis();
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;

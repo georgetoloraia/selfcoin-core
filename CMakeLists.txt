@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 option(SELFCOIN_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
 option(SELFCOIN_BUILD_FUZZ "Build fuzz harness executables" ON)
+option(SELFCOIN_STRICT_WARNINGS "Enable strict warning flags" OFF)
 
 find_package(OpenSSL REQUIRED)
 
@@ -61,7 +62,9 @@ if(ROCKSDB_LIB AND ROCKSDB_INCLUDE_DIR)
   target_link_libraries(selfcoin_core PUBLIC ${ROCKSDB_LIB})
 endif()
 
-target_compile_options(selfcoin_core PRIVATE -Wall -Wextra -Wpedantic)
+if(SELFCOIN_STRICT_WARNINGS)
+  target_compile_options(selfcoin_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
 set(SC_SAN_FLAGS "")
 if(SELFCOIN_SANITIZE)
   set(SC_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)

@@ -61,7 +61,11 @@ TEST(test_unbond_signature_and_rule_validation) {
   auto tx = build_unbond_tx(bond_op, kp.public_key, BOND_AMOUNT, 1000, kp.private_key, &err);
   ASSERT_TRUE(tx.has_value());
 
-  SpecialValidationContext ctx{&vr, WARMUP_BLOCKS + 5};
+  SpecialValidationContext ctx{
+      .validators = &vr,
+      .current_height = WARMUP_BLOCKS + 5,
+      .is_committee_member = {},
+  };
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
 }
@@ -143,7 +147,11 @@ TEST(test_slash_evidence_parsing_and_validation) {
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 10);
   vr.advance_height(200);
-  SpecialValidationContext ctx{&vr, 200, [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; }};
+  SpecialValidationContext ctx{
+      .validators = &vr,
+      .current_height = 200,
+      .is_committee_member = [](const PubKey32&, std::uint64_t, std::uint32_t) { return true; },
+  };
 
   auto r = validate_tx(*tx, 1, view, &ctx);
   ASSERT_TRUE(r.ok);
@@ -178,7 +186,11 @@ TEST(test_scvalreg_not_spendable_as_normal_p2pkh) {
 
   consensus::ValidatorRegistry vr;
   vr.register_bond(kp.public_key, bond_op, 1);
-  SpecialValidationContext ctx{&vr, 10};
+  SpecialValidationContext ctx{
+      .validators = &vr,
+      .current_height = 10,
+      .is_committee_member = {},
+  };
 
   auto r = validate_tx(tx, 1, view, &ctx);
   ASSERT_TRUE(!r.ok);

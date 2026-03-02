@@ -15,6 +15,12 @@ TEST(test_sha256d_vectors) {
   ASSERT_EQ(hex_encode32(v1), "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358");
 }
 
+TEST(test_h160_vector) {
+  Bytes abc{'a', 'b', 'c'};
+  const auto h = crypto::h160(abc);
+  ASSERT_EQ(hex_encode(Bytes(h.begin(), h.end())), "bb1be98c142444d7a56aa3981c3942a978e4dc33");
+}
+
 TEST(test_merkle_root_and_odd_duplication) {
   Bytes a{'a'}, b{'b'}, c{'c'};
   std::vector<Bytes> txs = {a, b, c};

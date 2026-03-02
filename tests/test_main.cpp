@@ -20,6 +20,7 @@ void register_monetary_tests();
 void register_bonding_tests();
 void register_mempool_tests();
 void register_hardening_tests();
+void register_genesis_tests();
 void register_integration_tests();
 void register_lightserver_tests();
 
@@ -33,6 +34,7 @@ int main() {
   register_bonding_tests();
   register_mempool_tests();
   register_hardening_tests();
+  register_genesis_tests();
   register_integration_tests();
   register_lightserver_tests();
 

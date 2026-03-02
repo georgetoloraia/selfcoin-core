@@ -49,12 +49,29 @@ Per-block payout split (`T = reward + fees`):
 `selfcoin-node` and `selfcoin-lightserver` support:
 - `--devnet` (default)
 - `--testnet`
+- `--mainnet`
 
 Fixed profile constants include:
 - distinct network magic (`devnet`: `0x53434F49`, `testnet`: `0x5343544E`)
 - default ports (`devnet`: P2P `18444`, lightserver `19444`; `testnet`: P2P `28444`, lightserver `29444`)
 - `MAX_COMMITTEE`, `ROUND_TIMEOUT_MS`, `MAX_PAYLOAD_LEN`
 - bond/warmup/unbond-delay constants
+
+Mainnet planning artifacts live under `mainnet/` and include:
+- `MAINNET_PLAN.md`
+- `MAINNET_PARAMS.md`
+- `GENESIS_SPEC.md`
+- `GENESIS_VALIDATOR_CEREMONY.md`
+- `SEEDS.md`
+- `THREAT_MODEL_AND_LAUNCH_CHECKLIST.md`
+- template `genesis.json`
+
+Genesis tooling commands:
+```bash
+./build/selfcoin-cli genesis_build --in mainnet/genesis.json --out mainnet/genesis.bin
+./build/selfcoin-cli genesis_hash --in mainnet/genesis.bin
+./build/selfcoin-cli genesis_verify --json mainnet/genesis.json --bin mainnet/genesis.bin
+```
 
 Testnet bootstrap:
 - `--seeds host:port,...` for explicit seed list
@@ -114,6 +131,11 @@ Terminal 4:
 Run lightserver against node0 DB:
 ```bash
 ./build/selfcoin-lightserver --db /tmp/sc-node0 --bind 127.0.0.1 --port 19444 --relay-host 127.0.0.1 --relay-port 19040 --devnet --devnet-initial-active 4
+```
+
+Run a mainnet-profile node with explicit genesis:
+```bash
+./build/selfcoin-node --mainnet --node-id 0 --db /tmp/sc-mainnet-node0 --genesis mainnet/genesis.json --port 19440
 ```
 
 ## Run Testnet
@@ -303,3 +325,20 @@ sudo ufw reload
 3. Run one `selfcoin-lightserver --testnet --relay-host <local_node_ip> --relay-port 28444`.
 4. Verify convergence with observer:
    `python3 scripts/observe.py https://ls-a/rpc https://ls-b/rpc https://ls-c/rpc`
+
+## Wallet Integration
+
+Any application can embed a non-custodial SelfCoin wallet over lightserver JSON-RPC.
+
+- Wallet API contract: `spec/SELFCOIN_WALLET_API_V1.md`
+- Reference TypeScript SDK: `sdk/selfcoin-wallet-js`
+- Example apps:
+  - `sdk/selfcoin-wallet-js/examples/node-demo.ts`
+  - `sdk/selfcoin-wallet-js/examples/watch.ts`
+
+Quick start:
+```bash
+cd sdk/selfcoin-wallet-js
+npm install
+npm test
+```

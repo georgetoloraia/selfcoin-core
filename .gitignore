@@ -42,3 +42,5 @@
 
 # build and binary files
 build/
+sdk/selfcoin-wallet-js/node_modules/
+sdk/selfcoin-wallet-js/dist/

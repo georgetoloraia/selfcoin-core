@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <cstdlib>
 #include <set>
 #include <sstream>
 
@@ -37,6 +38,12 @@ Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
   return Bytes(msg.begin(), msg.end());
 }
 
+bool restart_debug_enabled() {
+  const char* v = std::getenv("SELFCOIN_RESTART_DEBUG");
+  if (!v) return false;
+  return std::string(v) == "1" || std::string(v) == "true" || std::string(v) == "yes";
+}
+
 std::string endpoint_to_ip(std::string endpoint) {
   const auto pos = endpoint.find(':');
   if (pos == std::string::npos) return endpoint;
@@ -50,6 +57,7 @@ std::vector<Node*> g_local_bus_nodes;
 
 Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
   finalized_hash_ = zero_hash();
+  restart_debug_ = restart_debug_enabled();
 }
 
 Node::~Node() { stop(); }
@@ -76,6 +84,22 @@ bool Node::init() {
   if (!load_state()) {
     std::cerr << "load_state failed\n";
     return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    // Ensure no stale in-memory state survives re-init.
+    current_round_ = 0;
+    round_started_ms_ = now_unix() * 1000;
+    candidate_blocks_.clear();
+    candidate_block_sizes_.clear();
+    proposed_in_round_.clear();
+    logged_committee_rounds_.clear();
+    votes_.clear_height(finalized_height_ + 1);
+  }
+  if (restart_debug_) {
+    log_line("restart-debug startup-state height=" + std::to_string(finalized_height_) + " round=" +
+             std::to_string(current_round_) + " tip=" + hex_encode32(finalized_hash_));
   }
 
   {
@@ -169,14 +193,32 @@ void Node::start() {
 }
 
 void Node::stop() {
-  if (!running_.exchange(false)) return;
+  if (restart_debug_) {
+    std::lock_guard<std::mutex> lk(mu_);
+    log_line("restart-debug shutdown-begin height=" + std::to_string(finalized_height_) + " round=" +
+             std::to_string(current_round_) + " tip=" + hex_encode32(finalized_hash_));
+  }
+  if (!running_.exchange(false)) {
+    db_.close();
+    return;
+  }
   if (loop_thread_.joinable()) loop_thread_.join();
+  if (restart_debug_) log_line("restart-debug event-loop-joined");
+  if (restart_debug_) log_line("restart-debug round-timer-cancelled");
+  join_local_bus_tasks();
+  if (restart_debug_) log_line("restart-debug local-bus-tasks-joined");
   persist_peers();
+  if (restart_debug_) log_line("restart-debug peers-persisted");
   p2p_.stop();
+  if (restart_debug_) log_line("restart-debug p2p-stopped");
   if (cfg_.disable_p2p) {
     std::lock_guard<std::mutex> lk(g_local_bus_mu);
     g_local_bus_nodes.erase(std::remove(g_local_bus_nodes.begin(), g_local_bus_nodes.end(), this), g_local_bus_nodes.end());
   }
+  (void)db_.flush();
+  if (restart_debug_) log_line("restart-debug db-flushed");
+  db_.close();
+  if (restart_debug_) log_line("restart-debug db-closed");
 }
 
 NodeStatus Node::status() const {
@@ -211,7 +253,7 @@ bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   return mempool_.accept_tx(tx, utxos_, &err);
 }
 bool Node::pause_proposals_for_test(bool pause) {
-  pause_proposals_ = pause;
+  pause_proposals_.store(pause);
   return true;
 }
 std::size_t Node::mempool_size_for_test() const {
@@ -288,6 +330,10 @@ void Node::event_loop() {
         ++current_round_;
         round_started_ms_ = now_ms;
         log_line("round-timeout height=" + std::to_string(h) + " new_round=" + std::to_string(current_round_));
+        if (restart_debug_) {
+          log_line("restart-debug round-timer-reset height=" + std::to_string(h) + " round=" +
+                   std::to_string(current_round_));
+        }
       }
 
       const auto hr = std::make_pair(h, current_round_);
@@ -314,7 +360,7 @@ void Node::event_loop() {
         }
       }
 
-      if (!pause_proposals_ && leader.has_value() && *leader == local_key_.public_key) {
+      if (!pause_proposals_.load() && leader.has_value() && *leader == local_key_.public_key) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           auto b = build_proposal_block(h, current_round_);
@@ -515,6 +561,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             finalized_hash_ = bid;
             current_round_ = 0;
             round_started_ms_ = now_unix() * 1000;
+            if (restart_debug_) {
+              log_line("restart-debug round-timer-reset height=" + std::to_string(finalized_height_) + " round=0");
+            }
             votes_.clear_height(blk->header.height);
             candidate_blocks_.clear();
             candidate_block_sizes_.clear();
@@ -570,6 +619,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 }
 
 bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
+  if (from_network && !running_) return false;
   std::optional<Vote> maybe_vote;
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -629,46 +679,54 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
 }
 
 bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (vote.height != finalized_height_ + 1) return false;
-  if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
+  if (from_network && !running_) return false;
+  bool relay_vote = false;
+  bool finalize_ok = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (vote.height != finalized_height_ + 1) return false;
+    if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
 
-  const auto nowm = now_ms();
-  auto& verify_bucket = vote_verify_buckets_[from_peer_id];
-  verify_bucket.configure(cfg_.vote_verify_capacity, cfg_.vote_verify_refill);
-  if (from_network && !verify_bucket.consume(1.0, nowm)) return false;
+    const auto nowm = now_ms();
+    auto& verify_bucket = vote_verify_buckets_[from_peer_id];
+    verify_bucket.configure(cfg_.vote_verify_capacity, cfg_.vote_verify_refill);
+    if (from_network && !verify_bucket.consume(1.0, nowm)) return false;
 
-  const p2p::VoteVerifyCache::Key vkey{vote.height, vote.round, vote.block_id, vote.validator_pubkey};
-  if (!vote_verify_cache_.contains(vkey)) {
-    Bytes bid(vote.block_id.begin(), vote.block_id.end());
-    if (!crypto::ed25519_verify(bid, vote.signature, vote.validator_pubkey)) return false;
-    vote_verify_cache_.insert(vkey);
-  }
-
-  auto tr = votes_.add_vote(vote);
-  if (tr.equivocation && tr.evidence.has_value()) {
-    if (is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
-      validators_.ban(vote.validator_pubkey);
-      auto vi = validators_.get(vote.validator_pubkey);
-      if (vi.has_value()) db_.put_validator(vote.validator_pubkey, *vi);
-      log_line("equivocation-banned validator=" +
-               hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
-               " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
+    const p2p::VoteVerifyCache::Key vkey{vote.height, vote.round, vote.block_id, vote.validator_pubkey};
+    if (!vote_verify_cache_.contains(vkey)) {
+      Bytes bid(vote.block_id.begin(), vote.block_id.end());
+      if (!crypto::ed25519_verify(bid, vote.signature, vote.validator_pubkey)) return false;
+      vote_verify_cache_.insert(vkey);
     }
+
+    auto tr = votes_.add_vote(vote);
+    if (tr.equivocation && tr.evidence.has_value()) {
+      if (is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
+        validators_.ban(vote.validator_pubkey);
+        auto vi = validators_.get(vote.validator_pubkey);
+        if (vi.has_value()) db_.put_validator(vote.validator_pubkey, *vi);
+        log_line("equivocation-banned validator=" +
+                 hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
+                 " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
+      }
+    }
+
+    if (!tr.accepted) {
+      return tr.duplicate;
+    }
+
+    relay_vote = from_network && !should_mute_peer(from_peer_id);
+    finalize_ok = finalize_if_quorum(vote.block_id, vote.height, vote.round);
   }
 
-  if (!tr.accepted) {
-    return tr.duplicate;
-  }
-
-  if (from_network && !should_mute_peer(from_peer_id)) {
+  if (relay_vote) {
     broadcast_vote(vote);
   }
-
-  return finalize_if_quorum(vote.block_id, vote.height, vote.round);
+  return finalize_ok;
 }
 
 bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
+  if (from_network && !running_) return false;
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -736,6 +794,9 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   finalized_hash_ = block_id;
   current_round_ = 0;
   round_started_ms_ = now_unix() * 1000;
+  if (restart_debug_) {
+    log_line("restart-debug round-timer-reset height=" + std::to_string(finalized_height_) + " round=0");
+  }
 
   votes_.clear_height(height);
   vote_verify_cache_.clear_height(height);
@@ -831,6 +892,7 @@ void Node::broadcast_propose(const Block& block) {
   p.prev_finalized_hash = block.header.prev_finalized_hash;
   p.block_bytes = block.serialize();
   if (cfg_.disable_p2p) {
+    if (!running_) return;
     std::vector<Node*> peers;
     {
       std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -838,7 +900,7 @@ void Node::broadcast_propose(const Block& block) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      std::thread([peer, p]() { peer->handle_propose(p, true); }).detach();
+      spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); });
     }
   } else {
     p2p_.broadcast(p2p::MsgType::PROPOSE, p2p::ser_propose(p));
@@ -847,6 +909,7 @@ void Node::broadcast_propose(const Block& block) {
 
 void Node::broadcast_vote(const Vote& vote) {
   if (cfg_.disable_p2p) {
+    if (!running_) return;
     std::vector<Node*> peers;
     {
       std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -854,7 +917,7 @@ void Node::broadcast_vote(const Vote& vote) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      std::thread([peer, vote]() { peer->handle_vote(vote, true); }).detach();
+      spawn_local_bus_task([peer, vote]() { peer->handle_vote(vote, true, 0); });
     }
   } else {
     p2p_.broadcast(p2p::MsgType::VOTE, p2p::ser_vote(p2p::VoteMsg{vote}));
@@ -863,6 +926,7 @@ void Node::broadcast_vote(const Vote& vote) {
 
 void Node::broadcast_finalized_block(const Block& block) {
   if (cfg_.disable_p2p) {
+    if (!running_) return;
     std::vector<Node*> peers;
     {
       std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -870,10 +934,10 @@ void Node::broadcast_finalized_block(const Block& block) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      std::thread([peer, block]() {
+      spawn_local_bus_task([peer, block]() {
         p2p::ProposeMsg pm{block.header.height, block.header.round, block.header.prev_finalized_hash, block.serialize()};
         peer->handle_propose(pm, true);
-      }).detach();
+      });
     }
   } else {
     p2p_.broadcast(p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{block.serialize()}));
@@ -882,6 +946,7 @@ void Node::broadcast_finalized_block(const Block& block) {
 
 void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
   if (cfg_.disable_p2p) {
+    if (!running_) return;
     std::vector<Node*> peers;
     {
       std::lock_guard<std::mutex> lk(g_local_bus_mu);
@@ -889,7 +954,7 @@ void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      std::thread([peer, tx]() { peer->handle_tx(tx, true); }).detach();
+      spawn_local_bus_task([peer, tx]() { peer->handle_tx(tx, true); });
     }
   } else {
     const auto payload = p2p::ser_tx(p2p::TxMsg{tx.serialize()});
@@ -937,6 +1002,11 @@ bool Node::persist_finalized_block(const Block& block) {
       if (!db_.put_script_utxo(sh, op, out, block.header.height)) return false;
       if (!db_.add_script_history(sh, block.header.height, txid)) return false;
     }
+  }
+  if (!db_.flush()) return false;
+  if (restart_debug_) {
+    log_line("restart-debug db-commit-flush height=" + std::to_string(block.header.height) + " hash=" +
+             hex_encode32(h));
   }
   return true;
 }
@@ -1112,6 +1182,22 @@ void Node::log_line(const std::string& s) const {
     return;
   }
   std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
+}
+
+void Node::spawn_local_bus_task(std::function<void()> fn) {
+  std::lock_guard<std::mutex> lk(local_bus_tasks_mu_);
+  local_bus_tasks_.emplace_back([f = std::move(fn)]() { f(); });
+}
+
+void Node::join_local_bus_tasks() {
+  std::vector<std::thread> tasks;
+  {
+    std::lock_guard<std::mutex> lk(local_bus_tasks_mu_);
+    tasks.swap(local_bus_tasks_);
+  }
+  for (auto& t : tasks) {
+    if (t.joinable()) t.join();
+  }
 }
 
 void Node::load_persisted_peers() {

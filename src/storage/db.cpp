@@ -387,6 +387,26 @@ bool DB::add_script_history(const Hash32& scripthash, std::uint64_t height, cons
   return put(key_sh(scripthash, height, txid), {});
 }
 
+bool DB::flush() {
+#ifdef SC_HAS_ROCKSDB
+  if (!rocks_ || !rocks_->db) return false;
+  rocksdb::FlushOptions opts;
+  opts.wait = true;
+  auto s = rocks_->db->Flush(opts);
+  return s.ok();
+#else
+  return flush_file();
+#endif
+}
+
+void DB::close() {
+#ifdef SC_HAS_ROCKSDB
+  rocks_.reset();
+#else
+  mem_.clear();
+#endif
+}
+
 std::vector<DB::ScriptHistoryEntry> DB::get_script_history(const Hash32& scripthash) const {
   std::vector<ScriptHistoryEntry> out;
   const std::string prefix = key_sh_prefix(scripthash);

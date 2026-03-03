@@ -1,8 +1,17 @@
 {
   "network": "mainnet",
-  "seeds": [
-    "212.58.103.170:19440"
-    // "seed1.mainnet.selfcoin.example:19440",
-    // "seed2.mainnet.selfcoin.example:19440"
+  "seeds_p2p": [
+    "212.58.103.170:19440",
+    "seed1.mainnet.selfcoin.example:19440",
+    "seed2.mainnet.selfcoin.example:19440"
+  ],
+  "lightservers_rpc": [
+    "http://ls1.mainnet.selfcoin.example:19444/rpc",
+    "http://ls2.mainnet.selfcoin.example:19444/rpc"
+  ],
+  "notes": [
+    "Seeds must be raw P2P endpoints on :19440.",
+    "Lightservers are RPC-only endpoints on :19444.",
+    "Do not put Cloudflare/nginx/TLS in front of P2P."
   ]
 }

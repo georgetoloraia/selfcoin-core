@@ -7,10 +7,36 @@
 
 #include <chrono>
 #include <cstring>
+#include <sstream>
 
 #include "p2p/messages.hpp"
 
 namespace selfcoin::p2p {
+namespace {
+
+std::string bytes_to_hex_prefix(const Bytes& in, std::size_t n = 16) {
+  const std::size_t take = std::min(n, in.size());
+  return hex_encode(Bytes(in.begin(), in.begin() + take));
+}
+
+std::string u32_hex(std::uint32_t v) {
+  std::ostringstream oss;
+  oss << "0x" << std::hex << std::nouppercase << v;
+  return oss.str();
+}
+
+std::string frame_fail_detail(const FrameFailureInfo& fi) {
+  std::ostringstream oss;
+  oss << "reason=" << frame_read_error_string(fi.reason) << " class=" << prefix_kind_string(fi.prefix_kind)
+      << " expected_magic=" << u32_hex(fi.expected_magic)
+      << " expected_proto=" << std::to_string(fi.expected_proto_version)
+      << " first16=" << bytes_to_hex_prefix(fi.first_bytes);
+  if (fi.received_magic.has_value()) oss << " received_magic=" << u32_hex(*fi.received_magic);
+  if (fi.payload_len.has_value()) oss << " payload_len=" << *fi.payload_len;
+  return oss.str();
+}
+
+}  // namespace
 
 void PeerManager::configure_network(std::uint32_t magic, std::uint16_t proto_version, std::size_t max_payload_len) {
   magic_ = magic;
@@ -266,6 +292,7 @@ void PeerManager::start_peer(int fd, const std::string& endpoint, const std::str
     p->info.id = next_peer_id_++;
     p->info.endpoint = endpoint;
     p->info.ip = ip;
+    p->info.inbound = inbound;
     peers_[p->info.id] = p;
   }
   emit_event(p->info.id, PeerEventType::CONNECTED, endpoint);
@@ -290,15 +317,16 @@ void PeerManager::read_loop(int peer_id) {
     const auto info = get_peer_info(peer_id);
     const std::uint32_t header_timeout = info.established() ? limits_.idle_timeout_ms : limits_.handshake_timeout_ms;
     FrameReadError ferr = FrameReadError::NONE;
+    FrameFailureInfo finfo;
     auto frame = read_frame_fd_timed(p->fd, max_payload_len_, magic_, proto_version_, header_timeout, limits_.frame_timeout_ms,
-                                     &ferr);
+                                     &ferr, &finfo);
     if (!frame.has_value()) {
       if (ferr == FrameReadError::TIMEOUT_HEADER) {
         emit_event(peer_id, info.established() ? PeerEventType::FRAME_TIMEOUT : PeerEventType::HANDSHAKE_TIMEOUT, "header-timeout");
       } else if (ferr == FrameReadError::TIMEOUT_BODY) {
         emit_event(peer_id, PeerEventType::FRAME_TIMEOUT, "body-timeout");
       } else if (ferr != FrameReadError::NONE && ferr != FrameReadError::IO_EOF) {
-        emit_event(peer_id, PeerEventType::FRAME_INVALID, "invalid-frame");
+        emit_event(peer_id, PeerEventType::FRAME_INVALID, frame_fail_detail(finfo));
       }
       break;
     }

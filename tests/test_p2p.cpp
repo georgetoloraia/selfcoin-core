@@ -1,6 +1,7 @@
 #include "test_framework.hpp"
 
 #include "common/network.hpp"
+#include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 
 using namespace selfcoin;
@@ -29,6 +30,13 @@ TEST(test_version_message_v07_roundtrip) {
   ASSERT_EQ(d->node_software_version, v.node_software_version);
   ASSERT_EQ(d->start_height, v.start_height);
   ASSERT_EQ(d->start_hash, v.start_hash);
+}
+
+TEST(test_prefix_classification) {
+  ASSERT_EQ(p2p::classify_prefix(Bytes{'H', 'T', 'T', 'P'}), p2p::PrefixKind::HTTP);
+  ASSERT_EQ(p2p::classify_prefix(Bytes{'{', '"', 'a'}), p2p::PrefixKind::JSON);
+  ASSERT_EQ(p2p::classify_prefix(Bytes{0x16, 0x03, 0x01, 0x00}), p2p::PrefixKind::TLS);
+  ASSERT_EQ(p2p::classify_prefix(Bytes{0x01, 0x02, 0x03}), p2p::PrefixKind::UNKNOWN);
 }
 
 void register_p2p_tests() {}

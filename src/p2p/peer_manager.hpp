@@ -19,6 +19,7 @@ struct PeerInfo {
   int id{0};
   std::string endpoint;
   std::string ip;
+  bool inbound{false};
   bool version_rx{false};
   bool verack_rx{false};
   bool version_tx{false};

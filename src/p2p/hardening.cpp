@@ -40,8 +40,13 @@ double TokenBucket::available(std::uint64_t now_ms) const {
   return tokens_;
 }
 
-PeerDiscipline::PeerDiscipline(int soft_mute_score, int ban_score, std::uint64_t ban_seconds)
-    : soft_mute_score_(soft_mute_score), ban_score_(ban_score), ban_seconds_(ban_seconds) {}
+PeerDiscipline::PeerDiscipline(int soft_mute_score, int ban_score, std::uint64_t ban_seconds,
+                               int invalid_frame_ban_threshold, std::uint64_t invalid_frame_window_seconds)
+    : soft_mute_score_(soft_mute_score),
+      ban_score_(ban_score),
+      ban_seconds_(ban_seconds),
+      invalid_frame_ban_threshold_(std::max(1, invalid_frame_ban_threshold)),
+      invalid_frame_window_seconds_(std::max<std::uint64_t>(1, invalid_frame_window_seconds)) {}
 
 int PeerDiscipline::reason_score(MisbehaviorReason reason) const {
   switch (reason) {
@@ -71,7 +76,23 @@ PeerScoreStatus PeerDiscipline::add_score(const std::string& ip, MisbehaviorReas
     if (decay > 0) e.score = std::max(0, e.score - decay);
   }
   e.last_update = now_unix;
-  e.score += reason_score(reason);
+  if (reason == MisbehaviorReason::INVALID_FRAME) {
+    e.invalid_frame_strikes.push_back(now_unix);
+    while (!e.invalid_frame_strikes.empty() &&
+           e.invalid_frame_strikes.front() + invalid_frame_window_seconds_ < now_unix) {
+      e.invalid_frame_strikes.pop_front();
+    }
+    if (static_cast<int>(e.invalid_frame_strikes.size()) >= invalid_frame_ban_threshold_) {
+      const int s = reason_score(reason);
+      if (static_cast<int>(e.invalid_frame_strikes.size()) == invalid_frame_ban_threshold_) {
+        e.score += s * invalid_frame_ban_threshold_;
+      } else {
+        e.score += s;
+      }
+    }
+  } else {
+    e.score += reason_score(reason);
+  }
   if (e.score >= ban_score_) e.ban_until = std::max(e.ban_until, now_unix + ban_seconds_);
   return status(ip, now_unix);
 }

@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
                  "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "
+                 "[--invalid-frame-ban-threshold <n>] [--invalid-frame-window-seconds <s>] "
                  "[--min-relay-fee <sats>]\n";
     return 1;
   }

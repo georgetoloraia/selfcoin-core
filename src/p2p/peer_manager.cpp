@@ -5,6 +5,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstring>
 
 #include "p2p/messages.hpp"
@@ -105,8 +106,10 @@ void PeerManager::stop() {
       ::close(p->fd);
       p->fd = -1;
     }
-    if (p->reader.joinable()) p->reader.join();
   }
+
+  std::unique_lock<std::mutex> lk(reader_wait_mu_);
+  reader_wait_cv_.wait_for(lk, std::chrono::seconds(5), [this]() { return active_readers_.load() == 0; });
 }
 
 bool PeerManager::send_to(int peer_id, std::uint16_t msg_type, const Bytes& payload, bool low_priority) {
@@ -266,8 +269,12 @@ void PeerManager::start_peer(int fd, const std::string& endpoint, const std::str
     peers_[p->info.id] = p;
   }
   emit_event(p->info.id, PeerEventType::CONNECTED, endpoint);
-
-  p->reader = std::thread([this, peer_id = p->info.id]() { read_loop(peer_id); });
+  active_readers_.fetch_add(1);
+  std::thread([this, peer_id = p->info.id]() {
+    read_loop(peer_id);
+    active_readers_.fetch_sub(1);
+    reader_wait_cv_.notify_all();
+  }).detach();
 }
 
 void PeerManager::read_loop(int peer_id) {

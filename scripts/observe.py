@@ -30,23 +30,50 @@ def main() -> int:
     while True:
         rows = []
         tips = []
+        ids = []
         for url in args.urls:
             try:
-                tip = rpc(url, "get_tip", {})
+                status = rpc(url, "get_status", {})
+                tip = status.get("tip", {})
                 h = int(tip["height"])
                 hs = str(tip["hash"])
-                rows.append((url, h, hs, "ok"))
+                network_id = str(status.get("network_id", ""))
+                genesis_hash = str(status.get("genesis_hash", ""))
+                proto = int(status.get("protocol_version", 0))
+                magic = int(status.get("magic", 0))
+                rows.append((url, h, hs, network_id, genesis_hash, proto, magic, "ok"))
                 tips.append((h, hs))
+                ids.append((network_id, genesis_hash, proto, magic))
             except Exception as exc:
-                rows.append((url, -1, "error", f"err:{exc}"))
+                rows.append((url, -1, "error", "", "", 0, 0, f"err:{exc}"))
                 tips.append((-1, "error"))
+                ids.append(("", "", 0, 0))
+
+        id_mismatch = False
+        ref_id = None
+        for identity in ids:
+            if identity[0] == "":
+                continue
+            if ref_id is None:
+                ref_id = identity
+            elif identity != ref_id:
+                id_mismatch = True
+                break
+
+        if id_mismatch:
+            print("ERROR: chain identity mismatch detected")
+            print("server\tnetwork_id\tgenesis_hash\tproto\tmagic")
+            for url, _, _, nid, ghash, proto, magic, _ in rows:
+                print(f"{url}\t{nid[:16]}...\t{ghash[:16]}...\t{proto}\t{magic}")
+            print("")
+            return 2
 
         best_h = max(h for h, _ in tips)
         canonical = max(tips, key=lambda t: (t[0], t[1]))
         mismatch = False
 
         print("server\theight\thash\tlag\tstatus")
-        for url, h, hs, st in rows:
+        for url, h, hs, _, _, _, _, st in rows:
             lag = max(0, best_h - h) if h >= 0 else -1
             row_status = st
             if h >= 0 and (h, hs) != canonical:
@@ -73,4 +100,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

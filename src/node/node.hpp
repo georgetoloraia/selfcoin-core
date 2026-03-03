@@ -16,6 +16,7 @@
 #include "p2p/messages.hpp"
 #include "p2p/addrman.hpp"
 #include "p2p/peer_manager.hpp"
+#include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "p2p/hardening.hpp"
 #include "storage/db.hpp"
@@ -32,8 +33,10 @@ struct NodeConfig {
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
   bool listen{true};
+  bool public_mode{false};
   bool dns_seeds{false};
   std::size_t outbound_target{8};
+  std::size_t max_inbound{64};
   std::uint16_t p2p_port{18444};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
@@ -65,16 +68,29 @@ struct NodeConfig {
 };
 
 struct NodeStatus {
+  std::string network_name;
+  std::uint32_t protocol_version{0};
+  std::string network_id_short;
+  std::uint32_t magic{0};
+  std::string genesis_hash;
+  std::string genesis_source;
+  bool chain_id_ok{true};
+  std::string db_dir;
   std::uint64_t height{0};
   std::uint32_t round{0};
   Hash32 tip_hash{};
+  std::string tip_hash_short;
   PubKey32 leader{};
   std::size_t votes_for_current{0};
   std::size_t peers{0};
   std::size_t mempool_size{0};
   std::size_t committee_size{0};
+  std::size_t quorum_threshold{0};
   std::size_t addrman_size{0};
+  std::size_t inbound_connected{0};
   std::size_t outbound_connected{0};
+  std::size_t observed_signers{0};
+  std::string consensus_state;
   std::string last_bootstrap_source;
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
@@ -147,6 +163,8 @@ class Node {
   bool should_mute_peer(int peer_id) const;
   void prune_caches_locked(std::uint64_t height, std::uint32_t round);
   bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
+  std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
+                                     std::size_t* quorum_threshold = nullptr) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -194,9 +212,14 @@ class Node {
   std::atomic<bool> pause_proposals_{false};
   std::uint64_t last_seed_attempt_ms_{0};
   std::uint64_t last_addrman_save_ms_{0};
+  std::uint64_t last_summary_log_ms_{0};
+  std::uint64_t last_finalized_progress_ms_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> dns_seed_peers_;
   p2p::AddrMan addrman_{10'000};
+  ChainId chain_id_{};
+  std::optional<Hash32> expected_genesis_hash_;
+  std::string genesis_source_hint_{"devnet"};
   std::set<int> getaddr_requested_peers_;
   std::string last_bootstrap_source_{"none"};
   bool restart_debug_{false};

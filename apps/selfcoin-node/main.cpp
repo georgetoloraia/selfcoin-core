@@ -14,11 +14,11 @@ void on_sigint(int) { g_stop = 1; }
 int main(int argc, char** argv) {
   auto cfg = selfcoin::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: selfcoin-node [--devnet|--testnet|--mainnet] --node-id <id> --db <dir> [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
-                 "[--listen] [--bind <ip>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
+    std::cerr << "usage: selfcoin-node [--devnet|--testnet|--mainnet] --node-id <id> [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
+                 "[--public] [--listen] [--bind <ip>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
-                 "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--ban-seconds <s>] "
+                 "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "
                  "[--min-relay-fee <sats>]\n";
     return 1;
   }

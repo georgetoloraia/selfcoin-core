@@ -28,6 +28,8 @@ endif()
 add_library(selfcoin_core
   src/common/types.cpp
   src/common/network.cpp
+  src/common/chain_id.cpp
+  src/common/paths.cpp
   src/codec/bytes.cpp
   src/codec/varint.cpp
   src/crypto/hash.cpp
@@ -98,6 +100,7 @@ endif()
 add_executable(selfcoin-tests
   tests/test_main.cpp
   tests/test_codec.cpp
+  tests/test_chain_id.cpp
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
@@ -108,6 +111,7 @@ add_executable(selfcoin-tests
   tests/test_mempool.cpp
   tests/test_hardening.cpp
   tests/test_genesis.cpp
+  tests/test_paths.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp
 )

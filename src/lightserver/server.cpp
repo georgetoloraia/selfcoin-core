@@ -15,6 +15,7 @@
 #include <sstream>
 
 #include "codec/bytes.hpp"
+#include "common/paths.hpp"
 #include "consensus/validators.hpp"
 #include "crypto/hash.hpp"
 #include "node/node.hpp"
@@ -116,9 +117,11 @@ Server::Server(Config cfg) : cfg_(std::move(cfg)) {}
 Server::~Server() { stop(); }
 
 bool Server::init() {
+  cfg_.db_path = expand_user_home(cfg_.db_path);
   if (!db_.open_readonly(cfg_.db_path)) {
     if (!db_.open(cfg_.db_path)) return false;
   }
+  chain_id_ = ChainId::from_config_and_db(cfg_.network, db_);
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   if (cfg_.tx_relay_port == 0) cfg_.tx_relay_port = cfg_.network.p2p_default_port;
   started_at_unix_ = static_cast<std::uint64_t>(::time(nullptr));
@@ -351,6 +354,9 @@ std::string Server::handle_rpc_body(const std::string& body) {
     std::ostringstream oss;
     oss << "{\"network_name\":\"" << cfg_.network.name << "\",\"protocol_version\":"
         << cfg_.network.protocol_version << ",\"feature_flags\":" << cfg_.network.feature_flags
+        << ",\"network_id\":\"" << chain_id_.network_id_hex << "\",\"magic\":" << chain_id_.magic
+        << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\",\"genesis_source\":\""
+        << chain_id_.genesis_source << "\",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false")
         << ",\"tip\":{\"height\":" << tip->height << ",\"hash\":\"" << hex_encode32(tip->hash)
         << "\"},\"peers\":null,\"mempool_size\":null,\"uptime_s\":" << (now - started_at_unix_)
         << ",\"version\":\"selfcoin-core/0.7\"}";
@@ -485,12 +491,14 @@ std::string Server::handle_rpc_body(const std::string& body) {
 std::optional<Config> parse_args(int argc, char** argv) {
   Config cfg;
   cfg.network = devnet_network();
+  cfg.db_path = default_db_dir_for_network(cfg.network.name);
   cfg.port = cfg.network.lightserver_default_port;
   cfg.tx_relay_port = cfg.network.p2p_default_port;
   cfg.max_committee = cfg.network.max_committee;
   bool port_explicit = false;
   bool relay_port_explicit = false;
   bool committee_explicit = false;
+  bool db_explicit = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::optional<std::string> {
@@ -501,6 +509,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
       auto v = next();
       if (!v) return std::nullopt;
       cfg.db_path = *v;
+      db_explicit = true;
     } else if (a == "--bind") {
       auto v = next();
       if (!v) return std::nullopt;
@@ -556,6 +565,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
       return std::nullopt;
     }
   }
+  if (!db_explicit) cfg.db_path = default_db_dir_for_network(cfg.network.name);
   return cfg;
 }
 

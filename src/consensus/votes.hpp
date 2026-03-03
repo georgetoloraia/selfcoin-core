@@ -29,6 +29,7 @@ class VoteTracker {
   explicit VoteTracker(Limits limits) : limits_(limits) {}
   VoteTallyResult add_vote(const Vote& vote);
   std::vector<FinalitySig> signatures_for(std::uint64_t height, std::uint32_t round, const Hash32& block_id) const;
+  std::set<PubKey32> participants_for(std::uint64_t height, std::uint32_t round) const;
   void clear_height(std::uint64_t height);
 
  private:

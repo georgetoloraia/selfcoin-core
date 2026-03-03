@@ -54,6 +54,14 @@ std::vector<FinalitySig> VoteTracker::signatures_for(std::uint64_t height, std::
   return out;
 }
 
+std::set<PubKey32> VoteTracker::participants_for(std::uint64_t height, std::uint32_t round) const {
+  std::set<PubKey32> out;
+  const auto it = seen_by_validator_.find(std::make_pair(height, round));
+  if (it == seen_by_validator_.end()) return out;
+  for (const auto& [pub, _] : it->second) out.insert(pub);
+  return out;
+}
+
 void VoteTracker::clear_height(std::uint64_t height) {
   for (auto it = by_block_.begin(); it != by_block_.end();) {
     if (it->first.height == height) {

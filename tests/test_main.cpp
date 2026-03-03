@@ -12,6 +12,7 @@ std::vector<std::pair<std::string, TestFn>>& tests() {
 Reg::Reg(const std::string& n, TestFn fn) { tests().push_back({n, std::move(fn)}); }
 
 void register_codec_tests();
+void register_chain_id_tests();
 void register_crypto_tests();
 void register_address_tests();
 void register_consensus_tests();
@@ -22,11 +23,13 @@ void register_bonding_tests();
 void register_mempool_tests();
 void register_hardening_tests();
 void register_genesis_tests();
+void register_paths_tests();
 void register_integration_tests();
 void register_lightserver_tests();
 
 int main() {
   register_codec_tests();
+  register_chain_id_tests();
   register_crypto_tests();
   register_address_tests();
   register_consensus_tests();
@@ -37,6 +40,7 @@ int main() {
   register_mempool_tests();
   register_hardening_tests();
   register_genesis_tests();
+  register_paths_tests();
   register_integration_tests();
   register_lightserver_tests();
 

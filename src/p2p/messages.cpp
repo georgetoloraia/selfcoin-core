@@ -190,4 +190,65 @@ std::optional<TxMsg> de_tx(const Bytes& b) {
   return m;
 }
 
+Bytes ser_getaddr(const GetAddrMsg&) { return {}; }
+
+std::optional<GetAddrMsg> de_getaddr(const Bytes& b) {
+  if (!b.empty()) return std::nullopt;
+  return GetAddrMsg{};
+}
+
+Bytes ser_addr(const AddrMsg& m) {
+  codec::ByteWriter w;
+  w.varint(m.entries.size());
+  for (const auto& e : m.entries) {
+    w.u8(e.ip_version);
+    if (e.ip_version == 4) {
+      Bytes ip4{e.ip[0], e.ip[1], e.ip[2], e.ip[3]};
+      w.bytes(ip4);
+    } else {
+      w.bytes_fixed(e.ip);
+    }
+    w.u16le(e.port);
+    w.u64le(e.last_seen_unix);
+  }
+  return w.take();
+}
+
+std::optional<AddrMsg> de_addr(const Bytes& b) {
+  AddrMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto n = r.varint();
+        if (!n || *n > 2000) return false;
+        m.entries.clear();
+        m.entries.reserve(*n);
+        for (std::uint64_t i = 0; i < *n; ++i) {
+          AddrEntryMsg e;
+          auto ver = r.u8();
+          if (!ver || (*ver != 4 && *ver != 6)) return false;
+          e.ip_version = *ver;
+          if (*ver == 4) {
+            auto ip4 = r.bytes(4);
+            if (!ip4) return false;
+            e.ip.fill(0);
+            e.ip[0] = (*ip4)[0];
+            e.ip[1] = (*ip4)[1];
+            e.ip[2] = (*ip4)[2];
+            e.ip[3] = (*ip4)[3];
+          } else {
+            auto ip6 = r.bytes_fixed<16>();
+            if (!ip6) return false;
+            e.ip = *ip6;
+          }
+          auto p = r.u16le();
+          auto seen = r.u64le();
+          if (!p || !seen) return false;
+          e.port = *p;
+          e.last_seen_unix = *seen;
+          m.entries.push_back(e);
+        }
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
 }  // namespace selfcoin::p2p

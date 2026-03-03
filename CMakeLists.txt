@@ -33,6 +33,7 @@ add_library(selfcoin_core
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
   src/genesis/genesis.cpp
+  src/genesis/embedded_mainnet.cpp
   src/merkle/merkle.cpp
   src/address/address.cpp
   src/utxo/tx.cpp
@@ -44,6 +45,7 @@ add_library(selfcoin_core
   src/consensus/votes.cpp
   src/storage/db.cpp
   src/p2p/framing.cpp
+  src/p2p/addrman.cpp
   src/p2p/hardening.cpp
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
@@ -100,6 +102,7 @@ add_executable(selfcoin-tests
   tests/test_address.cpp
   tests/test_consensus.cpp
   tests/test_p2p.cpp
+  tests/test_addrman.cpp
   tests/test_monetary.cpp
   tests/test_bonding.cpp
   tests/test_mempool.cpp

@@ -1,12 +1,14 @@
 #include "node/node.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <netdb.h>
 #include <cstdlib>
 #include <set>
 #include <sstream>
@@ -17,6 +19,7 @@
 #include "consensus/monetary.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "merkle/merkle.hpp"
 
@@ -136,10 +139,15 @@ bool Node::init() {
   round_started_ms_ = now_unix() * 1000;
 
   load_persisted_peers();
+  load_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
   if ((cfg_.testnet || cfg_.mainnet) && cfg_.seeds.empty()) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
+  }
+  if ((cfg_.mainnet || cfg_.testnet) && cfg_.dns_seeds) {
+    dns_seed_peers_ = resolve_dns_seeds_once();
+    for (const auto& d : dns_seed_peers_) bootstrap_peers_.push_back(d);
   }
 
   if (!cfg_.disable_p2p) {
@@ -151,9 +159,11 @@ bool Node::init() {
     });
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
       if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
+        auto na = p2p::parse_endpoint(detail);
         {
           std::lock_guard<std::mutex> lk(mu_);
           peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
+          if (na.has_value()) addrman_.add_or_update(*na, now_unix());
         }
         if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
           p2p_.disconnect_peer(peer_id);
@@ -163,9 +173,12 @@ bool Node::init() {
       if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
         std::lock_guard<std::mutex> lk(mu_);
         peer_ip_cache_.erase(peer_id);
+        getaddr_requested_peers_.erase(peer_id);
         msg_rate_buckets_.erase(peer_id);
         vote_verify_buckets_.erase(peer_id);
         tx_verify_buckets_.erase(peer_id);
+        auto na = p2p::parse_endpoint(detail);
+        if (na.has_value()) addrman_.mark_fail(*na, now_unix(), "disconnect");
         return;
       }
       if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
@@ -177,11 +190,13 @@ bool Node::init() {
         score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
       }
     });
-    if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
-      std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
-      return false;
+    if (cfg_.listen) {
+      if (!p2p_.start_listener(cfg_.bind_ip, cfg_.p2p_port)) {
+        std::cerr << "listener start failed " << cfg_.bind_ip << ":" << cfg_.p2p_port << "\n";
+        return false;
+      }
+      cfg_.p2p_port = p2p_.listener_port();
     }
-    cfg_.p2p_port = p2p_.listener_port();
     try_connect_bootstrap_peers();
   }
 
@@ -213,6 +228,7 @@ void Node::stop() {
   join_local_bus_tasks();
   if (restart_debug_) log_line("restart-debug local-bus-tasks-joined");
   persist_peers();
+  persist_addrman();
   if (restart_debug_) log_line("restart-debug peers-persisted");
   p2p_.stop();
   if (restart_debug_) log_line("restart-debug p2p-stopped");
@@ -239,6 +255,9 @@ NodeStatus Node::status() const {
   s.peers = peer_count();
   s.mempool_size = mempool_.size();
   s.committee_size = committee_for_height(finalized_height_ + 1).size();
+  s.addrman_size = addrman_.size();
+  s.outbound_connected = peer_count();
+  s.last_bootstrap_source = last_bootstrap_source_;
   s.rejected_network_id = rejected_network_id_;
   s.rejected_protocol_version = rejected_protocol_version_;
   s.rejected_pre_handshake = rejected_pre_handshake_;
@@ -357,7 +376,9 @@ void Node::event_loop() {
           j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
             << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
-            << ",\"committee_size\":" << committee.size()
+            << ",\"committee_size\":" << committee.size() << ",\"addrman_size\":" << addrman_.size()
+            << ",\"outbound_connected\":" << peer_count()
+            << ",\"last_bootstrap_source\":\"" << last_bootstrap_source_ << "\""
             << ",\"rejected_network_id\":" << rejected_network_id_
             << ",\"rejected_protocol_version\":" << rejected_protocol_version_
             << ",\"rejected_pre_handshake\":" << rejected_pre_handshake_ << "}";
@@ -386,11 +407,15 @@ void Node::event_loop() {
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (!cfg_.disable_p2p && cfg_.testnet) {
+    if (!cfg_.disable_p2p) {
       const std::uint64_t now_ms = now_unix() * 1000;
-      if (peer_count() == 0 && now_ms > last_seed_attempt_ms_ + 3000) {
+      if (peer_count() < cfg_.outbound_target && now_ms > last_seed_attempt_ms_ + 3000) {
         try_connect_bootstrap_peers();
         last_seed_attempt_ms_ = now_ms;
+      }
+      if (now_ms > last_addrman_save_ms_ + 10'000) {
+        persist_addrman();
+        last_addrman_save_ms_ = now_ms;
       }
     }
   }
@@ -471,6 +496,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   if (msg_type == p2p::MsgType::VERACK) {
     p2p_.mark_handshake_rx(peer_id, false, true);
+    maybe_request_getaddr(peer_id);
+    auto pi = p2p_.get_peer_info(peer_id);
+    auto na = p2p::parse_endpoint(pi.endpoint);
+    if (na.has_value()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      addrman_.mark_success(*na, now_unix());
+    }
     return;
   }
 
@@ -618,6 +650,56 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       break;
     }
+    case p2p::MsgType::GETADDR: {
+      auto req = p2p::de_getaddr(payload);
+      if (!req.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-getaddr");
+        return;
+      }
+      p2p::AddrMsg msg;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto addrs = addrman_.select_candidates(256, now_unix());
+        msg.entries.reserve(addrs.size());
+        for (const auto& a : addrs) {
+          p2p::AddrEntryMsg e;
+          std::array<std::uint8_t, 16> bin{};
+          if (inet_pton(AF_INET, a.ip.c_str(), bin.data()) == 1) {
+            e.ip_version = 4;
+          } else if (inet_pton(AF_INET6, a.ip.c_str(), bin.data()) == 1) {
+            e.ip_version = 6;
+          } else {
+            continue;
+          }
+          e.ip = bin;
+          e.port = a.port;
+          e.last_seen_unix = now_unix();
+          msg.entries.push_back(e);
+        }
+      }
+      (void)p2p_.send_to(peer_id, p2p::MsgType::ADDR, p2p::ser_addr(msg), true);
+      break;
+    }
+    case p2p::MsgType::ADDR: {
+      auto msg = p2p::de_addr(payload);
+      if (!msg.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-addr");
+        return;
+      }
+      std::lock_guard<std::mutex> lk(mu_);
+      for (const auto& e : msg->entries) {
+        char ipbuf[INET6_ADDRSTRLEN]{};
+        const char* s = nullptr;
+        if (e.ip_version == 4) {
+          s = inet_ntop(AF_INET, e.ip.data(), ipbuf, sizeof(ipbuf));
+        } else if (e.ip_version == 6) {
+          s = inet_ntop(AF_INET6, e.ip.data(), ipbuf, sizeof(ipbuf));
+        }
+        if (!s || e.port == 0) continue;
+        addrman_.add_or_update(p2p::NetAddress{std::string(ipbuf), e.port}, e.last_seen_unix);
+      }
+      break;
+    }
     default:
       break;
   }
@@ -663,6 +745,9 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     }
     candidate_blocks_[bid] = *blk;
     prune_caches_locked(msg.height, msg.round);
+    // Votes can arrive before proposal in local-bus mode; try finalizing immediately
+    // once candidate block is available.
+    (void)finalize_if_quorum(bid, msg.height, msg.round);
 
     if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       Bytes b_id(bid.begin(), bid.end());
@@ -922,7 +1007,7 @@ void Node::broadcast_vote(const Vote& vote) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      spawn_local_bus_task([peer, vote]() { peer->handle_vote(vote, true, 0); });
+      spawn_local_bus_task([peer, vote]() { peer->handle_vote(vote, false, 0); });
     }
   } else {
     p2p_.broadcast(p2p::MsgType::VOTE, p2p::ser_vote(p2p::VoteMsg{vote}));
@@ -1017,9 +1102,18 @@ bool Node::persist_finalized_block(const Block& block) {
 }
 
 bool Node::init_mainnet_genesis() {
-  std::string path = cfg_.genesis_path.empty() ? "mainnet/genesis.json" : cfg_.genesis_path;
+  const bool use_embedded = cfg_.genesis_path.empty();
   std::string err;
-  auto doc = genesis::load_from_path(path, &err);
+  std::optional<genesis::Document> doc;
+  Hash32 ghash{};
+  if (use_embedded) {
+    const Bytes bin(genesis::MAINNET_GENESIS_BIN, genesis::MAINNET_GENESIS_BIN + genesis::MAINNET_GENESIS_BIN_LEN);
+    doc = genesis::decode_bin(bin, &err);
+    if (doc.has_value()) ghash = genesis::hash_bin(bin);
+  } else {
+    doc = genesis::load_from_path(cfg_.genesis_path, &err);
+    if (doc.has_value()) ghash = genesis::hash_doc(*doc);
+  }
   if (!doc.has_value()) {
     std::cerr << "genesis load failed: " << err << "\n";
     return false;
@@ -1028,8 +1122,11 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "genesis validation failed: " << err << "\n";
     return false;
   }
+  if (use_embedded && ghash != genesis::MAINNET_GENESIS_HASH) {
+    std::cerr << "embedded genesis hash mismatch; binary may be corrupted\n";
+    return false;
+  }
 
-  const Hash32 ghash = genesis::hash_doc(*doc);
   const Bytes ghash_b(ghash.begin(), ghash.end());
   const Hash32 gblock = genesis::block_id(*doc);
   const Bytes gblock_b(gblock.begin(), gblock.end());
@@ -1289,15 +1386,90 @@ void Node::persist_peers() const {
   for (const auto& ep : seen) out << ep << "\n";
 }
 
+void Node::load_addrman() {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
+  (void)addrman_.load(p.string());
+}
+
+void Node::persist_addrman() const {
+  const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
+  (void)addrman_.save(p.string());
+}
+
+std::vector<std::string> Node::resolve_dns_seeds_once() const {
+  std::vector<std::string> out;
+  std::set<std::string> dedup;
+  for (const auto& ep : cfg_.network.default_seeds) {
+    const auto pos = ep.rfind(':');
+    if (pos == std::string::npos) continue;
+    const std::string host = ep.substr(0, pos);
+    const std::string port = ep.substr(pos + 1);
+    if (host.empty() || port.empty()) continue;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0) continue;
+    for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+      char ipbuf[INET6_ADDRSTRLEN]{};
+      if (it->ai_family == AF_INET) {
+        auto* sa = reinterpret_cast<sockaddr_in*>(it->ai_addr);
+        if (!inet_ntop(AF_INET, &sa->sin_addr, ipbuf, sizeof(ipbuf))) continue;
+      } else if (it->ai_family == AF_INET6) {
+        auto* sa = reinterpret_cast<sockaddr_in6*>(it->ai_addr);
+        if (!inet_ntop(AF_INET6, &sa->sin6_addr, ipbuf, sizeof(ipbuf))) continue;
+      } else {
+        continue;
+      }
+      dedup.insert(std::string(ipbuf) + ":" + port);
+    }
+    freeaddrinfo(res);
+  }
+  out.assign(dedup.begin(), dedup.end());
+  return out;
+}
+
+void Node::maybe_request_getaddr(int peer_id) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!getaddr_requested_peers_.insert(peer_id).second) return;
+  (void)p2p_.send_to(peer_id, p2p::MsgType::GETADDR, p2p::ser_getaddr(p2p::GetAddrMsg{}), true);
+}
+
 void Node::try_connect_bootstrap_peers() {
-  std::set<std::string> uniq(bootstrap_peers_.begin(), bootstrap_peers_.end());
+  std::set<std::string> uniq;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& p : bootstrap_peers_) uniq.insert(p);
+    for (const auto& p : dns_seed_peers_) uniq.insert(p);
+    for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) uniq.insert(a.key());
+  }
+
   for (const auto& peer : uniq) {
     const auto pos = peer.find(':');
     if (pos == std::string::npos) continue;
     const std::string host = peer.substr(0, pos);
-    const std::uint16_t port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+    std::uint16_t port = 0;
+    try {
+      port = static_cast<std::uint16_t>(std::stoi(peer.substr(pos + 1)));
+    } catch (...) {
+      continue;
+    }
     if (discipline_.is_banned(host, now_unix())) continue;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      addrman_.mark_attempt(p2p::NetAddress{host, port}, now_unix());
+    }
     if (!p2p_.connect_to(host, port)) continue;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (std::find(dns_seed_peers_.begin(), dns_seed_peers_.end(), peer) != dns_seed_peers_.end())
+        last_bootstrap_source_ = "dns";
+      else if (std::find(bootstrap_peers_.begin(), bootstrap_peers_.end(), peer) != bootstrap_peers_.end())
+        last_bootstrap_source_ = "seeds";
+      else
+        last_bootstrap_source_ = "addrman";
+      addrman_.mark_success(p2p::NetAddress{host, port}, now_unix());
+    }
     for (int pid : p2p_.peer_ids()) send_version(pid);
   }
 }
@@ -1391,6 +1563,7 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
 
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
+  cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
   cfg.network = devnet_network();
   cfg.p2p_port = cfg.network.p2p_default_port;
   cfg.max_committee = cfg.network.max_committee;
@@ -1411,6 +1584,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.devnet = true;
       cfg.testnet = false;
       cfg.mainnet = false;
+      cfg.dns_seeds = false;
       cfg.network = devnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
@@ -1418,6 +1592,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.testnet = true;
       cfg.devnet = false;
       cfg.mainnet = false;
+      cfg.dns_seeds = true;
       cfg.network = testnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
@@ -1425,6 +1600,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.mainnet = true;
       cfg.devnet = false;
       cfg.testnet = false;
+      cfg.dns_seeds = true;
       cfg.network = mainnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
@@ -1437,6 +1613,12 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       if (!v) return std::nullopt;
       cfg.p2p_port = static_cast<std::uint16_t>(std::stoi(*v));
       port_explicit = true;
+    } else if (a == "--listen") {
+      cfg.listen = true;
+    } else if (a == "--bind") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.bind_ip = *v;
     } else if (a == "--db") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1463,6 +1645,17 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       while (std::getline(ss, item, ',')) {
         if (!item.empty()) cfg.seeds.push_back(item);
       }
+    } else if (a == "--allow-unsafe-genesis-override") {
+      cfg.allow_unsafe_genesis_override = true;
+    } else if (a == "--outbound-target") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.outbound_target = static_cast<std::size_t>(std::stoull(*v));
+      if (cfg.outbound_target == 0) cfg.outbound_target = 1;
+    } else if (a == "--dns-seeds") {
+      cfg.dns_seeds = true;
+    } else if (a == "--no-dns-seeds") {
+      cfg.dns_seeds = false;
     } else if (a == "--devnet-initial-active") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1506,6 +1699,11 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;
     }
+  }
+
+  if (cfg.mainnet && !cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
+    std::cerr << "--genesis override on --mainnet requires --allow-unsafe-genesis-override\n";
+    return std::nullopt;
   }
   return cfg;
 }

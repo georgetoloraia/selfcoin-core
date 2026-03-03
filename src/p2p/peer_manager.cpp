@@ -57,6 +57,8 @@ bool PeerManager::start_listener(const std::string& bind_ip, std::uint16_t port)
 }
 
 bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
+  if (!running_) running_ = true;
+
   addrinfo hints{};
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
@@ -266,9 +268,10 @@ void PeerManager::read_loop(int peer_id) {
   ::shutdown(p->fd, SHUT_RDWR);
   ::close(p->fd);
   p->fd = -1;
+  const std::string endpoint = p->info.endpoint;
   std::lock_guard<std::mutex> lk(mu_);
   peers_.erase(peer_id);
-  emit_event(peer_id, PeerEventType::DISCONNECTED, "read-loop-end");
+  emit_event(peer_id, PeerEventType::DISCONNECTED, endpoint.empty() ? "read-loop-end" : endpoint);
 }
 
 void PeerManager::emit_event(int peer_id, PeerEventType type, const std::string& detail) const {

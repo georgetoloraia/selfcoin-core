@@ -18,6 +18,8 @@ enum MsgType : std::uint16_t {
   GET_BLOCK = 7,
   BLOCK = 8,
   TX = 9,
+  GETADDR = 10,
+  ADDR = 11,
 };
 
 struct VersionMsg {
@@ -60,6 +62,19 @@ struct TxMsg {
   Bytes tx_bytes;
 };
 
+struct GetAddrMsg {};
+
+struct AddrEntryMsg {
+  std::uint8_t ip_version{4};  // 4 or 6
+  std::array<std::uint8_t, 16> ip{};
+  std::uint16_t port{0};
+  std::uint64_t last_seen_unix{0};
+};
+
+struct AddrMsg {
+  std::vector<AddrEntryMsg> entries;
+};
+
 Bytes ser_version(const VersionMsg& m);
 std::optional<VersionMsg> de_version(const Bytes& b);
 Bytes ser_finalized_tip(const FinalizedTipMsg& m);
@@ -74,5 +89,9 @@ Bytes ser_block(const BlockMsg& m);
 std::optional<BlockMsg> de_block(const Bytes& b);
 Bytes ser_tx(const TxMsg& m);
 std::optional<TxMsg> de_tx(const Bytes& b);
+Bytes ser_getaddr(const GetAddrMsg& m);
+std::optional<GetAddrMsg> de_getaddr(const Bytes& b);
+Bytes ser_addr(const AddrMsg& m);
+std::optional<AddrMsg> de_addr(const Bytes& b);
 
 }  // namespace selfcoin::p2p

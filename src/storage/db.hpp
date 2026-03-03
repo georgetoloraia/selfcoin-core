@@ -18,6 +18,14 @@ struct TipState {
 
 class DB {
  public:
+  DB();
+  ~DB();
+
+  DB(const DB&) = delete;
+  DB& operator=(const DB&) = delete;
+  DB(DB&&) noexcept = default;
+  DB& operator=(DB&&) noexcept = default;
+
   bool open(const std::string& path);
   bool open_readonly(const std::string& path);
   bool flush();

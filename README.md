@@ -164,6 +164,12 @@ Open firewall for `19440/tcp` for mainnet operators.
 Do not point seeds/peers to lightserver (`19444`) and do not put TLS/HTTP proxies in front of P2P.
 If logs show `invalid-frame`, first verify endpoint is raw P2P (`19440`) on the same network.
 
+Mainnet publishing rules:
+- Publish seeds only as P2P endpoints: `seedX.domain:19440`.
+- Publish lightservers only as RPC endpoints: `http(s)://host:19444/rpc`.
+- Keep seed hostnames and lightserver hostnames separate.
+- Recommended: do not use Cloudflare/nginx/TLS in front of P2P (`19440`).
+
 Note: chain finalization still requires validator quorum online.
 
 ## Run Testnet

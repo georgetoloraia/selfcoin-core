@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <array>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -78,7 +79,6 @@ class PeerManager {
     int fd{-1};
     bool inbound{false};
     PeerInfo info;
-    std::thread reader;
     mutable std::mutex write_mu;
     std::atomic<std::size_t> queued_bytes{0};
     std::atomic<std::size_t> queued_msgs{0};
@@ -104,6 +104,9 @@ class PeerManager {
   std::uint16_t proto_version_{PROTOCOL_VERSION};
   std::size_t max_payload_len_{8 * 1024 * 1024};
   Limits limits_{};
+  std::atomic<std::size_t> active_readers_{0};
+  mutable std::mutex reader_wait_mu_;
+  std::condition_variable reader_wait_cv_;
 };
 
 }  // namespace selfcoin::p2p

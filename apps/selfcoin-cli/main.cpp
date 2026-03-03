@@ -17,6 +17,7 @@
 #include "common/network.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
@@ -113,6 +114,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
               << "  selfcoin-cli genesis_hash --in <genesis.bin>\n"
               << "  selfcoin-cli genesis_verify --json <genesis.json> --bin <genesis.bin>\n"
+              << "  selfcoin-cli genesis_print_embedded\n"
               << "  selfcoin-cli broadcast_tx --host <ip> --port <p> --tx-hex <hex>\n";
     return 1;
   }
@@ -244,6 +246,13 @@ int main(int argc, char** argv) {
     std::cout << "verified=1\n";
     std::cout << "genesis_hash=" << selfcoin::hex_encode32(ghash) << "\n";
     std::cout << "genesis_block_id=" << selfcoin::hex_encode32(gbid) << "\n";
+    return 0;
+  }
+
+  if (cmd == "genesis_print_embedded") {
+    std::cout << "embedded_mainnet_genesis_len=" << selfcoin::genesis::MAINNET_GENESIS_BIN_LEN << "\n";
+    std::cout << "embedded_mainnet_genesis_hash=" << selfcoin::hex_encode32(selfcoin::genesis::MAINNET_GENESIS_HASH)
+              << "\n";
     return 0;
   }
 

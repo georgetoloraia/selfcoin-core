@@ -1,19 +1,20 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <thread>
-#include <functional>
 
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
 #include "mempool/mempool.hpp"
 #include "p2p/messages.hpp"
+#include "p2p/addrman.hpp"
 #include "p2p/peer_manager.hpp"
 #include "common/network.hpp"
 #include "p2p/hardening.hpp"
@@ -27,8 +28,12 @@ struct NodeConfig {
   bool testnet{false};
   bool mainnet{false};
   NetworkConfig network{devnet_network()};
+  bool allow_unsafe_genesis_override{false};
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
+  bool listen{true};
+  bool dns_seeds{false};
+  std::size_t outbound_target{8};
   std::uint16_t p2p_port{18444};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
@@ -68,6 +73,9 @@ struct NodeStatus {
   std::size_t peers{0};
   std::size_t mempool_size{0};
   std::size_t committee_size{0};
+  std::size_t addrman_size{0};
+  std::size_t outbound_connected{0};
+  std::string last_bootstrap_source;
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
   std::uint64_t rejected_pre_handshake{0};
@@ -128,7 +136,11 @@ class Node {
   std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
   void load_persisted_peers();
   void persist_peers() const;
+  void load_addrman();
+  void persist_addrman() const;
   void try_connect_bootstrap_peers();
+  std::vector<std::string> resolve_dns_seeds_once() const;
+  void maybe_request_getaddr(int peer_id);
   std::size_t peer_count() const;
   std::string peer_ip_for(int peer_id) const;
   void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
@@ -181,7 +193,12 @@ class Node {
 
   std::atomic<bool> pause_proposals_{false};
   std::uint64_t last_seed_attempt_ms_{0};
+  std::uint64_t last_addrman_save_ms_{0};
   std::vector<std::string> bootstrap_peers_;
+  std::vector<std::string> dns_seed_peers_;
+  p2p::AddrMan addrman_{10'000};
+  std::set<int> getaddr_requested_peers_;
+  std::string last_bootstrap_source_{"none"};
   bool restart_debug_{false};
 };
 

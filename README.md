@@ -133,10 +133,17 @@ Run lightserver against node0 DB:
 ./build/selfcoin-lightserver --db /tmp/sc-node0 --bind 127.0.0.1 --port 19444 --relay-host 127.0.0.1 --relay-port 19040 --devnet --devnet-initial-active 4
 ```
 
-Run a mainnet-profile node with explicit genesis:
+Run mainnet with embedded canonical genesis (recommended):
 ```bash
-./build/selfcoin-node --mainnet --node-id 0 --db /tmp/sc-mainnet-node0 --genesis mainnet/genesis.json --port 19440
+./build/selfcoin-node --mainnet --db /tmp/sc-mainnet-node0
 ```
+
+Optional operator mode with inbound listening:
+```bash
+./build/selfcoin-node --mainnet --db /tmp/sc-mainnet-node0 --listen --bind 0.0.0.0 --port 19440
+```
+
+Note: chain finalization still requires validator quorum online.
 
 ## Run Testnet
 

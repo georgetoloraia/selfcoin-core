@@ -3,6 +3,7 @@
 Initial placeholders:
 - `212.58.103.170:19440` (temporary raw IP seed)
 - `seed1.gotdns.ch:19440` (active dynamic DNS seed)
+- `138.197.113.69:19440` (public VPS seed)
 - `seed1.mainnet.selfcoin.example:19440`
 - `seed2.mainnet.selfcoin.example:19440`
 - format to publish: `seedX.domain:19440`

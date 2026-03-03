@@ -70,6 +70,7 @@ const NetworkConfig kMainnet{
     .default_seeds = {
         "212.58.103.170:19440",
         "seed1.gotdns.ch:19440",
+        "138.197.113.69:19440",
         // "seed1.mainnet.selfcoin.example:19440",
         // "seed2.mainnet.selfcoin.example:19440",
     },

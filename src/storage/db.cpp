@@ -161,6 +161,9 @@ class DB::RocksImpl {
 };
 #endif
 
+DB::DB() = default;
+DB::~DB() = default;
+
 bool DB::open(const std::string& path) {
   path_ = expand_user_home(path);
   (void)ensure_private_dir(path_);

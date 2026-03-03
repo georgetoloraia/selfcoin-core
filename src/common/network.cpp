@@ -69,6 +69,7 @@ const NetworkConfig kMainnet{
     .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
     .default_seeds = {
         "212.58.103.170:19440",
+        "seed1.gotdns.ch:19440",
         // "seed1.mainnet.selfcoin.example:19440",
         // "seed2.mainnet.selfcoin.example:19440",
     },

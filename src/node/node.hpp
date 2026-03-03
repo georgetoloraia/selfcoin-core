@@ -52,6 +52,8 @@ struct NodeConfig {
   std::size_t peer_queue_max_bytes{2 * 1024 * 1024};
   std::size_t peer_queue_max_msgs{2'000};
   std::uint64_t ban_seconds{600};
+  int invalid_frame_ban_threshold{3};
+  std::uint64_t invalid_frame_window_seconds{60};
   std::uint64_t min_relay_fee{0};
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
@@ -154,6 +156,7 @@ class Node {
   void persist_peers() const;
   void load_addrman();
   void persist_addrman() const;
+  bool seed_preflight_ok(const std::string& host, std::uint16_t port);
   void try_connect_bootstrap_peers();
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
@@ -192,6 +195,7 @@ class Node {
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
   std::map<int, std::string> peer_ip_cache_;
+  std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};
@@ -216,6 +220,7 @@ class Node {
   std::uint64_t last_finalized_progress_ms_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> dns_seed_peers_;
+  std::set<std::string> preflight_checked_seeds_;
   p2p::AddrMan addrman_{10'000};
   ChainId chain_id_{};
   std::optional<Hash32> expected_genesis_hash_;

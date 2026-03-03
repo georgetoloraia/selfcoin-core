@@ -49,7 +49,8 @@ struct PeerScoreStatus {
 
 class PeerDiscipline {
  public:
-  PeerDiscipline(int soft_mute_score, int ban_score, std::uint64_t ban_seconds);
+  PeerDiscipline(int soft_mute_score, int ban_score, std::uint64_t ban_seconds, int invalid_frame_ban_threshold = 3,
+                 std::uint64_t invalid_frame_window_seconds = 60);
 
   PeerScoreStatus add_score(const std::string& ip, MisbehaviorReason reason, std::uint64_t now_unix);
   PeerScoreStatus status(const std::string& ip, std::uint64_t now_unix) const;
@@ -61,6 +62,7 @@ class PeerDiscipline {
     int score{0};
     std::uint64_t ban_until{0};
     std::uint64_t last_update{0};
+    std::deque<std::uint64_t> invalid_frame_strikes;
   };
 
   int reason_score(MisbehaviorReason reason) const;
@@ -68,6 +70,8 @@ class PeerDiscipline {
   int soft_mute_score_{30};
   int ban_score_{100};
   std::uint64_t ban_seconds_{600};
+  int invalid_frame_ban_threshold_{3};
+  std::uint64_t invalid_frame_window_seconds_{60};
   std::map<std::string, Entry> entries_;
 };
 

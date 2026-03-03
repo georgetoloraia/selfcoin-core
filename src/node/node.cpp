@@ -9,6 +9,7 @@
 #include <iostream>
 #include <iterator>
 #include <netdb.h>
+#include <poll.h>
 #include <cstdlib>
 #include <set>
 #include <sstream>
@@ -60,6 +61,15 @@ std::string endpoint_to_ip(std::string endpoint) {
   return endpoint.substr(0, pos);
 }
 
+std::string token_value(const std::string& s, const std::string& key) {
+  const std::string needle = key + "=";
+  const auto pos = s.find(needle);
+  if (pos == std::string::npos) return "";
+  auto end = s.find(' ', pos + needle.size());
+  if (end == std::string::npos) end = s.size();
+  return s.substr(pos + needle.size(), end - (pos + needle.size()));
+}
+
 std::mutex g_local_bus_mu;
 std::vector<Node*> g_local_bus_nodes;
 
@@ -104,7 +114,8 @@ bool Node::init() {
               << "] warning: public mode enabled (listening for inbound peers on " << cfg_.bind_ip << ":"
               << cfg_.p2p_port << ")\n";
   }
-  discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds);
+  discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds, cfg_.invalid_frame_ban_threshold,
+                                    cfg_.invalid_frame_window_seconds);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
@@ -218,6 +229,32 @@ bool Node::init() {
         return;
       }
       if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
+        const auto pi = p2p_.get_peer_info(peer_id);
+        const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
+        const std::uint64_t tms = now_ms();
+        bool should_log = false;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          auto& last = invalid_frame_log_ms_[ip];
+          if (tms > last + 10'000) {
+            should_log = true;
+            last = tms;
+          }
+        }
+        const std::string klass = token_value(detail, "class");
+        if (should_log) {
+          std::ostringstream oss;
+          oss << "frame-parse-fail peer_id=" << peer_id << " dir=" << (pi.inbound ? "inbound" : "outbound")
+              << " endpoint=" << pi.endpoint << " " << detail;
+          log_line(oss.str());
+          if (klass == "HTTP" || klass == "JSON") {
+            log_line("peer sent HTTP/JSON bytes; likely dialing lightserver port (19444) instead of P2P");
+          } else if (klass == "TLS") {
+            log_line("peer sent TLS handshake bytes; do not place TLS/proxy in front of P2P port");
+          } else if (token_value(detail, "reason") == "MAGIC_MISMATCH") {
+            log_line("magic mismatch: peer is likely on a different network (devnet/testnet/mainnet)");
+          }
+        }
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
       } else if (type == p2p::PeerManager::PeerEventType::FRAME_TIMEOUT ||
                  type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
@@ -1549,6 +1586,55 @@ void Node::maybe_request_getaddr(int peer_id) {
   (void)p2p_.send_to(peer_id, p2p::MsgType::GETADDR, p2p::ser_getaddr(p2p::GetAddrMsg{}), true);
 }
 
+bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {
+  const std::string key = host + ":" + std::to_string(port);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (preflight_checked_seeds_.find(key) != preflight_checked_seeds_.end()) return true;
+    preflight_checked_seeds_.insert(key);
+  }
+
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* res = nullptr;
+  if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res) != 0) return true;
+  int fd = -1;
+  for (addrinfo* it = res; it != nullptr; it = it->ai_next) {
+    fd = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) continue;
+    if (::connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+    ::close(fd);
+    fd = -1;
+  }
+  freeaddrinfo(res);
+  if (fd < 0) return true;
+
+  pollfd pfd{};
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  Bytes prefix;
+  if (::poll(&pfd, 1, 200) > 0 && (pfd.revents & POLLIN)) {
+    std::array<std::uint8_t, 16> tmp{};
+    const ssize_t n = ::recv(fd, tmp.data(), tmp.size(), MSG_DONTWAIT);
+    if (n > 0) prefix.assign(tmp.begin(), tmp.begin() + n);
+  }
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
+
+  if (prefix.empty()) return true;
+  const auto kind = p2p::classify_prefix(prefix);
+  if (kind == p2p::PrefixKind::HTTP || kind == p2p::PrefixKind::JSON) {
+    log_line("seed preflight warning " + key + " appears HTTP/JSON; likely lightserver port");
+    return false;
+  }
+  if (kind == p2p::PrefixKind::TLS) {
+    log_line("seed preflight warning " + key + " appears TLS; do not put TLS/proxy in front of P2P");
+    return false;
+  }
+  return true;
+}
+
 void Node::try_connect_bootstrap_peers() {
   std::set<std::string> uniq;
   {
@@ -1569,6 +1655,7 @@ void Node::try_connect_bootstrap_peers() {
       continue;
     }
     if (discipline_.is_banned(host, now_unix())) continue;
+    if (!seed_preflight_ok(host, port)) continue;
     {
       std::lock_guard<std::mutex> lk(mu_);
       addrman_.mark_attempt(p2p::NetAddress{host, port}, now_unix());
@@ -1817,6 +1904,14 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.ban_seconds = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--invalid-frame-ban-threshold") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.invalid_frame_ban_threshold = std::max(1, std::stoi(*v));
+    } else if (a == "--invalid-frame-window-seconds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.invalid_frame_window_seconds = std::max<std::uint64_t>(1, std::stoull(*v));
     } else if (a == "--min-relay-fee") {
       auto v = next(a);
       if (!v) return std::nullopt;

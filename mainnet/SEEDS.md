@@ -17,3 +17,7 @@ Operator run example:
 
 Default data dir:
 - `~/.selfcoin/mainnet`
+
+Port sanity:
+- Seeds must be P2P endpoints (`19440`), not lightserver HTTP (`19444`).
+- Do not place TLS/HTTP reverse proxies in front of the P2P port.

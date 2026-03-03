@@ -161,6 +161,8 @@ Operator mode (public seed/full node):
 
 `--public` enables inbound listening, binds to `0.0.0.0` by default, and applies inbound caps.
 Open firewall for `19440/tcp` for mainnet operators.
+Do not point seeds/peers to lightserver (`19444`) and do not put TLS/HTTP proxies in front of P2P.
+If logs show `invalid-frame`, first verify endpoint is raw P2P (`19440`) on the same network.
 
 Note: chain finalization still requires validator quorum online.
 

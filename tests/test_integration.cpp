@@ -13,6 +13,7 @@
 #include <sstream>
 #include <thread>
 #include <array>
+#include <atomic>
 
 #include "address/address.hpp"
 #include "consensus/validators.hpp"
@@ -180,6 +181,54 @@ struct Cluster {
   }
 };
 
+struct HttpStubServer {
+  int fd{-1};
+  std::uint16_t port{0};
+  std::atomic<bool> running{false};
+  std::thread th;
+
+  bool start() {
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+    if (::listen(fd, 8) != 0) return false;
+    sockaddr_in bound{};
+    socklen_t bl = sizeof(bound);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bl) != 0) return false;
+    port = ntohs(bound.sin_port);
+    running = true;
+    th = std::thread([this]() {
+      while (running) {
+        sockaddr_in caddr{};
+        socklen_t len = sizeof(caddr);
+        int cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+        if (cfd < 0) continue;
+        const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        (void)::send(cfd, kResp, sizeof(kResp) - 1, 0);
+        ::shutdown(cfd, SHUT_RDWR);
+        ::close(cfd);
+      }
+    });
+    return true;
+  }
+
+  void stop() {
+    running = false;
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+      fd = -1;
+    }
+    if (th.joinable()) th.join();
+  }
+};
+
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
                      std::size_t max_committee = MAX_COMMITTEE) {
   std::filesystem::remove_all(base);
@@ -279,6 +328,29 @@ bool send_invalid_frame(const std::string& ip, std::uint16_t port, std::uint32_t
   ::shutdown(fd, SHUT_RDWR);
   ::close(fd);
   return ok;
+}
+
+bool connect_and_check_closed(const std::string& ip, std::uint16_t port, std::chrono::milliseconds wait) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return true;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+    ::close(fd);
+    return true;
+  }
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return true;
+  }
+  std::this_thread::sleep_for(wait);
+  char c = 0;
+  const ssize_t n = ::recv(fd, &c, 1, MSG_DONTWAIT);
+  const bool closed = (n == 0) || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
+  return closed;
 }
 
 bool send_version_and_expect_disconnect(const std::string& ip, std::uint16_t port, const p2p::VersionMsg& v,
@@ -940,6 +1012,74 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   n.stop();
 }
 
+TEST(test_seed_http_port_preflight_does_not_break_node_progress) {
+  const std::string base = "/tmp/selfcoin_it_seed_http_preflight";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  HttpStubServer http;
+  if (!http.start()) return;
+
+  node::NodeConfig cfg;
+  cfg.devnet = true;
+  cfg.testnet = false;
+  cfg.node_id = 0;
+  cfg.network = devnet_network();
+  cfg.devnet_initial_active_validators = 1;
+  cfg.max_committee = 1;
+  cfg.db_path = base + "/node0";
+  cfg.bind_ip = "127.0.0.1";
+  cfg.p2p_port = 0;
+  cfg.seeds.push_back("127.0.0.1:" + std::to_string(http.port));
+
+  node::Node n(cfg);
+  if (!n.init()) {
+    http.stop();
+    return;
+  }
+  n.start();
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 3; }, std::chrono::seconds(20)));
+  ASSERT_TRUE(n.status().peers == 0);
+  n.stop();
+  http.stop();
+}
+
+TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
+  const std::string base = "/tmp/selfcoin_it_hardening_threshold";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig cfg;
+  cfg.devnet = true;
+  cfg.testnet = false;
+  cfg.node_id = 0;
+  cfg.network = devnet_network();
+  cfg.devnet_initial_active_validators = 1;
+  cfg.max_committee = 1;
+  cfg.db_path = base + "/node0";
+  cfg.bind_ip = "127.0.0.1";
+  cfg.p2p_port = 0;
+  cfg.ban_seconds = 30;
+  cfg.invalid_frame_ban_threshold = 3;
+  cfg.invalid_frame_window_seconds = 60;
+  cfg.handshake_timeout_ms = 5000;
+
+  node::Node n(cfg);
+  if (!n.init()) return;
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  ASSERT_TRUE(port != 0);
+
+  ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
+  ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
+  ASSERT_TRUE(!connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(200)));
+
+  ASSERT_TRUE(send_invalid_frame("127.0.0.1", port, cfg.network.magic));
+  ASSERT_TRUE(wait_for([&]() { return connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(150)); },
+                       std::chrono::seconds(3)));
+  n.stop();
+}
+
 TEST(test_fee_split_in_coinbase_deterministic) {
   const auto keys = node::Node::devnet_keypairs();
   ASSERT_TRUE(keys.size() >= 1u);
@@ -1011,6 +1151,38 @@ TEST(test_reject_cross_network_version_handshake) {
   v.node_software_version = "handshake-test/0.7";
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
+  n.stop();
+}
+
+TEST(test_reject_magic_mismatch_frame_before_handshake) {
+  const std::string base = "/tmp/selfcoin_it_reject_magic_mismatch";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  node::NodeConfig cfg;
+  cfg.devnet = true;
+  cfg.testnet = false;
+  cfg.network = devnet_network();
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  node::Node n(cfg);
+  if (!n.init()) return;
+  n.start();
+  const std::uint16_t port = n.p2p_port_for_test();
+  if (port == 0) {
+    n.stop();
+    return;
+  }
+
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
+  v.network_id = cfg.network.network_id;
+  v.feature_flags = cfg.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 444;
+  v.node_software_version = "magic-mismatch-test/0.7";
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, testnet_network(), std::chrono::milliseconds(300)));
   n.stop();
 }
 

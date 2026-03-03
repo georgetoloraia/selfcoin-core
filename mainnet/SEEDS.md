@@ -1,6 +1,7 @@
 # Mainnet Seeds
 
 Initial placeholders:
+- `212.58.103.170:19440` (temporary raw IP seed)
 - `seed1.mainnet.selfcoin.example:19440`
 - `seed2.mainnet.selfcoin.example:19440`
 

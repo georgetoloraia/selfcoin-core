@@ -6,14 +6,17 @@
 #include <array>
 #include <chrono>
 #include <ctime>
+#include <regex>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <optional>
 #include <random>
 #include <string>
 #include <algorithm>
 
 #include "address/address.hpp"
+#include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
@@ -99,6 +102,108 @@ std::optional<std::array<std::uint8_t, 64>> decode_hex64(const std::string& hex)
   return out;
 }
 
+std::optional<std::string> parse_http_host(const std::string& url) {
+  std::regex re(R"(^http://([^/:]+):([0-9]+)/rpc$)");
+  std::smatch m;
+  if (!std::regex_match(url, m, re)) return std::nullopt;
+  return m[1].str();
+}
+
+std::optional<std::uint16_t> parse_http_port(const std::string& url) {
+  std::regex re(R"(^http://([^/:]+):([0-9]+)/rpc$)");
+  std::smatch m;
+  if (!std::regex_match(url, m, re)) return std::nullopt;
+  return static_cast<std::uint16_t>(std::stoul(m[2].str()));
+}
+
+std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
+  auto host = parse_http_host(url);
+  auto port = parse_http_port(url);
+  if (!host || !port) {
+    if (err) *err = "url must be http://host:port/rpc";
+    return std::nullopt;
+  }
+  auto fd_opt = connect_tcp(*host, *port);
+  if (!fd_opt.has_value()) {
+    if (err) *err = "connect failed";
+    return std::nullopt;
+  }
+  const int fd = *fd_opt;
+  std::ostringstream req;
+  req << "POST /rpc HTTP/1.1\r\nHost: " << *host << ":" << *port
+      << "\r\nContent-Type: application/json\r\nContent-Length: " << body.size()
+      << "\r\nConnection: close\r\n\r\n" << body;
+  const auto req_s = req.str();
+  if (!selfcoin::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
+    ::close(fd);
+    if (err) *err = "send failed";
+    return std::nullopt;
+  }
+  std::string resp;
+  std::array<char, 4096> buf{};
+  while (true) {
+    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) break;
+    resp.append(buf.data(), static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  const auto pos = resp.find("\r\n\r\n");
+  if (pos == std::string::npos) {
+    if (err) *err = "bad http response";
+    return std::nullopt;
+  }
+  return resp.substr(pos + 4);
+}
+
+std::optional<std::string> find_json_string(const std::string& json, const std::string& key) {
+  std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return std::nullopt;
+  return m[1].str();
+}
+
+std::optional<std::uint64_t> find_json_u64(const std::string& json, const std::string& key) {
+  std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return std::nullopt;
+  return static_cast<std::uint64_t>(std::stoull(m[1].str()));
+}
+
+struct RpcStatusView {
+  selfcoin::ChainId chain;
+  std::uint64_t tip_height{0};
+  std::string tip_hash;
+};
+
+std::optional<RpcStatusView> parse_get_status_result(const std::string& body, std::string* err) {
+  if (body.find("\"error\"") != std::string::npos) {
+    if (err) *err = "rpc returned error";
+    return std::nullopt;
+  }
+  RpcStatusView out;
+  auto network_name = find_json_string(body, "network_name");
+  auto network_id = find_json_string(body, "network_id");
+  auto genesis_hash = find_json_string(body, "genesis_hash");
+  auto genesis_source = find_json_string(body, "genesis_source");
+  auto proto = find_json_u64(body, "protocol_version");
+  auto magic = find_json_u64(body, "magic");
+  auto tip_height = find_json_u64(body, "height");
+  auto tip_hash = find_json_string(body, "hash");
+  if (!network_name || !network_id || !genesis_hash || !genesis_source || !proto || !magic || !tip_height || !tip_hash) {
+    if (err) *err = "missing status fields";
+    return std::nullopt;
+  }
+  out.chain.network_name = *network_name;
+  out.chain.network_id_hex = *network_id;
+  out.chain.genesis_hash_hex = *genesis_hash;
+  out.chain.genesis_source = *genesis_source;
+  out.chain.protocol_version = static_cast<std::uint32_t>(*proto);
+  out.chain.magic = static_cast<std::uint32_t>(*magic);
+  out.tip_height = *tip_height;
+  out.tip_hash = *tip_hash;
+  return out;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -115,6 +220,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli genesis_hash --in <genesis.bin>\n"
               << "  selfcoin-cli genesis_verify --json <genesis.json> --bin <genesis.bin>\n"
               << "  selfcoin-cli genesis_print_embedded\n"
+              << "  selfcoin-cli rpc_status --url http://host:port/rpc\n"
+              << "  selfcoin-cli rpc_compare --urls http://a:19444/rpc,http://b:19444/rpc\n"
               << "  selfcoin-cli broadcast_tx --host <ip> --port <p> --tx-hex <hex>\n";
     return 1;
   }
@@ -253,6 +360,108 @@ int main(int argc, char** argv) {
     std::cout << "embedded_mainnet_genesis_len=" << selfcoin::genesis::MAINNET_GENESIS_BIN_LEN << "\n";
     std::cout << "embedded_mainnet_genesis_hash=" << selfcoin::hex_encode32(selfcoin::genesis::MAINNET_GENESIS_HASH)
               << "\n";
+    return 0;
+  }
+
+  if (cmd == "rpc_status") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "rpc_status requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = rpc_http_post(url, R"({"jsonrpc":"2.0","id":1,"method":"get_status","params":{}})", &err);
+    if (!body.has_value()) {
+      std::cerr << "rpc_status failed: " << err << "\n";
+      return 1;
+    }
+    auto status = parse_get_status_result(*body, &err);
+    if (!status.has_value()) {
+      std::cerr << "rpc_status parse failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "url=" << url << "\n";
+    std::cout << "network_name=" << status->chain.network_name << "\n";
+    std::cout << "network_id=" << status->chain.network_id_hex << "\n";
+    std::cout << "protocol_version=" << status->chain.protocol_version << "\n";
+    std::cout << "magic=" << status->chain.magic << "\n";
+    std::cout << "genesis_hash=" << status->chain.genesis_hash_hex << "\n";
+    std::cout << "genesis_source=" << status->chain.genesis_source << "\n";
+    std::cout << "tip_height=" << status->tip_height << "\n";
+    std::cout << "tip_hash=" << status->tip_hash << "\n";
+    return 0;
+  }
+
+  if (cmd == "rpc_compare") {
+    std::string urls_csv;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--urls" && i + 1 < argc) urls_csv = argv[++i];
+    }
+    if (urls_csv.empty()) {
+      std::cerr << "rpc_compare requires --urls\n";
+      return 1;
+    }
+    std::vector<std::string> urls;
+    {
+      std::stringstream ss(urls_csv);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        if (!item.empty()) urls.push_back(item);
+      }
+    }
+    if (urls.size() < 2) {
+      std::cerr << "rpc_compare requires at least 2 urls\n";
+      return 1;
+    }
+
+    std::vector<RpcStatusView> statuses;
+    statuses.reserve(urls.size());
+    bool had_error = false;
+
+    std::cout << "url\tnetwork_id\tgenesis_hash\tproto\tmagic\theight\ttip\n";
+    for (const auto& url : urls) {
+      std::string err;
+      auto body = rpc_http_post(url, R"({"jsonrpc":"2.0","id":1,"method":"get_status","params":{}})", &err);
+      if (!body.has_value()) {
+        std::cout << url << "\tERR\tERR\tERR\tERR\tERR\t" << err << "\n";
+        had_error = true;
+        continue;
+      }
+      auto st = parse_get_status_result(*body, &err);
+      if (!st.has_value()) {
+        std::cout << url << "\tERR\tERR\tERR\tERR\tERR\t" << err << "\n";
+        had_error = true;
+        continue;
+      }
+      statuses.push_back(*st);
+      std::cout << url << "\t" << st->chain.network_id_hex.substr(0, 8) << "...\t" << st->chain.genesis_hash_hex.substr(0, 8)
+                << "...\t" << st->chain.protocol_version << "\t" << st->chain.magic << "\t" << st->tip_height << "\t"
+                << st->tip_hash.substr(0, 8) << "...\n";
+    }
+
+    if (had_error || statuses.size() < 2) return 2;
+
+    bool mismatch = false;
+    const auto& ref = statuses.front().chain;
+    for (std::size_t i = 1; i < statuses.size(); ++i) {
+      const auto mm = selfcoin::compare_chain_identity(ref, statuses[i].chain);
+      if (!mm.match) {
+        mismatch = true;
+        std::cout << "MISMATCH[" << i << "]:";
+        if (mm.network_id_differs) std::cout << " network_id";
+        if (mm.genesis_hash_differs) std::cout << " genesis_hash";
+        if (mm.protocol_version_differs) std::cout << " protocol_version";
+        if (mm.magic_differs) std::cout << " magic";
+        std::cout << "\n";
+      }
+    }
+    if (mismatch) return 2;
+    std::cout << "all chain identities match\n";
     return 0;
   }
 

@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "codec/bytes.hpp"
+#include "common/paths.hpp"
 
 #ifdef SC_HAS_ROCKSDB
 #include <rocksdb/db.h>
@@ -161,37 +162,45 @@ class DB::RocksImpl {
 #endif
 
 bool DB::open(const std::string& path) {
-  path_ = path;
+  path_ = expand_user_home(path);
+  (void)ensure_private_dir(path_);
   readonly_ = false;
 #ifdef SC_HAS_ROCKSDB
+  std::error_code ec;
+  std::filesystem::create_directories(path_, ec);
   rocks_ = std::make_unique<RocksImpl>();
   rocksdb::Options options;
   options.create_if_missing = true;
   rocksdb::DB* raw = nullptr;
-  auto s = rocksdb::DB::Open(options, path, &raw);
+  auto s = rocksdb::DB::Open(options, path_, &raw);
   if (!s.ok()) return false;
   rocks_->db.reset(raw);
   return true;
 #else
-  std::filesystem::create_directories(path_);
+  std::error_code ec;
+  std::filesystem::create_directories(path_, ec);
   return load_file();
 #endif
 }
 
 bool DB::open_readonly(const std::string& path) {
-  path_ = path;
+  path_ = expand_user_home(path);
+  (void)ensure_private_dir(path_);
   readonly_ = true;
 #ifdef SC_HAS_ROCKSDB
+  std::error_code ec;
+  std::filesystem::create_directories(path_, ec);
   rocks_ = std::make_unique<RocksImpl>();
   rocksdb::Options options;
   options.create_if_missing = false;
   rocksdb::DB* raw = nullptr;
-  auto s = rocksdb::DB::OpenForReadOnly(options, path, &raw);
+  auto s = rocksdb::DB::OpenForReadOnly(options, path_, &raw);
   if (!s.ok()) return false;
   rocks_->db.reset(raw);
   return true;
 #else
-  std::filesystem::create_directories(path_);
+  std::error_code ec;
+  std::filesystem::create_directories(path_, ec);
   return load_file();
 #endif
 }

@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "storage/db.hpp"
 
@@ -55,6 +56,7 @@ class Server {
   std::atomic<bool> running_{false};
   std::thread accept_thread_;
   std::uint64_t started_at_unix_{0};
+  ChainId chain_id_{};
 };
 
 std::optional<Config> parse_args(int argc, char** argv);

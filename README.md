@@ -101,6 +101,17 @@ Requirements:
 - OpenSSL development libs
 - Optional: RocksDB development libs (auto-detected)
 
+One-command bootstrap (installs missing dependencies, then builds):
+```bash
+./scripts/bootstrap_build.sh
+```
+
+Optional overrides:
+```bash
+BUILD_DIR=build BUILD_TYPE=Release GENERATOR=Ninja ./scripts/bootstrap_build.sh
+```
+
+Manual build:
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -135,13 +146,21 @@ Run lightserver against node0 DB:
 
 Run mainnet with embedded canonical genesis (recommended):
 ```bash
-./build/selfcoin-node --mainnet --db /tmp/sc-mainnet-node0
+./build/selfcoin-node --mainnet
 ```
 
-Optional operator mode with inbound listening:
+Default data dir (when `--db` is omitted):
+- mainnet: `~/.selfcoin/mainnet`
+- testnet: `~/.selfcoin/testnet`
+- devnet: `~/.selfcoin/devnet`
+
+Operator mode (public seed/full node):
 ```bash
-./build/selfcoin-node --mainnet --db /tmp/sc-mainnet-node0 --listen --bind 0.0.0.0 --port 19440
+./build/selfcoin-node --mainnet --public
 ```
+
+`--public` enables inbound listening, binds to `0.0.0.0` by default, and applies inbound caps.
+Open firewall for `19440/tcp` for mainnet operators.
 
 Note: chain finalization still requires validator quorum online.
 

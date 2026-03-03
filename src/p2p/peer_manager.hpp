@@ -48,6 +48,7 @@ class PeerManager {
     std::uint32_t idle_timeout_ms{120'000};
     std::size_t max_outbound_queue_bytes{2 * 1024 * 1024};
     std::size_t max_outbound_queue_msgs{2'000};
+    std::size_t max_inbound{64};
   };
 
   void configure_network(std::uint32_t magic, std::uint16_t proto_version, std::size_t max_payload_len);
@@ -64,6 +65,8 @@ class PeerManager {
 
   std::vector<int> peer_ids() const;
   PeerInfo get_peer_info(int peer_id) const;
+  std::size_t inbound_count() const;
+  std::size_t outbound_count() const;
   std::uint16_t listener_port() const { return listen_port_; }
   bool mark_handshake_tx(int peer_id, bool version, bool verack);
   bool mark_handshake_rx(int peer_id, bool version, bool verack);
@@ -73,6 +76,7 @@ class PeerManager {
  private:
   struct PeerConn {
     int fd{-1};
+    bool inbound{false};
     PeerInfo info;
     std::thread reader;
     mutable std::mutex write_mu;
@@ -81,7 +85,7 @@ class PeerManager {
   };
 
   void accept_loop();
-  void start_peer(int fd, const std::string& endpoint, const std::string& ip);
+  void start_peer(int fd, const std::string& endpoint, const std::string& ip, bool inbound);
   void read_loop(int peer_id);
   void emit_event(int peer_id, PeerEventType type, const std::string& detail) const;
 

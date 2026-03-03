@@ -17,6 +17,7 @@
 #include "codec/bytes.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/monetary.hpp"
+#include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
@@ -34,6 +35,11 @@ constexpr std::uint32_t kProposalRoundWindow = 32;
 
 std::string short_pub_hex(const PubKey32& pub) {
   Bytes b(pub.begin(), pub.begin() + 4);
+  return hex_encode(b);
+}
+
+std::string short_hash_hex(const Hash32& h) {
+  Bytes b(h.begin(), h.begin() + 4);
   return hex_encode(b);
 }
 
@@ -80,6 +86,24 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 bool Node::init() {
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   if (cfg_.testnet && cfg_.min_relay_fee == 0) cfg_.min_relay_fee = 1000;
+  if (cfg_.mainnet) {
+    genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
+  } else if (cfg_.devnet) {
+    genesis_source_hint_ = "devnet";
+  } else {
+    genesis_source_hint_ = "file";
+  }
+  cfg_.db_path = expand_user_home(cfg_.db_path);
+  const std::filesystem::path dbp(cfg_.db_path);
+  const auto parent = dbp.parent_path();
+  if (!parent.empty()) (void)ensure_private_dir(parent.string());
+  (void)ensure_private_dir(cfg_.db_path);
+  std::cout << "[node " << cfg_.node_id << "] db-dir=" << cfg_.db_path << "\n";
+  if (cfg_.public_mode) {
+    std::cout << "[node " << cfg_.node_id
+              << "] warning: public mode enabled (listening for inbound peers on " << cfg_.bind_ip << ":"
+              << cfg_.p2p_port << ")\n";
+  }
   discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
@@ -92,6 +116,16 @@ bool Node::init() {
   if (!load_state()) {
     std::cerr << "load_state failed\n";
     return false;
+  }
+  chain_id_ =
+      ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
+  {
+    std::ostringstream oss;
+    oss << "chain-id network=" << chain_id_.network_name << " proto=" << chain_id_.protocol_version
+        << " network_id=" << chain_id_.network_id_hex << " magic=" << chain_id_.magic
+        << " genesis_hash=" << chain_id_.genesis_hash_hex << " genesis_source=" << chain_id_.genesis_source
+        << " chain_id_ok=" << (chain_id_.chain_id_ok ? 1 : 0) << " db_dir=" << cfg_.db_path;
+    log_line(oss.str());
   }
 
   {
@@ -137,6 +171,7 @@ bool Node::init() {
   }
 
   round_started_ms_ = now_unix() * 1000;
+  last_finalized_progress_ms_ = now_unix() * 1000;
 
   load_persisted_peers();
   load_addrman();
@@ -152,8 +187,9 @@ bool Node::init() {
 
   if (!cfg_.disable_p2p) {
     p2p_.configure_network(cfg_.network.magic, cfg_.network.protocol_version, cfg_.network.max_payload_len);
-    p2p_.configure_limits(p2p::PeerManager::Limits{cfg_.handshake_timeout_ms, cfg_.frame_timeout_ms, cfg_.idle_timeout_ms,
-                                                    cfg_.peer_queue_max_bytes, cfg_.peer_queue_max_msgs});
+    p2p_.configure_limits(
+        p2p::PeerManager::Limits{cfg_.handshake_timeout_ms, cfg_.frame_timeout_ms, cfg_.idle_timeout_ms,
+                                 cfg_.peer_queue_max_bytes, cfg_.peer_queue_max_msgs, cfg_.max_inbound});
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
     });
@@ -245,23 +281,64 @@ void Node::stop() {
 NodeStatus Node::status() const {
   std::lock_guard<std::mutex> lk(mu_);
   NodeStatus s;
+  s.network_name = cfg_.network.name;
+  s.protocol_version = cfg_.network.protocol_version;
+  s.magic = cfg_.network.magic;
+  s.genesis_hash = chain_id_.genesis_hash_hex;
+  s.genesis_source = chain_id_.genesis_source;
+  s.chain_id_ok = chain_id_.chain_id_ok;
+  s.db_dir = cfg_.db_path;
+  s.network_id_short = hex_encode(Bytes(cfg_.network.network_id.begin(), cfg_.network.network_id.begin() + 4));
   s.height = finalized_height_;
   s.round = current_round_;
   s.tip_hash = finalized_hash_;
+  s.tip_hash_short = short_hash_hex(finalized_hash_);
   const auto active = validators_.active_sorted(finalized_height_ + 1);
   auto leader = consensus::select_leader(finalized_hash_, finalized_height_ + 1, current_round_, active);
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
   s.peers = peer_count();
   s.mempool_size = mempool_.size();
-  s.committee_size = committee_for_height(finalized_height_ + 1).size();
+  const auto committee = committee_for_height(finalized_height_ + 1);
+  s.committee_size = committee.size();
+  s.quorum_threshold = consensus::quorum_threshold(committee.size());
   s.addrman_size = addrman_.size();
-  s.outbound_connected = peer_count();
+  s.inbound_connected = cfg_.disable_p2p ? 0 : p2p_.inbound_count();
+  s.outbound_connected = cfg_.disable_p2p ? peer_count() : p2p_.outbound_count();
+  s.consensus_state = consensus_state_locked(now_unix() * 1000, &s.observed_signers, &s.quorum_threshold);
   s.last_bootstrap_source = last_bootstrap_source_;
   s.rejected_network_id = rejected_network_id_;
   s.rejected_protocol_version = rejected_protocol_version_;
   s.rejected_pre_handshake = rejected_pre_handshake_;
   return s;
+}
+
+std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers,
+                                         std::size_t* quorum_threshold) const {
+  const std::uint64_t h = finalized_height_ + 1;
+  const auto committee = committee_for_height(h);
+  const std::size_t quorum = consensus::quorum_threshold(committee.size());
+  if (quorum_threshold) *quorum_threshold = quorum;
+
+  std::size_t observed = 0;
+  if (!committee.empty()) {
+    const auto participants = votes_.participants_for(h, current_round_);
+    for (const auto& pub : committee) {
+      if (participants.find(pub) != participants.end()) ++observed;
+    }
+    if (is_committee_member_for(local_key_.public_key, h, current_round_)) observed = std::max<std::size_t>(observed, 1);
+  }
+  if (observed_signers) *observed_signers = observed;
+
+  const std::size_t peers = peer_count();
+  if (peers == 0 || (finalized_height_ == 0 && observed == 0)) return "SYNCING";
+
+  const std::uint64_t stale_ms = cfg_.network.round_timeout_ms * 2ULL;
+  if (now_ms > last_finalized_progress_ms_ + stale_ms) {
+    if (observed < quorum) return "WAITING_FOR_QUORUM";
+    return "SYNCING";
+  }
+  return "FINALIZING";
 }
 
 bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0); }
@@ -377,13 +454,47 @@ void Node::event_loop() {
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
             << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
             << ",\"committee_size\":" << committee.size() << ",\"addrman_size\":" << addrman_.size()
-            << ",\"outbound_connected\":" << peer_count()
+            << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\""
+            << ",\"genesis_source\":\"" << chain_id_.genesis_source << "\""
+            << ",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false")
+            << ",\"outbound_connected\":" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count())
+            << ",\"inbound_connected\":" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
             << ",\"last_bootstrap_source\":\"" << last_bootstrap_source_ << "\""
             << ",\"rejected_network_id\":" << rejected_network_id_
             << ",\"rejected_protocol_version\":" << rejected_protocol_version_
             << ",\"rejected_pre_handshake\":" << rejected_pre_handshake_ << "}";
           std::cout << j.str() << "\n";
         }
+      }
+
+      if (now_ms > last_summary_log_ms_ + 30'000) {
+        std::size_t observed = 0;
+        std::size_t q = quorum;
+        const auto state = consensus_state_locked(now_ms, &observed, &q);
+        if (cfg_.log_json) {
+          std::ostringstream j;
+          j << "{\"type\":\"summary\",\"network\":\"" << cfg_.network.name << "\",\"protocol_version\":"
+            << cfg_.network.protocol_version << ",\"network_id\":\""
+            << hex_encode(Bytes(cfg_.network.network_id.begin(), cfg_.network.network_id.begin() + 4)) << "\",\"magic\":"
+            << cfg_.network.magic << ",\"db_dir\":\"" << cfg_.db_path << "\",\"height\":" << finalized_height_
+            << ",\"tip\":\"" << short_hash_hex(finalized_hash_) << "\",\"genesis_hash\":\""
+            << chain_id_.genesis_hash_hex << "\",\"genesis_source\":\"" << chain_id_.genesis_source
+            << "\",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false") << ",\"peers\":" << peer_count()
+            << ",\"outbound_connected\":" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count())
+            << ",\"inbound_connected\":" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
+            << ",\"outbound_target\":" << cfg_.outbound_target << ",\"addrman_size\":" << addrman_.size()
+            << ",\"bootstrap_source_last\":\"" << last_bootstrap_source_ << "\",\"committee_size\":" << committee.size()
+            << ",\"quorum_threshold\":" << q << ",\"observed_signers\":" << observed
+            << ",\"consensus_state\":\"" << state << "\"}";
+          std::cout << j.str() << "\n";
+        } else {
+          std::cout << cfg_.network.name << " h=" << finalized_height_ << " tip=" << short_hash_hex(finalized_hash_)
+                    << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8)
+                    << " peers=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
+                    << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
+                    << " addrman=" << addrman_.size() << " state=" << state << "\n";
+        }
+        last_summary_log_ms_ = now_ms;
       }
 
       if (!pause_proposals_.load() && leader.has_value() && *leader == local_key_.public_key) {
@@ -596,6 +707,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             mempool_.prune_against_utxo(utxos_);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
+            last_finalized_progress_ms_ = now_unix() * 1000;
             current_round_ = 0;
             round_started_ms_ = now_unix() * 1000;
             if (restart_debug_) {
@@ -882,6 +994,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
+  last_finalized_progress_ms_ = now_unix() * 1000;
   current_round_ = 0;
   round_started_ms_ = now_unix() * 1000;
   if (restart_debug_) {
@@ -1126,6 +1239,7 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "embedded genesis hash mismatch; binary may be corrupted\n";
     return false;
   }
+  expected_genesis_hash_ = ghash;
 
   const Bytes ghash_b(ghash.begin(), ghash.end());
   const Hash32 gblock = genesis::block_id(*doc);
@@ -1567,8 +1681,11 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
   cfg.network = devnet_network();
   cfg.p2p_port = cfg.network.p2p_default_port;
   cfg.max_committee = cfg.network.max_committee;
+  cfg.db_path = default_db_dir_for_network(cfg.network.name);
   bool port_explicit = false;
   bool committee_explicit = false;
+  bool bind_explicit = false;
+  bool db_explicit = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1619,10 +1736,12 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.bind_ip = *v;
+      bind_explicit = true;
     } else if (a == "--db") {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.db_path = *v;
+      db_explicit = true;
     } else if (a == "--genesis") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1656,6 +1775,9 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.dns_seeds = true;
     } else if (a == "--no-dns-seeds") {
       cfg.dns_seeds = false;
+    } else if (a == "--public") {
+      cfg.public_mode = true;
+      cfg.listen = true;
     } else if (a == "--devnet-initial-active") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1687,6 +1809,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.peer_queue_max_msgs = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--max-inbound") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.max_inbound = static_cast<std::size_t>(std::stoull(*v));
     } else if (a == "--ban-seconds") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1705,6 +1831,8 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     std::cerr << "--genesis override on --mainnet requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
   }
+  if (!db_explicit) cfg.db_path = default_db_dir_for_network(cfg.network.name);
+  if (cfg.public_mode && !bind_explicit) cfg.bind_ip = "0.0.0.0";
   return cfg;
 }
 

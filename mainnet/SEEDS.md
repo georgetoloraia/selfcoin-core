@@ -9,3 +9,11 @@ Operator expectations:
 - at least 2 independent organizations
 - static DNS + health monitoring
 - public uptime targets and incident contact
+
+Operator run example:
+```bash
+./build/selfcoin-node --mainnet --public
+```
+
+Default data dir:
+- `~/.selfcoin/mainnet`

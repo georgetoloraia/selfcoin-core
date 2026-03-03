@@ -76,7 +76,7 @@ bool PeerManager::connect_to(const std::string& host, std::uint16_t port) {
   freeaddrinfo(res);
   if (fd < 0) return false;
 
-  start_peer(fd, host + ":" + std::to_string(port), host);
+  start_peer(fd, host + ":" + std::to_string(port), host, false);
   return true;
 }
 
@@ -178,6 +178,24 @@ PeerInfo PeerManager::get_peer_info(int peer_id) const {
   return it->second->info;
 }
 
+std::size_t PeerManager::inbound_count() const {
+  std::size_t n = 0;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& [_, p] : peers_) {
+    if (p->inbound) ++n;
+  }
+  return n;
+}
+
+std::size_t PeerManager::outbound_count() const {
+  std::size_t n = 0;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& [_, p] : peers_) {
+    if (!p->inbound) ++n;
+  }
+  return n;
+}
+
 bool PeerManager::mark_handshake_tx(int peer_id, bool version, bool verack) {
   std::lock_guard<std::mutex> lk(mu_);
   auto it = peers_.find(peer_id);
@@ -218,13 +236,28 @@ void PeerManager::accept_loop() {
     }
     char ipbuf[64]{};
     inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf));
-    start_peer(fd, std::string(ipbuf) + ":" + std::to_string(ntohs(addr.sin_port)), ipbuf);
+    bool allowed = true;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      std::size_t inbound = 0;
+      for (const auto& [_, p] : peers_) {
+        if (p->inbound) ++inbound;
+      }
+      if (inbound >= limits_.max_inbound) allowed = false;
+    }
+    if (!allowed) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+      continue;
+    }
+    start_peer(fd, std::string(ipbuf) + ":" + std::to_string(ntohs(addr.sin_port)), ipbuf, true);
   }
 }
 
-void PeerManager::start_peer(int fd, const std::string& endpoint, const std::string& ip) {
+void PeerManager::start_peer(int fd, const std::string& endpoint, const std::string& ip, bool inbound) {
   auto p = std::make_shared<PeerConn>();
   p->fd = fd;
+  p->inbound = inbound;
   {
     std::lock_guard<std::mutex> lk(mu_);
     p->info.id = next_peer_id_++;

@@ -36,6 +36,56 @@ TEST(test_addrman_save_load_roundtrip) {
   std::filesystem::remove(path);
 }
 
+TEST(test_addrman_mainnet_port_filter_rejects_non_19440) {
+  p2p::AddrMan am(10);
+  p2p::AddrPolicy policy;
+  policy.required_port = 19440;
+  am.set_policy(policy);
+
+  am.add_or_update({"104.28.157.140", 58855}, 100);
+  am.mark_success({"104.28.157.140", 60226}, 101);
+  am.mark_attempt({"104.28.157.140", 60226}, 102);
+
+  ASSERT_EQ(am.size(), 0u);
+}
+
+TEST(test_addrman_mainnet_port_filter_accepts_19440) {
+  p2p::AddrMan am(10);
+  p2p::AddrPolicy policy;
+  policy.required_port = 19440;
+  am.set_policy(policy);
+
+  am.add_or_update({"138.197.113.69", 19440}, 100);
+  am.mark_success({"138.197.113.69", 19440}, 110);
+
+  ASSERT_EQ(am.size(), 1u);
+  auto picks = am.select_candidates(10, 200);
+  ASSERT_EQ(picks.size(), 1u);
+  ASSERT_EQ(picks[0].port, 19440);
+}
+
+TEST(test_addrman_policy_filters_loaded_entries) {
+  const std::string path = "/tmp/selfcoin-addrman-filter.dat";
+  {
+    p2p::AddrMan am(10);
+    am.add_or_update({"104.28.157.140", 58855}, 100);
+    am.add_or_update({"138.197.113.69", 19440}, 101);
+    ASSERT_TRUE(am.save(path));
+  }
+
+  p2p::AddrMan loaded(10);
+  p2p::AddrPolicy policy;
+  policy.required_port = 19440;
+  loaded.set_policy(policy);
+  ASSERT_TRUE(loaded.load(path));
+  ASSERT_EQ(loaded.size(), 1u);
+  auto picks = loaded.select_candidates(10, 200);
+  ASSERT_EQ(picks.size(), 1u);
+  ASSERT_EQ(picks[0].port, 19440);
+
+  std::filesystem::remove(path);
+}
+
 TEST(test_addr_message_roundtrip_ipv4_ipv6) {
   p2p::AddrMsg m;
   p2p::AddrEntryMsg a4;

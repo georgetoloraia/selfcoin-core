@@ -45,6 +45,10 @@ TEST(test_node_default_db_path_uses_home_by_network) {
 
   for (const auto& c : cases) {
     std::vector<std::string> args = {"selfcoin-node", c.net_flag, "--node-id", "0", "--disable-p2p"};
+    if (c.net_name == "mainnet") {
+      args.push_back("--validator-passphrase");
+      args.push_back("test-passphrase");
+    }
     auto argv = make_argv(args);
     auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
     ASSERT_TRUE(cfg.has_value());
@@ -60,4 +64,3 @@ TEST(test_node_default_db_path_uses_home_by_network) {
 }
 
 void register_paths_tests() {}
-

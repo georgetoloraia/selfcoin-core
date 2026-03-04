@@ -23,6 +23,7 @@
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
+#include "keystore/validator_keystore.hpp"
 #include "merkle/merkle.hpp"
 
 namespace selfcoin::node {
@@ -162,13 +163,42 @@ bool Node::init() {
   }
 
   {
-    const auto keys = devnet_keypairs();
-    if (keys.empty()) {
-      std::cerr << "no key material available\n";
-      return false;
+    bool key_loaded = false;
+    if (cfg_.mainnet || !cfg_.validator_key_file.empty()) {
+      const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
+                                                        ? keystore::default_validator_keystore_path(cfg_.db_path)
+                                                        : cfg_.validator_key_file);
+      keystore::ValidatorKey vk;
+      std::string kerr;
+      if (keystore::keystore_exists(key_path)) {
+        if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
+          std::cerr << "failed to load validator keystore: " << kerr << "\n";
+          return false;
+        }
+      } else {
+        if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
+                                                 keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
+                                                 &kerr)) {
+          std::cerr << "failed to create validator keystore: " << kerr << "\n";
+          return false;
+        }
+        log_line("created validator keystore path=" + key_path);
+      }
+      local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
+      local_key_.public_key = vk.pubkey;
+      log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
+      key_loaded = true;
     }
-    const int safe_node_id = std::max(0, cfg_.node_id);
-    local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
+
+    const auto keys = devnet_keypairs();
+    if (!key_loaded) {
+      if (keys.empty()) {
+        std::cerr << "no key material available\n";
+        return false;
+      }
+      const int safe_node_id = std::max(0, cfg_.node_id);
+      local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
+    }
 
     if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet)) {
       const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
@@ -1804,6 +1834,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
   bool committee_explicit = false;
   bool bind_explicit = false;
   bool db_explicit = false;
+  std::string validator_passphrase_env;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -1860,6 +1891,18 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       if (!v) return std::nullopt;
       cfg.db_path = *v;
       db_explicit = true;
+    } else if (a == "--validator-key-file") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_key_file = *v;
+    } else if (a == "--validator-passphrase") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_passphrase = *v;
+    } else if (a == "--validator-passphrase-env") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      validator_passphrase_env = *v;
     } else if (a == "--genesis") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1956,6 +1999,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
   if (cfg.mainnet && !cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
     std::cerr << "--genesis override on --mainnet requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
+  }
+  if (cfg.validator_passphrase.empty() && !validator_passphrase_env.empty()) {
+    const char* pv = std::getenv(validator_passphrase_env.c_str());
+    if (pv) cfg.validator_passphrase = pv;
   }
   if (!db_explicit) cfg.db_path = default_db_dir_for_network(cfg.network.name);
   if (cfg.public_mode && !bind_explicit) cfg.bind_ip = "0.0.0.0";

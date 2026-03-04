@@ -20,6 +20,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
+#include "keystore/validator_keystore.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
@@ -119,6 +120,13 @@ crypto::KeyPair key_from_byte(std::uint8_t b) {
   auto kp = crypto::keypair_from_seed32(seed);
   if (!kp.has_value()) throw std::runtime_error("key generation failed");
   return *kp;
+}
+
+std::array<std::uint8_t, 32> devnet_seed_for_node_id(int node_id) {
+  std::array<std::uint8_t, 32> seed{};
+  const int i = node_id + 1;
+  for (std::size_t j = 0; j < seed.size(); ++j) seed[j] = static_cast<std::uint8_t>(i * 19 + static_cast<int>(j));
+  return seed;
 }
 
 std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
@@ -1237,8 +1245,15 @@ TEST(test_mainnet_bootstrap_with_genesis) {
     cfg.disable_p2p = true;
     cfg.node_id = i;
     cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.p2p_port = 0;
     cfg.genesis_path = gpath;
     cfg.max_committee = 4;
+    cfg.validator_passphrase = "test-passphrase";
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    keystore::ValidatorKey vk;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    devnet_seed_for_node_id(i), &vk, &kerr));
     auto n = std::make_unique<node::Node>(cfg);
     ASSERT_TRUE(n->init());
     c.nodes.push_back(std::move(n));
@@ -1271,6 +1286,7 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   cfg.genesis_path = gpath;
+  cfg.validator_passphrase = "test-passphrase";
   node::Node n(cfg);
   if (!n.init()) return;
   n.start();

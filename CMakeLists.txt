@@ -34,6 +34,7 @@ add_library(selfcoin_core
   src/codec/varint.cpp
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
+  src/keystore/validator_keystore.cpp
   src/genesis/genesis.cpp
   src/genesis/embedded_mainnet.cpp
   src/merkle/merkle.cpp
@@ -112,6 +113,7 @@ add_executable(selfcoin-tests
   tests/test_hardening.cpp
   tests/test_genesis.cpp
   tests/test_paths.cpp
+  tests/test_keystore.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp
 )

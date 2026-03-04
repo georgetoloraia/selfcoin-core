@@ -30,6 +30,8 @@ struct NodeConfig {
   bool mainnet{false};
   NetworkConfig network{devnet_network()};
   bool allow_unsafe_genesis_override{false};
+  std::string validator_key_file;
+  std::string validator_passphrase;
   int node_id{0};
   std::string bind_ip{"127.0.0.1"};
   bool listen{true};

@@ -25,6 +25,12 @@ cmake --build build -j
 ./build/selfcoin-node --mainnet
 ```
 
+optional encrypted keystore:
+```bash
+export SELFCOIN_VALIDATOR_PASS="change-me"
+./build/selfcoin-node --mainnet --validator-passphrase-env SELFCOIN_VALIDATOR_PASS
+```
+
 Public node (operator mode):
 ```bash
 ./build/selfcoin-node --mainnet --public
@@ -74,4 +80,25 @@ npm run example:node-demo
 Read SDK docs:
 ```text
 sdk/selfcoin-wallet-js/README.md
+```
+
+## Keystore CLI
+Create encrypted wallet/validator keystore:
+```bash
+./build/selfcoin-cli wallet_create --out ~/.selfcoin/mainnet/keystore/validator.json --pass "change-me" --network mainnet
+```
+
+Create wallet/validator keystore without passphrase:
+```bash
+./build/selfcoin-cli wallet_create --out ~/.selfcoin/mainnet/keystore/validator.json --network mainnet
+```
+
+Show address:
+```bash
+./build/selfcoin-cli wallet_address --file ~/.selfcoin/mainnet/keystore/validator.json --pass "change-me"
+```
+
+Export keys (for backup/import):
+```bash
+./build/selfcoin-cli wallet_export --file ~/.selfcoin/mainnet/keystore/validator.json --pass "change-me"
 ```

@@ -28,9 +28,27 @@ struct AddrEntry {
   int score{0};
 };
 
+struct AddrPolicy {
+  std::optional<std::uint16_t> required_port;
+  bool reject_unroutable{false};
+};
+
+enum class AddrRejectReason : std::uint8_t {
+  NONE = 0,
+  EMPTY_IP,
+  ZERO_PORT,
+  PORT_MISMATCH,
+  UNROUTABLE_IP,
+};
+
 class AddrMan {
  public:
   explicit AddrMan(std::size_t max_entries = 10'000) : max_entries_(max_entries) {}
+
+  void set_policy(AddrPolicy policy);
+  const AddrPolicy& policy() const { return policy_; }
+  AddrRejectReason validate(const NetAddress& addr) const;
+  bool accepts(const NetAddress& addr) const { return validate(addr) == AddrRejectReason::NONE; }
 
   void add_or_update(const NetAddress& addr, std::uint64_t last_seen);
   void mark_attempt(const NetAddress& addr, std::uint64_t now);
@@ -46,10 +64,12 @@ class AddrMan {
   std::vector<AddrEntry> all() const;
 
  private:
+  void prune_invalid_locked();
   void enforce_limit();
   static std::uint64_t backoff_seconds(const AddrEntry& e);
 
   std::size_t max_entries_{10'000};
+  AddrPolicy policy_{};
   std::map<std::string, AddrEntry> entries_;
 };
 

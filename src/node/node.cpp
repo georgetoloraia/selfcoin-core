@@ -116,6 +116,12 @@ bool Node::init() {
   }
   discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds, cfg_.invalid_frame_ban_threshold,
                                     cfg_.invalid_frame_window_seconds);
+  p2p::AddrPolicy addr_policy;
+  if (cfg_.mainnet) {
+    addr_policy.required_port = cfg_.network.p2p_default_port;
+    addr_policy.reject_unroutable = true;
+  }
+  addrman_.set_policy(addr_policy);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
@@ -206,11 +212,9 @@ bool Node::init() {
     });
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
       if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
-        auto na = p2p::parse_endpoint(detail);
         {
           std::lock_guard<std::mutex> lk(mu_);
           peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
-          if (na.has_value()) addrman_.add_or_update(*na, now_unix());
         }
         if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
           p2p_.disconnect_peer(peer_id);
@@ -224,8 +228,6 @@ bool Node::init() {
         msg_rate_buckets_.erase(peer_id);
         vote_verify_buckets_.erase(peer_id);
         tx_verify_buckets_.erase(peer_id);
-        auto na = p2p::parse_endpoint(detail);
-        if (na.has_value()) addrman_.mark_fail(*na, now_unix(), "disconnect");
         return;
       }
       if (type == p2p::PeerManager::PeerEventType::FRAME_INVALID) {
@@ -646,7 +648,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     p2p_.mark_handshake_rx(peer_id, false, true);
     maybe_request_getaddr(peer_id);
     auto pi = p2p_.get_peer_info(peer_id);
-    auto na = p2p::parse_endpoint(pi.endpoint);
+    auto na = addrman_address_for_peer(pi);
     if (na.has_value()) {
       std::lock_guard<std::mutex> lk(mu_);
       addrman_.mark_success(*na, now_unix());
@@ -656,6 +658,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
+    if (msg_type == p2p::MsgType::ADDR || msg_type == p2p::MsgType::GETADDR) {
+      log_line("drop-addr peer_id=" + std::to_string(peer_id) + " reason=pre-handshake");
+    }
     {
       std::lock_guard<std::mutex> lk(mu_);
       ++rejected_pre_handshake_;
@@ -845,7 +850,23 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           s = inet_ntop(AF_INET6, e.ip.data(), ipbuf, sizeof(ipbuf));
         }
         if (!s || e.port == 0) continue;
-        addrman_.add_or_update(p2p::NetAddress{std::string(ipbuf), e.port}, e.last_seen_unix);
+        const p2p::NetAddress na{std::string(ipbuf), e.port};
+        const auto reject = addrman_.validate(na);
+        if (reject != p2p::AddrRejectReason::NONE) {
+          const std::string reason = (reject == p2p::AddrRejectReason::PORT_MISMATCH)   ? "port"
+                                     : (reject == p2p::AddrRejectReason::UNROUTABLE_IP) ? "unroutable"
+                                                                                         : "invalid";
+          const std::string log_key = reason + ":" + na.ip;
+          auto& last = addr_drop_log_ms_[log_key];
+          const std::uint64_t now = now_ms();
+          if (now > last + 10'000) {
+            last = now;
+            log_line("drop-addr peer_id=" + std::to_string(peer_id) + " ip=" + na.ip + ":" + std::to_string(na.port) +
+                     " reason=" + reason);
+          }
+          continue;
+        }
+        addrman_.add_or_update(na, e.last_seen_unix);
       }
       break;
     }
@@ -1683,6 +1704,16 @@ std::string Node::peer_ip_for(int peer_id) const {
   const auto pi = p2p_.get_peer_info(peer_id);
   if (!pi.ip.empty()) return pi.ip;
   return endpoint_to_ip(pi.endpoint);
+}
+
+std::optional<p2p::NetAddress> Node::addrman_address_for_peer(const p2p::PeerInfo& info) const {
+  if (info.ip.empty()) return std::nullopt;
+  if (cfg_.mainnet) return p2p::NetAddress{info.ip, cfg_.network.p2p_default_port};
+  if (!info.inbound) {
+    auto parsed = p2p::parse_endpoint(info.endpoint);
+    if (parsed.has_value()) return *parsed;
+  }
+  return p2p::NetAddress{info.ip, cfg_.network.p2p_default_port};
 }
 
 void Node::score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note) {

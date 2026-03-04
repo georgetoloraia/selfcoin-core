@@ -1,11 +1,43 @@
 #include "p2p/addrman.hpp"
 
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 
 namespace selfcoin::p2p {
+namespace {
+
+bool is_unroutable_ip(const std::string& ip) {
+  in_addr v4{};
+  if (inet_pton(AF_INET, ip.c_str(), &v4) == 1) {
+    const std::uint32_t host = ntohl(v4.s_addr);
+    const std::uint8_t a = static_cast<std::uint8_t>((host >> 24) & 0xFF);
+    const std::uint8_t b = static_cast<std::uint8_t>((host >> 16) & 0xFF);
+    if (a == 0 || a == 10 || a == 127) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a >= 224) return true;  // multicast/reserved/broadcast.
+    return false;
+  }
+
+  in6_addr v6{};
+  if (inet_pton(AF_INET6, ip.c_str(), &v6) == 1) {
+    if (IN6_IS_ADDR_UNSPECIFIED(&v6) || IN6_IS_ADDR_LOOPBACK(&v6) || IN6_IS_ADDR_MULTICAST(&v6)) return true;
+    const std::uint8_t first = v6.s6_addr[0];
+    const std::uint8_t second = v6.s6_addr[1];
+    if ((first & 0xFE) == 0xFC) return true;  // fc00::/7
+    if (first == 0xFE && (second & 0xC0) == 0x80) return true;  // fe80::/10
+    return false;
+  }
+
+  return true;
+}
+
+}  // namespace
 
 std::string NetAddress::key() const { return ip + ":" + std::to_string(port); }
 
@@ -23,8 +55,22 @@ std::optional<NetAddress> parse_endpoint(const std::string& endpoint) {
   }
 }
 
+void AddrMan::set_policy(AddrPolicy policy) {
+  policy_ = std::move(policy);
+  prune_invalid_locked();
+  enforce_limit();
+}
+
+AddrRejectReason AddrMan::validate(const NetAddress& addr) const {
+  if (addr.ip.empty()) return AddrRejectReason::EMPTY_IP;
+  if (addr.port == 0) return AddrRejectReason::ZERO_PORT;
+  if (policy_.required_port.has_value() && addr.port != *policy_.required_port) return AddrRejectReason::PORT_MISMATCH;
+  if (policy_.reject_unroutable && is_unroutable_ip(addr.ip)) return AddrRejectReason::UNROUTABLE_IP;
+  return AddrRejectReason::NONE;
+}
+
 void AddrMan::add_or_update(const NetAddress& addr, std::uint64_t last_seen) {
-  if (addr.ip.empty() || addr.port == 0) return;
+  if (!accepts(addr)) return;
   auto& e = entries_[addr.key()];
   if (e.addr.ip.empty()) e.addr = addr;
   e.last_seen = std::max(e.last_seen, last_seen);
@@ -32,12 +78,14 @@ void AddrMan::add_or_update(const NetAddress& addr, std::uint64_t last_seen) {
 }
 
 void AddrMan::mark_attempt(const NetAddress& addr, std::uint64_t now) {
+  if (!accepts(addr)) return;
   auto& e = entries_[addr.key()];
   e.addr = addr;
   e.last_attempt = now;
 }
 
 void AddrMan::mark_success(const NetAddress& addr, std::uint64_t now) {
+  if (!accepts(addr)) return;
   auto& e = entries_[addr.key()];
   e.addr = addr;
   e.last_seen = std::max(e.last_seen, now);
@@ -48,6 +96,7 @@ void AddrMan::mark_success(const NetAddress& addr, std::uint64_t now) {
 }
 
 void AddrMan::mark_fail(const NetAddress& addr, std::uint64_t now, const std::string& err) {
+  if (!accepts(addr)) return;
   auto& e = entries_[addr.key()];
   e.addr = addr;
   e.last_attempt = now;
@@ -66,7 +115,7 @@ std::vector<NetAddress> AddrMan::select_candidates(std::size_t n, std::uint64_t 
   std::vector<const AddrEntry*> all;
   all.reserve(entries_.size());
   for (const auto& [_, e] : entries_) {
-    if (e.addr.port == 0 || e.addr.ip.empty()) continue;
+    if (!accepts(e.addr)) continue;
     const auto bo = backoff_seconds(e);
     if (e.last_attempt > 0 && now < e.last_attempt + bo) continue;
     all.push_back(&e);
@@ -82,6 +131,16 @@ std::vector<NetAddress> AddrMan::select_candidates(std::size_t n, std::uint64_t 
   out.reserve(std::min(n, all.size()));
   for (std::size_t i = 0; i < all.size() && out.size() < n; ++i) out.push_back(all[i]->addr);
   return out;
+}
+
+void AddrMan::prune_invalid_locked() {
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (accepts(it->second.addr)) {
+      ++it;
+    } else {
+      it = entries_.erase(it);
+    }
+  }
 }
 
 void AddrMan::enforce_limit() {
@@ -139,9 +198,10 @@ bool AddrMan::load(const std::string& path) {
     } catch (...) {
       continue;
     }
-    if (e.addr.ip.empty() || e.addr.port == 0) continue;
+    if (!accepts(e.addr)) continue;
     entries_[e.addr.key()] = std::move(e);
   }
+  prune_invalid_locked();
   enforce_limit();
   return true;
 }

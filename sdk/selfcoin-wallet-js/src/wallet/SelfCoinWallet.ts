@@ -1,5 +1,3 @@
-import { randomBytes } from 'node:crypto';
-
 import { decodeAddress, deriveAddressFromPubkey } from '../address/index.js';
 import { keypairFromPrivkeyHex, keypairFromSeed32 } from '../crypto/ed25519.js';
 import { bytesToHex, hexToBytes } from '../crypto/hash.js';
@@ -19,7 +17,12 @@ export class SelfCoinWallet {
   constructor(public readonly client: LightServerClient) {}
 
   static generateKeypair(): Keypair {
-    const seed = new Uint8Array(randomBytes(32));
+    const cryptoApi = globalThis.crypto;
+    if (!cryptoApi || typeof cryptoApi.getRandomValues !== 'function') {
+      throw new Error('secure random source unavailable (crypto.getRandomValues required)');
+    }
+    const seed = new Uint8Array(32);
+    cryptoApi.getRandomValues(seed);
     return keypairFromSeed32(seed);
   }
 

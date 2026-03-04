@@ -162,6 +162,7 @@ class Node {
   void maybe_request_getaddr(int peer_id);
   std::size_t peer_count() const;
   std::string peer_ip_for(int peer_id) const;
+  std::optional<p2p::NetAddress> addrman_address_for_peer(const p2p::PeerInfo& info) const;
   void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
   bool should_mute_peer(int peer_id) const;
   void prune_caches_locked(std::uint64_t height, std::uint32_t round);
@@ -196,6 +197,7 @@ class Node {
   std::map<Hash32, std::size_t> candidate_block_sizes_;
   std::map<int, std::string> peer_ip_cache_;
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
+  std::map<std::string, std::uint64_t> addr_drop_log_ms_;
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};

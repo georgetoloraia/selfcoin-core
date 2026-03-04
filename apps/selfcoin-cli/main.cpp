@@ -22,6 +22,7 @@
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
+#include "keystore/validator_keystore.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "storage/db.hpp"
@@ -211,6 +212,10 @@ int main(int argc, char** argv) {
     std::cerr << "usage:\n"
               << "  selfcoin-cli tip --db <dir>\n"
               << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp tsc]\n"
+              << "  selfcoin-cli wallet_create --out <path> [--pass <pass>] [--network <mainnet|testnet|devnet>] [--seed-hex <32b-hex>]\n"
+              << "  selfcoin-cli wallet_address --file <path> [--pass <pass>]\n"
+              << "  selfcoin-cli wallet_export --file <path> [--pass <pass>]\n"
+              << "  selfcoin-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network <mainnet|testnet|devnet>]\n"
               << "  selfcoin-cli address_from_pubkey --hrp <sc|tsc> --pubkey <hex32>\n"
               << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
@@ -498,6 +503,125 @@ int main(int argc, char** argv) {
     std::cout << "privkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(seed.begin(), seed.end())) << "\n";
     std::cout << "pubkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end())) << "\n";
     if (addr.has_value()) std::cout << "address=" << *addr << "\n";
+    return 0;
+  }
+
+  if (cmd == "wallet_create") {
+    std::string out_path;
+    std::string passphrase;
+    std::string network_name = "mainnet";
+    std::string seed_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--network" && i + 1 < argc) network_name = argv[++i];
+      else if (a == "--seed-hex" && i + 1 < argc) seed_hex = argv[++i];
+    }
+    if (out_path.empty()) {
+      std::cerr << "--out is required\n";
+      return 1;
+    }
+    std::optional<std::array<std::uint8_t, 32>> seed_override;
+    if (!seed_hex.empty()) {
+      seed_override = decode_hex32(seed_hex);
+      if (!seed_override) {
+        std::cerr << "--seed-hex must be 32-byte hex\n";
+        return 1;
+      }
+    }
+    selfcoin::keystore::ValidatorKey vk;
+    std::string err;
+    if (!selfcoin::keystore::create_validator_keystore(out_path, passphrase, network_name,
+                                                        selfcoin::keystore::hrp_for_network(network_name),
+                                                        seed_override, &vk, &err)) {
+      std::cerr << "wallet_create failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "file=" << out_path << "\n";
+    std::cout << "network=" << vk.network_name << "\n";
+    std::cout << "pubkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
+    std::cout << "address=" << vk.address << "\n";
+    return 0;
+  }
+
+  if (cmd == "wallet_address") {
+    std::string file_path;
+    std::string passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+    }
+    if (file_path.empty()) {
+      std::cerr << "--file is required\n";
+      return 1;
+    }
+    selfcoin::keystore::ValidatorKey vk;
+    std::string err;
+    if (!selfcoin::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "wallet_address failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << vk.address << "\n";
+    return 0;
+  }
+
+  if (cmd == "wallet_export") {
+    std::string file_path;
+    std::string passphrase;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--file" && i + 1 < argc) file_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+    }
+    if (file_path.empty()) {
+      std::cerr << "--file is required\n";
+      return 1;
+    }
+    selfcoin::keystore::ValidatorKey vk;
+    std::string err;
+    if (!selfcoin::keystore::load_validator_keystore(file_path, passphrase, &vk, &err)) {
+      std::cerr << "wallet_export failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "network=" << vk.network_name << "\n";
+    std::cout << "privkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(vk.privkey.begin(), vk.privkey.end())) << "\n";
+    std::cout << "pubkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
+    std::cout << "address=" << vk.address << "\n";
+    return 0;
+  }
+
+  if (cmd == "wallet_import") {
+    std::string out_path;
+    std::string passphrase;
+    std::string network_name = "mainnet";
+    std::string privkey_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+      else if (a == "--pass" && i + 1 < argc) passphrase = argv[++i];
+      else if (a == "--network" && i + 1 < argc) network_name = argv[++i];
+      else if (a == "--privkey" && i + 1 < argc) privkey_hex = argv[++i];
+    }
+    auto priv = decode_hex32(privkey_hex);
+    if (out_path.empty() || !priv) {
+      std::cerr << "--out and --privkey(32-byte hex) are required\n";
+      return 1;
+    }
+    selfcoin::keystore::ValidatorKey vk;
+    std::string err;
+    const std::optional<std::array<std::uint8_t, 32>> seed_override = *priv;
+    if (!selfcoin::keystore::create_validator_keystore(out_path, passphrase, network_name,
+                                                        selfcoin::keystore::hrp_for_network(network_name),
+                                                        seed_override, &vk, &err)) {
+      std::cerr << "wallet_import failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "file=" << out_path << "\n";
+    std::cout << "network=" << vk.network_name << "\n";
+    std::cout << "pubkey_hex=" << selfcoin::hex_encode(selfcoin::Bytes(vk.pubkey.begin(), vk.pubkey.end())) << "\n";
+    std::cout << "address=" << vk.address << "\n";
     return 0;
   }
 

@@ -24,6 +24,7 @@ void register_mempool_tests();
 void register_hardening_tests();
 void register_genesis_tests();
 void register_paths_tests();
+void register_keystore_tests();
 void register_integration_tests();
 void register_lightserver_tests();
 
@@ -41,6 +42,7 @@ int main() {
   register_hardening_tests();
   register_genesis_tests();
   register_paths_tests();
+  register_keystore_tests();
   register_integration_tests();
   register_lightserver_tests();
 

@@ -14,15 +14,30 @@ Hash32 make_vrf_seed_v5(const Hash32& prev_entropy, std::uint64_t height, std::u
   return crypto::sha256d(w.data());
 }
 
-Hash32 role_seed_v5(const Hash32& seed, SortitionRole role) {
+Hash32 role_seed_v5(const Hash32& seed, V5Role role) {
   codec::ByteWriter w;
-  if (role == SortitionRole::PROPOSER) {
+  if (role == V5Role::PROPOSER) {
     w.bytes(Bytes{'S', 'C', '-', 'V', 'R', 'F', '-', 'R', 'O', 'L', 'E', '-', 'P', 'R', 'O', 'P', 'O', 'S', 'E', 'R'});
   } else {
     w.bytes(Bytes{'S', 'C', '-', 'V', 'R', 'F', '-', 'R', 'O', 'L', 'E', '-', 'V', 'O', 'T', 'E', 'R'});
   }
   w.bytes_fixed(seed);
   return crypto::sha256d(w.data());
+}
+
+Bytes make_v5_vrf_transcript(V5Role role, std::uint64_t height, std::uint32_t round, const Hash32& role_seed,
+                             const std::optional<std::array<std::uint8_t, 16>>& network_id) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'R', 'F', '-', 'P', 'R', 'O', 'O', 'F', '-', 'V', '5'});
+  w.u8(static_cast<std::uint8_t>(role));
+  w.u64le(height);
+  w.u32le(round);
+  w.bytes_fixed(role_seed);
+  if (network_id.has_value()) {
+    w.bytes(Bytes{'N', 'E', 'T', 'I', 'D'});
+    w.bytes_fixed(*network_id);
+  }
+  return w.take();
 }
 
 std::size_t voter_target_k_v5(std::size_t active_count, std::uint32_t round, const V5Params& p) {
@@ -49,13 +64,12 @@ bool is_output_below_probability_threshold(const Hash32& output, std::uint64_t n
   return static_cast<__uint128_t>(v) < threshold;
 }
 
-bool is_v5_eligible(const PubKey32& pub, const Hash32& role_seed, std::uint64_t num, std::uint64_t den,
+bool is_v5_eligible(const PubKey32& pub, V5Role role, std::uint64_t height, std::uint32_t round, const Hash32& role_seed,
+                    const std::optional<std::array<std::uint8_t, 16>>& network_id, std::uint64_t num, std::uint64_t den,
                     const crypto::VrfProof& proof) {
-  Bytes msg;
-  msg.insert(msg.end(), role_seed.begin(), role_seed.end());
-  if (!crypto::vrf_verify(pub, msg, proof)) return false;
+  const Bytes transcript = make_v5_vrf_transcript(role, height, round, role_seed, network_id);
+  if (!crypto::vrf_verify(pub, transcript, proof)) return false;
   return is_output_below_probability_threshold(proof.output, num, den);
 }
 
 }  // namespace selfcoin::consensus
-

@@ -1,6 +1,7 @@
 #include "consensus/validators.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 
 #include "codec/bytes.hpp"
@@ -38,6 +39,7 @@ void ValidatorRegistry::register_bond_legacy(const PubKey32& pub, const OutPoint
   auto& v = validators_[pub];
   v.status = ValidatorStatus::PENDING;
   v.joined_height = joined_height;
+  v.bonded_amount = BOND_AMOUNT;
   v.has_bond = true;
   v.bond_outpoint = bond_outpoint;
   v.unbond_height = 0;
@@ -50,6 +52,7 @@ bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_
   auto& v = validators_[pub];
   v.status = ValidatorStatus::PENDING;
   v.joined_height = joined_height;
+  v.bonded_amount = bond_amount;
   v.has_bond = true;
   v.bond_outpoint = bond_outpoint;
   v.unbond_height = 0;
@@ -314,6 +317,32 @@ void v4_advance_join_window(std::uint64_t height, std::uint64_t window_blocks, s
   const std::uint64_t steps = delta / window_blocks;
   *window_start_height += steps * window_blocks;
   *window_count = 0;
+}
+
+std::uint64_t validator_weight_units_v6(const ValidatorInfo& info, const ValidatorWeightParamsV6& params) {
+  if (!info.has_bond) return 0;
+  if (info.status != ValidatorStatus::ACTIVE) return 0;
+  const std::uint64_t unit = std::max<std::uint64_t>(1, params.bond_unit);
+  std::uint64_t units = info.bonded_amount / unit;
+  units = std::min(units, params.units_max);
+  return units;
+}
+
+std::uint64_t total_active_weight_units_v6(const ValidatorRegistry& registry, std::uint64_t height,
+                                           const ValidatorWeightParamsV6& params) {
+  std::uint64_t total = 0;
+  for (const auto& [pub, info] : registry.all()) {
+    if (!registry.is_active_for_height(pub, height)) continue;
+    auto active_info = info;
+    active_info.status = ValidatorStatus::ACTIVE;
+    const std::uint64_t w = validator_weight_units_v6(active_info, params);
+    if (w > 0 && total > std::numeric_limits<std::uint64_t>::max() - w) {
+      total = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      total += w;
+    }
+  }
+  return total;
 }
 
 }  // namespace selfcoin::consensus

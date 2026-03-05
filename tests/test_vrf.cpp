@@ -3,6 +3,7 @@
 #include <array>
 #include <stdexcept>
 
+#include "consensus/sortition_v5.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/vrf.hpp"
 
@@ -22,25 +23,71 @@ crypto::KeyPair key_from_byte(std::uint8_t b) {
 
 TEST(test_vrf_prove_verify_roundtrip) {
   auto kp = key_from_byte(7);
-  Bytes msg{1, 2, 3, 4, 5};
-  auto p = crypto::vrf_prove(kp.private_key, msg);
+  Hash32 seed{};
+  seed.fill(0xA1);
+  const auto transcript = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 5, 2, seed, std::nullopt);
+  auto p = crypto::vrf_prove(kp.private_key, kp.public_key, transcript);
   ASSERT_TRUE(p.has_value());
-  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, msg, *p));
+  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, transcript, *p));
 }
 
 TEST(test_vrf_wrong_seed_fails) {
   auto kp = key_from_byte(8);
-  auto p = crypto::vrf_prove(kp.private_key, Bytes{9});
+  Hash32 s1{};
+  s1.fill(0x0B);
+  Hash32 s2{};
+  s2.fill(0x0C);
+  const auto t1 = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 9, 1, s1, std::nullopt);
+  const auto t2 = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 9, 1, s2, std::nullopt);
+  auto p = crypto::vrf_prove(kp.private_key, kp.public_key, t1);
   ASSERT_TRUE(p.has_value());
-  ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, Bytes{10}, *p));
+  ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, t2, *p));
 }
 
 TEST(test_vrf_wrong_pubkey_fails) {
   auto kp1 = key_from_byte(9);
   auto kp2 = key_from_byte(10);
-  auto p = crypto::vrf_prove(kp1.private_key, Bytes{4, 4, 4});
+  Hash32 seed{};
+  seed.fill(0x33);
+  const auto transcript = consensus::make_v5_vrf_transcript(consensus::V5Role::PROPOSER, 10, 7, seed, std::nullopt);
+  auto p = crypto::vrf_prove(kp1.private_key, kp1.public_key, transcript);
   ASSERT_TRUE(p.has_value());
-  ASSERT_TRUE(!crypto::vrf_verify(kp2.public_key, Bytes{4, 4, 4}, *p));
+  ASSERT_TRUE(!crypto::vrf_verify(kp2.public_key, transcript, *p));
+}
+
+TEST(test_v5_vrf_replay_across_role_fails) {
+  auto kp = key_from_byte(11);
+  Hash32 seed{};
+  seed.fill(0x44);
+  const auto proposer = consensus::make_v5_vrf_transcript(consensus::V5Role::PROPOSER, 100, 3, seed, std::nullopt);
+  const auto voter = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 100, 3, seed, std::nullopt);
+  auto p = crypto::vrf_prove(kp.private_key, kp.public_key, proposer);
+  ASSERT_TRUE(p.has_value());
+  ASSERT_TRUE(crypto::vrf_verify(kp.public_key, proposer, *p));
+  ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, voter, *p));
+}
+
+TEST(test_v5_vrf_replay_across_round_fails) {
+  auto kp = key_from_byte(12);
+  Hash32 seed{};
+  seed.fill(0x55);
+  const auto round7 = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 100, 7, seed, std::nullopt);
+  const auto round8 = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 100, 8, seed, std::nullopt);
+  auto p = crypto::vrf_prove(kp.private_key, kp.public_key, round7);
+  ASSERT_TRUE(p.has_value());
+  ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, round8, *p));
+}
+
+TEST(test_v5_vrf_output_mismatch_fails) {
+  auto kp = key_from_byte(13);
+  Hash32 seed{};
+  seed.fill(0x66);
+  const auto transcript = consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, 11, 2, seed, std::nullopt);
+  auto p = crypto::vrf_prove(kp.private_key, kp.public_key, transcript);
+  ASSERT_TRUE(p.has_value());
+  auto tampered = *p;
+  tampered.output[0] ^= 0x01;
+  ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, transcript, tampered));
 }
 
 void register_vrf_tests() {}

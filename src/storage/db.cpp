@@ -134,6 +134,7 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   w.u64le(info.last_join_height);
   w.u64le(info.last_exit_height);
   w.u32le(info.penalty_strikes);
+  w.u64le(info.bonded_amount);
   return w.take();
 }
 
@@ -147,6 +148,7 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.joined_height = *h;
         if (r.eof()) {
           // Backward compatibility for v0 records.
+          info.bonded_amount = BOND_AMOUNT;
           info.has_bond = true;
           info.unbond_height = 0;
           return true;
@@ -175,6 +177,13 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.last_join_height = *last_join;
         info.last_exit_height = *last_exit;
         info.penalty_strikes = *strikes;
+        if (!r.eof()) {
+          auto bonded = r.u64le();
+          if (!bonded || !r.eof()) return false;
+          info.bonded_amount = *bonded;
+        } else {
+          info.bonded_amount = BOND_AMOUNT;
+        }
         return true;
       })) {
     return std::nullopt;

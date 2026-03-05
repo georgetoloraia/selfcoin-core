@@ -17,9 +17,16 @@ This document describes the v5 consensus-gated private sortition path implemente
 Implementation: `src/consensus/sortition_v5.cpp`.
 
 ## VRF-like Primitive
-- `proof = ed25519_sign(sk, role_seed)`
-- `output = sha256d("SC-VRF-OUT-V0" || proof)`
-- Verifier checks signature + output derivation.
+- Transcript:
+  - `"SC-VRF-PROOF-V5"` (ASCII)
+  - `role` (u8: PROPOSER=1, VOTER=2)
+  - `height` (u64 little-endian)
+  - `round` (u32 little-endian)
+  - `role_seed` (32 bytes)
+  - optional network binding: `"NETID"` + `network_id(16)`
+- `proof = ed25519_sign(sk, transcript)`
+- `output = sha256d("SC-VRF-OUT-V5" || pubkey || proof)`
+- Verifier checks signature against the same transcript, recomputes output, and compares it.
 
 Implementation: `src/crypto/vrf.cpp`.
 
@@ -44,6 +51,7 @@ Implementation: `src/p2p/messages.hpp`, `src/p2p/messages.cpp`.
 - Reject proposer/voter if not ACTIVE.
 - Reject missing/invalid proof.
 - Reject eligibility mismatch against deterministic seed/threshold.
+- Replay across role/round fails because transcript binds role+height+round.
 - Deduplicate proposer claims per `(height, round, proposer_pubkey)`.
 - Vote dedup remains one vote per validator per `(height, round)` in `VoteTracker`.
 

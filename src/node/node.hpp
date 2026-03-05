@@ -11,6 +11,7 @@
 
 #include "consensus/activation.hpp"
 #include "consensus/sortition_v5.hpp"
+#include "consensus/sortition_v6.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -74,6 +75,13 @@ struct NodeConfig {
   std::optional<std::uint32_t> v5_voter_target_k_override;
   std::optional<std::uint32_t> v5_round_expand_cap_override;
   std::optional<std::uint32_t> v5_round_expand_factor_override;
+  std::optional<std::uint64_t> v6_bond_unit_override;
+  std::optional<std::uint64_t> v6_units_max_override;
+  std::optional<std::uint64_t> v6_proposer_expected_num_override;
+  std::optional<std::uint64_t> v6_proposer_expected_den_override;
+  std::optional<std::uint32_t> v6_voter_target_k_override;
+  std::optional<std::uint32_t> v6_round_expand_cap_override;
+  std::optional<std::uint32_t> v6_round_expand_factor_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -206,6 +214,7 @@ class Node {
                                         const std::vector<FinalitySig>& finality_sigs);
   bool v4_active_for_height(std::uint64_t height) const;
   bool v5_active_for_height(std::uint64_t height) const;
+  bool v6_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -254,6 +263,7 @@ class Node {
   std::uint64_t v4_suspend_duration_blocks_{1'000};
   std::size_t last_participation_eligible_signers_{0};
   consensus::V5Params v5_params_{};
+  consensus::V6Params v6_params_{};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

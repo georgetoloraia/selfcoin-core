@@ -29,7 +29,10 @@ int main(int argc, char** argv) {
                  "[--liveness-window-blocks <n>] [--miss-rate-suspend-threshold-percent <n>] "
                  "[--miss-rate-exit-threshold-percent <n>] [--suspend-duration-blocks <n>] "
                  "[--v5-proposer-expected-num <n>] [--v5-proposer-expected-den <n>] "
-                 "[--v5-voter-target-k <n>] [--v5-round-expand-cap <n>] [--v5-round-expand-factor <n>]\n";
+                 "[--v5-voter-target-k <n>] [--v5-round-expand-cap <n>] [--v5-round-expand-factor <n>] "
+                 "[--v6-bond-unit <n>] [--v6-units-max <n>] "
+                 "[--v6-proposer-expected-num <n>] [--v6-proposer-expected-den <n>] "
+                 "[--v6-voter-target-k <n>] [--v6-round-expand-cap <n>] [--v6-round-expand-factor <n>]\n";
     return 1;
   }
 

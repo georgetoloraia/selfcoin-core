@@ -16,6 +16,7 @@ Bytes utxo_commitment_value(const TxOut& out);
 Hash32 validator_commitment_key(const PubKey32& pub);
 Bytes validator_commitment_value_v3(const ValidatorInfo& info);
 Bytes validator_commitment_value_v4(const ValidatorInfo& info);
+Bytes validator_commitment_value_v6(const ValidatorInfo& info);
 Bytes validator_commitment_value(const ValidatorInfo& info, std::uint32_t consensus_version);
 
 inline constexpr std::array<std::uint8_t, 4> kSCR3Prefix{{'S', 'C', 'R', '3'}};

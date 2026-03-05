@@ -44,6 +44,13 @@ struct NetworkConfig {
   std::uint32_t v5_voter_target_k{100};
   std::uint32_t v5_round_expand_cap{8};
   std::uint32_t v5_round_expand_factor{2};
+  std::uint64_t v6_bond_unit{BOND_AMOUNT};
+  std::uint64_t v6_units_max{1'000'000};
+  std::uint64_t v6_proposer_expected_num{1};
+  std::uint64_t v6_proposer_expected_den{1};
+  std::uint32_t v6_voter_target_k{100};
+  std::uint32_t v6_round_expand_cap{8};
+  std::uint32_t v6_round_expand_factor{2};
   std::vector<std::string> default_seeds;
 };
 

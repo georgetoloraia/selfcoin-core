@@ -48,6 +48,7 @@ add_library(selfcoin_core
   src/consensus/monetary.cpp
   src/consensus/activation.cpp
   src/consensus/sortition_v5.cpp
+  src/consensus/sortition_v6.cpp
   src/consensus/state_commitment.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
@@ -113,6 +114,7 @@ add_executable(selfcoin-tests
   tests/test_consensus.cpp
   tests/test_sortition_v2.cpp
   tests/test_sortition_v5.cpp
+  tests/test_sortition_v6.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp

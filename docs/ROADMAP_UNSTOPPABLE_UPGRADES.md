@@ -14,7 +14,7 @@ All future protocol evolution must be activation-gated on mainnet.
 - Mainnet defaults are conservative:
   - `activation_enabled = false`
   - `initial_consensus_version = 1`
-  - `max_consensus_version = 4`
+  - `max_consensus_version = 6`
 
 ## Upgrade Path
 1. Enable activation parameters in a planned release (window/threshold/delay).
@@ -85,6 +85,14 @@ All future protocol evolution must be activation-gated on mainnet.
 - Added v5 proposer/voter eligibility verification path in node handling.
 - Added v5 quorum target (`k_eff`) with round-based expansion for liveness.
 - Mainnet defaults remain unchanged because activation is disabled by default.
+
+## PR6 Status: Weighted Private Sortition (v6, Activation-Gated)
+- Upgrades v5 private sortition to bond-weighted eligibility.
+- Weight source is deterministic validator bonded amount converted to units:
+  - `units = floor(bonded_amount / v6_bond_unit)`, clamped by `v6_units_max`.
+- Keeps transcript-bound proof verification from v5.1; only threshold math changes.
+- Uses deterministic weighted threshold scaling (0/1 eligibility) and keeps count-based quorum.
+- Default mainnet behavior remains unchanged while activation is disabled.
 
 ## Candidate Upgrades
 - Unpredictable committee sortition (VRF-based).

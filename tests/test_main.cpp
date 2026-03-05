@@ -19,6 +19,7 @@ void register_address_tests();
 void register_consensus_tests();
 void register_sortition_v2_tests();
 void register_sortition_v5_tests();
+void register_sortition_v6_tests();
 void register_p2p_tests();
 void register_addrman_tests();
 void register_monetary_tests();
@@ -43,6 +44,7 @@ int main() {
   register_consensus_tests();
   register_sortition_v2_tests();
   register_sortition_v5_tests();
+  register_sortition_v6_tests();
   register_p2p_tests();
   register_addrman_tests();
   register_monetary_tests();

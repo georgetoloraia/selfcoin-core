@@ -34,6 +34,7 @@ add_library(selfcoin_core
   src/codec/varint.cpp
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
+  src/crypto/smt.cpp
   src/keystore/validator_keystore.cpp
   src/genesis/genesis.cpp
   src/genesis/embedded_mainnet.cpp
@@ -45,6 +46,7 @@ add_library(selfcoin_core
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
   src/consensus/activation.cpp
+  src/consensus/state_commitment.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
@@ -110,6 +112,8 @@ add_executable(selfcoin-tests
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp
+  tests/test_state_commitment.cpp
+  tests/test_smt.cpp
   tests/test_activation.cpp
   tests/test_bonding.cpp
   tests/test_mempool.cpp

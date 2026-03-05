@@ -20,6 +20,8 @@ void register_sortition_v2_tests();
 void register_p2p_tests();
 void register_addrman_tests();
 void register_monetary_tests();
+void register_state_commitment_tests();
+void register_smt_tests();
 void register_activation_tests();
 void register_bonding_tests();
 void register_mempool_tests();
@@ -40,6 +42,8 @@ int main() {
   register_p2p_tests();
   register_addrman_tests();
   register_monetary_tests();
+  register_state_commitment_tests();
+  register_smt_tests();
   register_activation_tests();
   register_bonding_tests();
   register_mempool_tests();

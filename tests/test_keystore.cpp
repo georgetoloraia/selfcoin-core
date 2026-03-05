@@ -77,7 +77,7 @@ TEST(test_keystore_create_and_load_without_passphrase) {
 
 TEST(test_node_parse_args_validator_passphrase_env) {
   ::setenv("SELFCOIN_TEST_VALIDATOR_PASS", "env-secret", 1);
-  std::vector<std::string> args = {"selfcoin-node", "--mainnet", "--node-id", "0",
+  std::vector<std::string> args = {"selfcoin-node", "--node-id", "0",
                                    "--validator-passphrase-env", "SELFCOIN_TEST_VALIDATOR_PASS"};
   auto argv = make_argv(args);
   auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());

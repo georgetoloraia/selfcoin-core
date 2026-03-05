@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <thread>
 
 #include "address/address.hpp"
@@ -19,6 +20,7 @@
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "storage/db.hpp"
+#include "crypto/smt.hpp"
 #include "utxo/signing.hpp"
 
 using namespace selfcoin;
@@ -76,7 +78,7 @@ struct Cluster {
   }
 };
 
-Cluster make_cluster(const std::string& base, int node_count = 4) {
+Cluster make_cluster(const std::string& base, int node_count = 4, bool v3_active = false) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
@@ -94,6 +96,11 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
     cfg.max_committee = static_cast<std::size_t>(node_count);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
+    if (v3_active) {
+      cfg.network.initial_consensus_version = 3;
+      cfg.activation_enabled_override = true;
+      cfg.activation_max_version_override = 3;
+    }
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     keystore::ValidatorKey created_key;
@@ -108,6 +115,26 @@ Cluster make_cluster(const std::string& base, int node_count = 4) {
   }
   for (auto& n : c.nodes) n->start();
   return c;
+}
+
+std::optional<std::string> json_string_field(const std::string& s, const std::string& key) {
+  const std::regex re("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+  std::smatch m;
+  if (!std::regex_search(s, m, re) || m.size() < 2) return std::nullopt;
+  return m[1].str();
+}
+
+std::vector<std::string> json_string_array_field(const std::string& s, const std::string& key) {
+  std::vector<std::string> out;
+  const std::regex outer_re("\"" + key + "\"\\s*:\\s*\\[(.*?)\\]");
+  std::smatch outer;
+  if (!std::regex_search(s, outer, outer_re) || outer.size() < 2) return out;
+  const std::string body = outer[1].str();
+  const std::regex item_re("\"([0-9a-fA-F]+)\"");
+  for (std::sregex_iterator it(body.begin(), body.end(), item_re), end; it != end; ++it) {
+    out.push_back((*it)[1].str());
+  }
+  return out;
 }
 
 bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
@@ -156,6 +183,14 @@ std::optional<std::string> http_post_rpc(const std::string& host, std::uint16_t 
 }
 
 }  // namespace
+
+TEST(test_lightserver_parse_args_rejects_mainnet_flag) {
+  std::vector<std::string> args = {"selfcoin-lightserver", "--mainnet"};
+  std::vector<char*> argv;
+  argv.reserve(args.size());
+  for (auto& s : args) argv.push_back(s.data());
+  ASSERT_TRUE(!lightserver::parse_args(static_cast<int>(argv.size()), argv.data()).has_value());
+}
 
 TEST(test_lightserver_indexing_after_finalization) {
   const std::string base = "/tmp/selfcoin_light_idx";
@@ -273,6 +308,127 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
                             hex_encode32(blk_hash) + R"("}})";
   auto bresp = ls->handle_rpc_for_test(blk_q);
   ASSERT_TRUE(bresp.find("block_hex") != std::string::npos);
+}
+
+TEST(test_lightserver_v3_proof_endpoints) {
+  const std::string base = "/tmp/selfcoin_light_v3_proofs";
+  auto cluster = make_cluster(base, 4, true);
+  auto& node = *cluster.nodes[0];
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base + "/node0";
+  lcfg.bind_ip = "127.0.0.1";
+  lcfg.max_committee = 4;
+  auto ls = std::make_unique<lightserver::Server>(lcfg);
+  ASSERT_TRUE(ls->init());
+
+  const auto tip = node.status();
+  const std::uint64_t h = tip.height;
+
+  const std::string roots_q =
+      std::string(R"({"jsonrpc":"2.0","id":21,"method":"get_roots","params":{"height":)") + std::to_string(h) + "}}";
+  const auto roots = ls->handle_rpc_for_test(roots_q);
+  ASSERT_TRUE(roots.find("utxo_root") != std::string::npos);
+  ASSERT_TRUE(roots.find("validators_root") != std::string::npos);
+  const auto utxo_root_hex = json_string_field(roots, "utxo_root");
+  const auto val_root_hex = json_string_field(roots, "validators_root");
+  ASSERT_TRUE(utxo_root_hex.has_value());
+  ASSERT_TRUE(val_root_hex.has_value());
+
+  OutPoint op{};
+  op.txid.fill(0x42);
+  op.index = 0;
+
+  const std::string up_q = std::string(R"({"jsonrpc":"2.0","id":22,"method":"get_utxo_proof","params":{"txid":")") +
+                           hex_encode32(op.txid) + R"(","vout":)" + std::to_string(op.index) + R"(,"height":)" +
+                           std::to_string(h) + "}}";
+  const auto up = ls->handle_rpc_for_test(up_q);
+  ASSERT_TRUE(up.find("siblings") != std::string::npos);
+  ASSERT_TRUE(up.find("proof_format") != std::string::npos);
+  ASSERT_TRUE(up.find("siblings_hex") != std::string::npos);
+  const auto up_root_hex = json_string_field(up, "utxo_root");
+  const auto key_hex = json_string_field(up, "key_hex");
+  const auto value_hex = json_string_field(up, "value_hex");
+  const auto siblings_hex = json_string_array_field(up, "siblings");
+  ASSERT_TRUE(up_root_hex.has_value() && key_hex.has_value());
+  ASSERT_TRUE(*up_root_hex == *utxo_root_hex);
+  ASSERT_TRUE(siblings_hex.size() == 256);
+
+  const auto root_b = hex_decode(*up_root_hex);
+  const auto key_b = hex_decode(*key_hex);
+  ASSERT_TRUE(root_b.has_value() && key_b.has_value());
+  ASSERT_TRUE(root_b->size() == 32 && key_b->size() == 32);
+  Hash32 root{};
+  Hash32 key{};
+  std::copy(root_b->begin(), root_b->end(), root.begin());
+  std::copy(key_b->begin(), key_b->end(), key.begin());
+  std::vector<Hash32> sibs;
+  sibs.reserve(256);
+  for (const auto& hhex : siblings_hex) {
+    auto b = hex_decode(hhex);
+    ASSERT_TRUE(b.has_value() && b->size() == 32);
+    Hash32 hh{};
+    std::copy(b->begin(), b->end(), hh.begin());
+    sibs.push_back(hh);
+  }
+  crypto::SmtProof proof{sibs};
+  if (value_hex.has_value()) {
+    auto val_b = hex_decode(*value_hex);
+    ASSERT_TRUE(val_b.has_value());
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, key, *val_b, proof));
+  } else {
+    ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(root, key, std::nullopt, proof));
+  }
+
+  const std::string vp_q =
+      [&]() {
+        const auto keys = node::Node::deterministic_test_keypairs();
+        return std::string(R"({"jsonrpc":"2.0","id":23,"method":"get_validator_proof","params":{"pubkey_hex":")") +
+               hex_encode(Bytes(keys[0].public_key.begin(), keys[0].public_key.end())) + R"(","height":)" +
+               std::to_string(h) + "}}";
+      }();
+  const auto vp = ls->handle_rpc_for_test(vp_q);
+  ASSERT_TRUE(vp.find("validators_root") != std::string::npos);
+  ASSERT_TRUE(vp.find("proof_format") != std::string::npos);
+  ASSERT_TRUE(vp.find("siblings_hex") != std::string::npos);
+  const auto vp_root_hex = json_string_field(vp, "validators_root");
+  const auto vp_key_hex = json_string_field(vp, "key_hex");
+  const auto vp_value_hex = json_string_field(vp, "value_hex");
+  const auto vp_siblings_hex = json_string_array_field(vp, "siblings");
+  ASSERT_TRUE(vp_root_hex.has_value() && vp_key_hex.has_value() && vp_value_hex.has_value());
+  ASSERT_TRUE(*vp_root_hex == *val_root_hex);
+  ASSERT_TRUE(vp_siblings_hex.size() == 256);
+
+  auto vrb = hex_decode(*vp_root_hex);
+  auto vkb = hex_decode(*vp_key_hex);
+  auto vvb = hex_decode(*vp_value_hex);
+  ASSERT_TRUE(vrb.has_value() && vkb.has_value() && vvb.has_value());
+  ASSERT_TRUE(vrb->size() == 32 && vkb->size() == 32);
+  Hash32 vr{};
+  Hash32 vk{};
+  std::copy(vrb->begin(), vrb->end(), vr.begin());
+  std::copy(vkb->begin(), vkb->end(), vk.begin());
+  std::vector<Hash32> vsibs;
+  vsibs.reserve(256);
+  for (const auto& hhex : vp_siblings_hex) {
+    auto b = hex_decode(hhex);
+    ASSERT_TRUE(b.has_value() && b->size() == 32);
+    Hash32 hh{};
+    std::copy(b->begin(), b->end(), hh.begin());
+    vsibs.push_back(hh);
+  }
+  crypto::SmtProof vproof{vsibs};
+  ASSERT_TRUE(crypto::SparseMerkleTree::verify_proof(vr, vk, *vvb, vproof));
+
+  if (h > 0) {
+    const std::string hr_q =
+        std::string(R"({"jsonrpc":"2.0","id":24,"method":"get_header_range","params":{"start_height":)") +
+        std::to_string(h) + R"(,"end_height":)" + std::to_string(h) + "}}";
+    const auto hr = ls->handle_rpc_for_test(hr_q);
+    ASSERT_TRUE(hr.find("finality_proof") != std::string::npos);
+    ASSERT_TRUE(hr.find(*utxo_root_hex) != std::string::npos);
+    ASSERT_TRUE(hr.find(*val_root_hex) != std::string::npos);
+  }
 }
 
 void register_lightserver_tests() {}

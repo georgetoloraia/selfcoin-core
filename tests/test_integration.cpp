@@ -17,10 +17,12 @@
 
 #include "address/address.hpp"
 #include "consensus/validators.hpp"
+#include "consensus/state_commitment.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
 #include "keystore/validator_keystore.hpp"
+#include "merkle/merkle.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
@@ -240,7 +242,7 @@ struct HttpStubServer {
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE) {
+                     std::size_t max_committee = MAX_COMMITTEE, bool v3_active = false) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
@@ -260,6 +262,11 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
+    if (v3_active) {
+      cfg.network.initial_consensus_version = 3;
+      cfg.activation_enabled_override = true;
+      cfg.activation_max_version_override = 3;
+    }
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
@@ -1312,6 +1319,45 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
+}
+
+TEST(test_v3_active_marker_missing_rejected) {
+  auto cluster = make_cluster("/tmp/selfcoin_it_v3_marker_missing", 4, 1, 4, true);
+  auto& n = *cluster.nodes[0];
+  n.pause_proposals_for_test(true);
+
+  const auto st = n.status();
+  const std::uint64_t h = st.height + 1;
+  const std::uint32_t r = st.round;
+  auto blk = n.build_proposal_for_test(h, r);
+  ASSERT_TRUE(blk.has_value());
+  ASSERT_TRUE(!blk->txs.empty());
+  ASSERT_TRUE(!blk->txs[0].inputs.empty());
+
+  auto& script = blk->txs[0].inputs[0].script_sig;
+  constexpr std::size_t kMarkerLen = 4 + 32 + 32;
+  bool removed = false;
+  if (script.size() >= kMarkerLen) {
+    for (std::size_t i = 0; i + kMarkerLen <= script.size(); ++i) {
+      if (std::equal(consensus::kSCR3Prefix.begin(), consensus::kSCR3Prefix.end(),
+                     script.begin() + static_cast<std::ptrdiff_t>(i))) {
+        script.erase(script.begin() + static_cast<std::ptrdiff_t>(i),
+                     script.begin() + static_cast<std::ptrdiff_t>(i + kMarkerLen));
+        removed = true;
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(removed);
+
+  std::vector<Bytes> tx_bytes;
+  tx_bytes.reserve(blk->txs.size());
+  for (const auto& tx : blk->txs) tx_bytes.push_back(tx.serialize());
+  auto m = merkle::compute_merkle_root_from_txs(tx_bytes);
+  ASSERT_TRUE(m.has_value());
+  blk->header.merkle_root = *m;
+
+  ASSERT_TRUE(!n.inject_propose_for_test(*blk));
 }
 
 void register_integration_tests() {}

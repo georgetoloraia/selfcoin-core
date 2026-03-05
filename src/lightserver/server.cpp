@@ -16,8 +16,10 @@
 
 #include "codec/bytes.hpp"
 #include "common/paths.hpp"
+#include "consensus/state_commitment.hpp"
 #include "consensus/validators.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/smt.hpp"
 #include "genesis/genesis.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
@@ -48,6 +50,20 @@ std::optional<Hash32> parse_hex32(const std::string& s) {
   Hash32 out{};
   std::copy(b->begin(), b->end(), out.begin());
   return out;
+}
+
+std::optional<PubKey32> parse_pubkey32(const std::string& s) {
+  auto b = hex_decode(s);
+  if (!b.has_value() || b->size() != 32) return std::nullopt;
+  PubKey32 out{};
+  std::copy(b->begin(), b->end(), out.begin());
+  return out;
+}
+
+std::string root_index_key(const std::string& kind, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "ROOT:" + kind + ":" + hex_encode(w.data());
 }
 
 std::optional<std::uint64_t> find_u64(const std::string& body, const std::string& key) {
@@ -380,8 +396,64 @@ std::string Server::handle_rpc_body(const std::string& body) {
       if (!blk.has_value()) break;
       if (!first) arr << ",";
       first = false;
+      auto ur = db_.get(root_index_key("UTXO", h));
+      auto vr = db_.get(root_index_key("VAL", h));
       arr << "{\"height\":" << h << ",\"header_hex\":\"" << hex_encode(blk->header.serialize())
-          << "\",\"block_hash\":\"" << hex_encode32(*bh) << "\",\"finality_proof\":[";
+          << "\",\"block_hash\":\"" << hex_encode32(*bh) << "\"";
+      if (ur.has_value() && ur->size() == 32) {
+        Hash32 r{};
+        std::copy(ur->begin(), ur->end(), r.begin());
+        arr << ",\"utxo_root\":\"" << hex_encode32(r) << "\"";
+      }
+      if (vr.has_value() && vr->size() == 32) {
+        Hash32 r{};
+        std::copy(vr->begin(), vr->end(), r.begin());
+        arr << ",\"validators_root\":\"" << hex_encode32(r) << "\"";
+      }
+      arr << ",\"finality_proof\":[";
+      for (size_t i = 0; i < blk->finality_proof.sigs.size(); ++i) {
+        if (i) arr << ",";
+        const auto& s = blk->finality_proof.sigs[i];
+        arr << "{\"pubkey_hex\":\"" << hex_encode(Bytes(s.validator_pubkey.begin(), s.validator_pubkey.end()))
+            << "\",\"sig_hex\":\"" << hex_encode(Bytes(s.signature.begin(), s.signature.end())) << "\"}";
+      }
+      arr << "]}";
+    }
+    arr << "]";
+    return make_result(id, arr.str());
+  }
+
+  if (*method == "get_header_range") {
+    auto start = find_u64(body, "start_height");
+    auto end = find_u64(body, "end_height");
+    if (!start || !end || *end < *start) return make_error(id, -32602, "missing/invalid start_height,end_height");
+    std::ostringstream arr;
+    arr << "[";
+    bool first = true;
+    for (std::uint64_t h = *start; h <= *end; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) break;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) break;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) break;
+      auto ur = db_.get(root_index_key("UTXO", h));
+      auto vr = db_.get(root_index_key("VAL", h));
+      if (!first) arr << ",";
+      first = false;
+      arr << "{\"height\":" << h << ",\"header_hex\":\"" << hex_encode(blk->header.serialize()) << "\",\"block_hash\":\""
+          << hex_encode32(*bh) << "\"";
+      if (ur.has_value() && ur->size() == 32) {
+        Hash32 r{};
+        std::copy(ur->begin(), ur->end(), r.begin());
+        arr << ",\"utxo_root\":\"" << hex_encode32(r) << "\"";
+      }
+      if (vr.has_value() && vr->size() == 32) {
+        Hash32 r{};
+        std::copy(vr->begin(), vr->end(), r.begin());
+        arr << ",\"validators_root\":\"" << hex_encode32(r) << "\"";
+      }
+      arr << ",\"finality_proof\":[";
       for (size_t i = 0; i < blk->finality_proof.sigs.size(); ++i) {
         if (i) arr << ",";
         const auto& s = blk->finality_proof.sigs[i];
@@ -447,6 +519,108 @@ std::string Server::handle_rpc_body(const std::string& body) {
       oss << "\"" << hex_encode(Bytes((*committee)[i].begin(), (*committee)[i].end())) << "\"";
     }
     oss << "]";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_roots") {
+    auto h = find_u64(body, "height");
+    if (!h) return make_error(id, -32602, "missing height");
+    auto ur = db_.get(root_index_key("UTXO", *h));
+    auto vr = db_.get(root_index_key("VAL", *h));
+    if (!ur.has_value() || ur->size() != 32 || !vr.has_value() || vr->size() != 32) {
+      return make_error(id, -32001, "roots unavailable");
+    }
+    Hash32 u{};
+    Hash32 v{};
+    std::copy(ur->begin(), ur->end(), u.begin());
+    std::copy(vr->begin(), vr->end(), v.begin());
+    std::ostringstream oss;
+    oss << "{\"height\":" << *h << ",\"utxo_root\":\"" << hex_encode32(u) << "\",\"validators_root\":\"" << hex_encode32(v)
+        << "\"}";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_utxo_proof") {
+    auto txid_hex = find_string(body, "txid");
+    auto vout = find_u64(body, "vout");
+    if (!txid_hex || !vout) return make_error(id, -32602, "missing txid/vout");
+    auto txid = parse_hex32(*txid_hex);
+    if (!txid) return make_error(id, -32602, "bad txid");
+    auto tip = db_.get_tip();
+    if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
+    std::uint64_t h = tip->height;
+    if (auto hopt = find_u64(body, "height"); hopt.has_value()) {
+      h = *hopt;
+      if (h != tip->height) return make_error(id, -32602, "historical proof not supported in v3.0");
+    }
+
+    const OutPoint op{*txid, static_cast<std::uint32_t>(*vout)};
+    const Hash32 key = consensus::utxo_commitment_key(op);
+    crypto::SparseMerkleTree tree(db_, "utxo");
+    const auto value = tree.get_value(key);
+    const auto proof = tree.get_proof(key);
+    auto ur = db_.get(root_index_key("UTXO", h));
+    if (!ur.has_value() || ur->size() != 32) return make_error(id, -32001, "utxo_root unavailable");
+    Hash32 root{};
+    std::copy(ur->begin(), ur->end(), root.begin());
+
+    std::ostringstream oss;
+    oss << "{\"proof_format\":\"smt_v0\",\"height\":" << h << ",\"key_hex\":\"" << hex_encode32(key)
+        << "\",\"root_hex\":\"" << hex_encode32(root) << "\",\"utxo_root\":\"" << hex_encode32(root) << "\",";
+    if (value.has_value()) oss << "\"value_hex\":\"" << hex_encode(*value) << "\",";
+    else oss << "\"value_hex\":null,";
+    oss << "\"siblings_hex\":[";
+    for (size_t i = 0; i < proof.siblings.size(); ++i) {
+      if (i) oss << ",";
+      oss << "\"" << hex_encode32(proof.siblings[i]) << "\"";
+    }
+    oss << "],\"siblings\":[";
+    for (size_t i = 0; i < proof.siblings.size(); ++i) {
+      if (i) oss << ",";
+      oss << "\"" << hex_encode32(proof.siblings[i]) << "\"";
+    }
+    oss << "]}";
+    return make_result(id, oss.str());
+  }
+
+  if (*method == "get_validator_proof") {
+    auto pub_hex = find_string(body, "pubkey_hex");
+    if (!pub_hex) return make_error(id, -32602, "missing pubkey_hex");
+    auto pub = parse_pubkey32(*pub_hex);
+    if (!pub) return make_error(id, -32602, "bad pubkey");
+    auto tip = db_.get_tip();
+    if (!tip.has_value()) return make_error(id, -32000, "tip unavailable");
+    std::uint64_t h = tip->height;
+    if (auto hopt = find_u64(body, "height"); hopt.has_value()) {
+      h = *hopt;
+      if (h != tip->height) return make_error(id, -32602, "historical proof not supported in v3.0");
+    }
+
+    const Hash32 key = consensus::validator_commitment_key(*pub);
+    crypto::SparseMerkleTree tree(db_, "validators");
+    const auto value = tree.get_value(key);
+    const auto proof = tree.get_proof(key);
+    auto vr = db_.get(root_index_key("VAL", h));
+    if (!vr.has_value() || vr->size() != 32) return make_error(id, -32001, "validators_root unavailable");
+    Hash32 root{};
+    std::copy(vr->begin(), vr->end(), root.begin());
+
+    std::ostringstream oss;
+    oss << "{\"proof_format\":\"smt_v0\",\"height\":" << h << ",\"key_hex\":\"" << hex_encode32(key)
+        << "\",\"root_hex\":\"" << hex_encode32(root) << "\",\"validators_root\":\"" << hex_encode32(root) << "\",";
+    if (value.has_value()) oss << "\"value_hex\":\"" << hex_encode(*value) << "\",";
+    else oss << "\"value_hex\":null,";
+    oss << "\"siblings_hex\":[";
+    for (size_t i = 0; i < proof.siblings.size(); ++i) {
+      if (i) oss << ",";
+      oss << "\"" << hex_encode32(proof.siblings[i]) << "\"";
+    }
+    oss << "],\"siblings\":[";
+    for (size_t i = 0; i < proof.siblings.size(); ++i) {
+      if (i) oss << ",";
+      oss << "\"" << hex_encode32(proof.siblings[i]) << "\"";
+    }
+    oss << "]}";
     return make_result(id, oss.str());
   }
 
@@ -530,7 +704,7 @@ std::optional<Config> parse_args(int argc, char** argv) {
       cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
       relay_port_explicit = true;
     } else if (a == "--mainnet") {
-      // Accepted for backward CLI compatibility; mainnet is always selected.
+      return std::nullopt;
     } else if (a == "--max-committee") {
       auto v = next();
       if (!v) return std::nullopt;

@@ -158,6 +158,12 @@ TEST(test_node_parse_args_mainnet_only) {
   bad_argv.reserve(bad.size());
   for (auto& s : bad) bad_argv.push_back(s.data());
   ASSERT_TRUE(!node::parse_args(static_cast<int>(bad_argv.size()), bad_argv.data()).has_value());
+
+  std::vector<std::string> legacy = {"selfcoin-node", "--mainnet", "--node-id", "3"};
+  std::vector<char*> legacy_argv;
+  legacy_argv.reserve(legacy.size());
+  for (auto& s : legacy) legacy_argv.push_back(s.data());
+  ASSERT_TRUE(!node::parse_args(static_cast<int>(legacy_argv.size()), legacy_argv.data()).has_value());
 }
 
 TEST(test_node_parse_args_activation_overrides) {

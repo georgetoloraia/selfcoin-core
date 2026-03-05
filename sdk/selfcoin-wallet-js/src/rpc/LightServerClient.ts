@@ -1,10 +1,13 @@
 import type {
   BroadcastResult,
   HeaderEntry,
+  RootPair,
   RpcUtxo,
   Status,
   Tip,
   TxLookup,
+  UtxoProof,
+  ValidatorProof,
 } from '../types/index.js';
 
 export interface ClientOptions {
@@ -125,6 +128,8 @@ export class LightServerClient {
       height: number;
       header_hex: string;
       block_hash: string;
+      utxo_root?: string;
+      validators_root?: string;
       finality_proof: Array<{ pubkey_hex: string; sig_hex: string }>;
     }>>(this.urls[0], 'get_headers', {
       from_height: Number(fromHeight),
@@ -134,6 +139,30 @@ export class LightServerClient {
       height: BigInt(r.height),
       header_hex: r.header_hex.toLowerCase(),
       block_hash: r.block_hash.toLowerCase(),
+      utxo_root: r.utxo_root?.toLowerCase(),
+      validators_root: r.validators_root?.toLowerCase(),
+      finality_proof: r.finality_proof.map((f) => ({ pubkey_hex: f.pubkey_hex.toLowerCase(), sig_hex: f.sig_hex.toLowerCase() })),
+    }));
+  }
+
+  async getHeaderRange(startHeight: bigint, endHeight: bigint): Promise<HeaderEntry[]> {
+    const raw = await this.callWithRetry<Array<{
+      height: number;
+      header_hex: string;
+      block_hash: string;
+      utxo_root?: string;
+      validators_root?: string;
+      finality_proof: Array<{ pubkey_hex: string; sig_hex: string }>;
+    }>>(this.urls[0], 'get_header_range', {
+      start_height: Number(startHeight),
+      end_height: Number(endHeight),
+    });
+    return raw.map((r) => ({
+      height: BigInt(r.height),
+      header_hex: r.header_hex.toLowerCase(),
+      block_hash: r.block_hash.toLowerCase(),
+      utxo_root: r.utxo_root?.toLowerCase(),
+      validators_root: r.validators_root?.toLowerCase(),
       finality_proof: r.finality_proof.map((f) => ({ pubkey_hex: f.pubkey_hex.toLowerCase(), sig_hex: f.sig_hex.toLowerCase() })),
     }));
   }
@@ -176,6 +205,71 @@ export class LightServerClient {
   async getCommittee(height: bigint): Promise<string[]> {
     const raw = await this.callWithRetry<string[]>(this.urls[0], 'get_committee', { height: Number(height) });
     return raw.map((p) => p.toLowerCase());
+  }
+
+  async getRoots(height: bigint): Promise<RootPair> {
+    const raw = await this.callWithRetry<{ height: number; utxo_root: string; validators_root: string }>(
+      this.urls[0],
+      'get_roots',
+      { height: Number(height) },
+    );
+    return {
+      height: BigInt(raw.height),
+      utxo_root: raw.utxo_root.toLowerCase(),
+      validators_root: raw.validators_root.toLowerCase(),
+    };
+  }
+
+  async getUtxoProof(txid: string, vout: number, height?: bigint): Promise<UtxoProof> {
+    const params: Record<string, unknown> = { txid: txid.toLowerCase(), vout };
+    if (height !== undefined) params.height = Number(height);
+    const raw = await this.callWithRetry<{
+      proof_format?: string;
+      height: number;
+      key_hex: string;
+      root_hex?: string;
+      utxo_root: string;
+      value_hex: string | null;
+      siblings_hex?: string[];
+      siblings: string[];
+    }>(this.urls[0], 'get_utxo_proof', params);
+    const siblings = (raw.siblings_hex ?? raw.siblings).map((s) => s.toLowerCase());
+    return {
+      proof_format: 'smt_v0',
+      height: BigInt(raw.height),
+      key_hex: raw.key_hex.toLowerCase(),
+      root_hex: (raw.root_hex ?? raw.utxo_root).toLowerCase(),
+      utxo_root: raw.utxo_root.toLowerCase(),
+      value_hex: raw.value_hex ? raw.value_hex.toLowerCase() : null,
+      siblings_hex: siblings,
+      siblings,
+    };
+  }
+
+  async getValidatorProof(pubkeyHex: string, height?: bigint): Promise<ValidatorProof> {
+    const params: Record<string, unknown> = { pubkey_hex: pubkeyHex.toLowerCase() };
+    if (height !== undefined) params.height = Number(height);
+    const raw = await this.callWithRetry<{
+      proof_format?: string;
+      height: number;
+      key_hex: string;
+      root_hex?: string;
+      validators_root: string;
+      value_hex: string | null;
+      siblings_hex?: string[];
+      siblings: string[];
+    }>(this.urls[0], 'get_validator_proof', params);
+    const siblings = (raw.siblings_hex ?? raw.siblings).map((s) => s.toLowerCase());
+    return {
+      proof_format: 'smt_v0',
+      height: BigInt(raw.height),
+      key_hex: raw.key_hex.toLowerCase(),
+      root_hex: (raw.root_hex ?? raw.validators_root).toLowerCase(),
+      validators_root: raw.validators_root.toLowerCase(),
+      value_hex: raw.value_hex ? raw.value_hex.toLowerCase() : null,
+      siblings_hex: siblings,
+      siblings,
+    };
   }
 
   async broadcastTx(txHex: string): Promise<BroadcastResult> {

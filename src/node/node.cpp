@@ -17,11 +17,13 @@
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
 #include "consensus/activation.hpp"
+#include "consensus/state_commitment.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/monetary.hpp"
 #include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/smt.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
@@ -69,6 +71,140 @@ std::string token_value(const std::string& s, const std::string& key) {
 
 std::mutex g_local_bus_mu;
 std::vector<Node*> g_local_bus_nodes;
+
+constexpr const char* kSmtTreeUtxo = "utxo";
+constexpr const char* kSmtTreeValidators = "validators";
+
+bool v3_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 3;
+}
+
+struct StateRootsV3 {
+  Hash32 utxo_root{};
+  Hash32 validators_root{};
+};
+
+StateRootsV3 compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators) {
+  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
+  utxo_leaves.reserve(utxos.size());
+  for (const auto& [op, ue] : utxos) {
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+  }
+
+  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
+  validator_leaves.reserve(validators.all().size());
+  for (const auto& [pub, info] : validators.all()) {
+    validator_leaves.push_back({consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info)});
+  }
+
+  StateRootsV3 roots;
+  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
+  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
+  return roots;
+}
+
+std::string smt_leaf_prefix(const std::string& tree_id) { return "SMTL:" + tree_id + ":"; }
+std::string smt_leaf_key(const std::string& tree_id, const Hash32& key) {
+  return smt_leaf_prefix(tree_id) + hex_encode(Bytes(key.begin(), key.end()));
+}
+std::string root_index_key(const std::string& kind, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "ROOT:" + kind + ":" + hex_encode(w.data());
+}
+
+std::string marker_error_to_string(consensus::MarkerError err) {
+  switch (err) {
+    case consensus::MarkerError::kNone:
+      return "none";
+    case consensus::MarkerError::kMissing:
+      return "missing";
+    case consensus::MarkerError::kMultipleMarkers:
+      return "multiple";
+    case consensus::MarkerError::kWrongLength:
+      return "wrong-length";
+  }
+  return "unknown";
+}
+
+void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vector<std::pair<Hash32, Bytes>>& leaves) {
+  const std::string prefix = smt_leaf_prefix(tree_id);
+  std::set<std::string> desired;
+  desired.clear();
+  for (const auto& [k, _] : leaves) desired.insert(smt_leaf_key(tree_id, k));
+  for (const auto& [k, _] : db.scan_prefix(prefix)) {
+    if (desired.find(k) == desired.end()) (void)db.put(k, {});
+  }
+  for (const auto& [k, v] : leaves) (void)db.put(smt_leaf_key(tree_id, k), v);
+}
+
+StateRootsV3 persist_v3_state_roots(storage::DB& db, std::uint64_t height, const UtxoSet& utxos,
+                                    const consensus::ValidatorRegistry& validators) {
+  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
+  utxo_leaves.reserve(utxos.size());
+  for (const auto& [op, ue] : utxos) {
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+  }
+  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
+  validator_leaves.reserve(validators.all().size());
+  for (const auto& [pub, info] : validators.all()) {
+    validator_leaves.push_back({consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info)});
+  }
+
+  sync_smt_tree(db, kSmtTreeUtxo, utxo_leaves);
+  sync_smt_tree(db, kSmtTreeValidators, validator_leaves);
+
+  StateRootsV3 roots{};
+  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
+  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
+  crypto::SparseMerkleTree utxo_tree(db, kSmtTreeUtxo);
+  crypto::SparseMerkleTree validators_tree(db, kSmtTreeValidators);
+  (void)utxo_tree.set_root_for_height(height, roots.utxo_root);
+  (void)validators_tree.set_root_for_height(height, roots.validators_root);
+  (void)db.put(root_index_key("UTXO", height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
+  (void)db.put(root_index_key("VAL", height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
+  return roots;
+}
+
+void apply_validator_changes_in_memory(consensus::ValidatorRegistry* registry, const Block& block, const UtxoSet& pre_utxos,
+                                       std::uint64_t height) {
+  if (!registry) return;
+  for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    for (const auto& in : tx.inputs) {
+      OutPoint op{in.prev_txid, in.prev_index};
+      auto it = pre_utxos.find(op);
+      if (it == pre_utxos.end()) continue;
+      PubKey32 pub{};
+      if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) registry->ban(pub);
+      else registry->request_unbond(pub, height);
+    }
+  }
+  for (const auto& tx : block.txs) {
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
+      PubKey32 pub{};
+      if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
+        registry->register_bond(pub, OutPoint{txid, out_i}, height);
+      }
+    }
+  }
+  registry->advance_height(height + 1);
+}
+
+std::optional<StateRootsV3> compute_post_state_roots_for_block(const Block& block, const UtxoSet& pre_utxos,
+                                                                const consensus::ValidatorRegistry& pre_validators,
+                                                                std::uint64_t height) {
+  UtxoSet post_utxos = pre_utxos;
+  consensus::ValidatorRegistry post_validators = pre_validators;
+  apply_validator_changes_in_memory(&post_validators, block, pre_utxos, height);
+  apply_block_to_utxo(block, post_utxos);
+  return compute_roots_for_state(post_utxos, post_validators);
+}
 
 }  // namespace
 
@@ -120,7 +256,6 @@ bool Node::init() {
     activation_params_.threshold_percent = *cfg_.activation_threshold_percent_override;
   if (cfg_.activation_delay_blocks_override.has_value())
     activation_params_.activation_delay_blocks = *cfg_.activation_delay_blocks_override;
-  activation_params_.initial_version = 1;
   activation_state_.current_version = activation_params_.initial_version;
   if (activation_params_.enabled) {
     log_line("activation override enabled max_version=" + std::to_string(activation_params_.max_version) +
@@ -393,6 +528,14 @@ std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* obse
 }
 
 bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0); }
+bool Node::inject_propose_for_test(const Block& block) {
+  p2p::ProposeMsg p;
+  p.height = block.header.height;
+  p.round = block.header.round;
+  p.prev_finalized_hash = block.header.prev_finalized_hash;
+  p.block_bytes = block.serialize();
+  return handle_propose(p, false);
+}
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
@@ -460,6 +603,10 @@ std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubK
   return validators_.get(pub);
 }
 std::uint16_t Node::p2p_port_for_test() const { return cfg_.p2p_port; }
+
+std::optional<Block> Node::build_proposal_for_test(std::uint64_t height, std::uint32_t round) {
+  return build_proposal_block(height, round);
+}
 
 void Node::event_loop() {
   while (running_) {
@@ -764,6 +911,17 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
             apply_activation_signal(*blk, blk->header.height);
+            if (v3_active_for_height(activation_state_, activation_params_, blk->header.height)) {
+              if (blk->txs.empty() || blk->txs[0].inputs.empty()) return;
+              consensus::MarkerError me = consensus::MarkerError::kNone;
+              const auto got = consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, &me);
+              if (!got.has_value()) {
+                log_line("v3-marker-invalid mode=finalized-block error=" + marker_error_to_string(me));
+                return;
+              }
+              const auto roots = persist_v3_state_roots(db_, blk->header.height, utxos_, validators_);
+              if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return;
+            }
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             last_finalized_progress_ms_ = now_unix() * 1000;
@@ -921,6 +1079,15 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
 
+    if (v3_active_for_height(activation_state_, activation_params_, msg.height)) {
+      if (blk->txs.empty() || blk->txs[0].inputs.empty()) return false;
+      const auto got = consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, nullptr);
+      if (!got.has_value()) return false;
+      auto expected = compute_post_state_roots_for_block(*blk, utxos_, validators_, msg.height);
+      if (!expected.has_value()) return false;
+      if (got->utxo_root != expected->utxo_root || got->validators_root != expected->validators_root) return false;
+    }
+
     Hash32 bid = blk->header.block_id();
     if (candidate_blocks_.find(bid) == candidate_blocks_.end()) {
       const std::size_t sz = msg.block_bytes.size();
@@ -1066,6 +1233,14 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
   apply_activation_signal(b, height);
+  if (v3_active_for_height(activation_state_, activation_params_, height)) {
+    if (b.txs.empty() || b.txs[0].inputs.empty()) return false;
+    consensus::MarkerError me = consensus::MarkerError::kNone;
+    const auto got = consensus::find_scr3_roots_marker(b.txs[0].inputs[0].script_sig, &me);
+    if (!got.has_value()) return false;
+    const auto roots = persist_v3_state_roots(db_, height, utxos_, validators_);
+    if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return false;
+  }
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
@@ -1113,10 +1288,9 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   in.sequence = 0xFFFFFFFF;
   std::optional<std::uint32_t> signal_version;
   if (activation_params_.enabled) {
-    signal_version = activation_state_.current_version;
-    if (activation_state_.pending_version > 0 && height >= activation_state_.pending_activation_height) {
-      signal_version = activation_state_.pending_version;
-    }
+    // Always advertise the highest supported version. Activation logic still advances
+    // one version at a time via finalized-window thresholds.
+    signal_version = activation_params_.max_version;
   }
   in.script_sig = consensus::make_coinbase_script_sig(height, round, signal_version);
   coinbase.inputs.push_back(in);
@@ -1156,6 +1330,13 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
 
   b.txs.push_back(coinbase);
   b.txs.insert(b.txs.end(), picked.begin(), picked.end());
+
+  if (v3_active_for_height(activation_state_, activation_params_, height)) {
+    auto roots = compute_post_state_roots_for_block(b, utxos_, validators_, height);
+    if (!roots.has_value()) return std::nullopt;
+    b.txs[0].inputs[0].script_sig =
+        consensus::append_v3_roots_to_coinbase_script(b.txs[0].inputs[0].script_sig, roots->utxo_root, roots->validators_root);
+  }
 
   std::vector<Bytes> tx_bytes;
   tx_bytes.reserve(b.txs.size());
@@ -1364,6 +1545,20 @@ bool Node::init_mainnet_genesis() {
     vi.unbond_height = 0;
     if (!db_.put_validator(pub, vi)) return false;
   }
+  {
+    consensus::ValidatorRegistry vr;
+    for (const auto& pub : doc->initial_validators) {
+      consensus::ValidatorInfo vi;
+      vi.status = consensus::ValidatorStatus::ACTIVE;
+      vi.joined_height = 0;
+      vi.has_bond = true;
+      vi.bond_outpoint = OutPoint{zero_hash(), 0};
+      vi.unbond_height = 0;
+      vr.upsert(pub, vi);
+    }
+    const UtxoSet empty_utxos;
+    (void)persist_v3_state_roots(db_, 0, empty_utxos, vr);
+  }
   return db_.flush();
 }
 
@@ -1422,6 +1617,13 @@ bool Node::load_state() {
       consensus::apply_signal(&activation_state_, activation_params_, h, sig);
     }
     (void)db_.set_activation_state(activation_state_);
+  }
+
+  if (v3_active_for_height(activation_state_, activation_params_, finalized_height_)) {
+    const auto existing = db_.get(root_index_key("UTXO", finalized_height_));
+    if (!existing.has_value() || existing->size() != 32) {
+      (void)persist_v3_state_roots(db_, finalized_height_, utxos_, validators_);
+    }
   }
 
   return true;
@@ -1913,7 +2115,8 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     };
 
     if (a == "--mainnet") {
-      // Accepted for backward CLI compatibility; mainnet is always selected.
+      std::cerr << "--mainnet is not needed in mainnet-only build; remove this flag\n";
+      return std::nullopt;
       cfg.dns_seeds = true;
     } else if (a == "--node-id") {
       auto v = next(a);

@@ -119,6 +119,7 @@ class Node {
 
   // Test hooks.
   bool inject_vote_for_test(const Vote& vote);
+  bool inject_propose_for_test(const Block& block);
   bool inject_tx_for_test(const Tx& tx, bool relay);
   bool pause_proposals_for_test(bool pause);
   std::size_t mempool_size_for_test() const;
@@ -132,6 +133,7 @@ class Node {
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   std::uint16_t p2p_port_for_test() const;
+  std::optional<Block> build_proposal_for_test(std::uint64_t height, std::uint32_t round);
 
   static std::vector<crypto::KeyPair> deterministic_test_keypairs();
 

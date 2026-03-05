@@ -15,7 +15,7 @@ int main(int argc, char** argv) {
   if (!cfg.has_value()) {
     std::cerr
         << "usage: selfcoin-lightserver [--db <dir>] [--bind 127.0.0.1] [--port <p>] [--relay-host 127.0.0.1] "
-           "[--relay-port <p2p>] [--devnet|--testnet|--mainnet|--nextnet] [--devnet-initial-active N] [--max-committee N]\n";
+           "[--relay-port <p2p>] [--mainnet] [--max-committee N]\n";
     return 1;
   }
 

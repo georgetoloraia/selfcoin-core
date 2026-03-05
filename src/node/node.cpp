@@ -79,7 +79,7 @@ Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
 
 Node::~Node() { stop(); }
 
-std::vector<crypto::KeyPair> Node::devnet_keypairs() {
+std::vector<crypto::KeyPair> Node::deterministic_test_keypairs() {
   std::vector<crypto::KeyPair> out;
   for (int i = 1; i <= 16; ++i) {
     std::array<std::uint8_t, 32> seed{};
@@ -92,16 +92,7 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 
 bool Node::init() {
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
-  if (cfg_.testnet && cfg_.min_relay_fee == 0) cfg_.min_relay_fee = 1000;
-  if (cfg_.mainnet) {
-    genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
-  } else if (cfg_.devnet) {
-    genesis_source_hint_ = "devnet";
-  } else if (cfg_.nextnet) {
-    genesis_source_hint_ = "nextnet";
-  } else {
-    genesis_source_hint_ = "file";
-  }
+  genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   cfg_.db_path = expand_user_home(cfg_.db_path);
   const std::filesystem::path dbp(cfg_.db_path);
   const auto parent = dbp.parent_path();
@@ -123,16 +114,14 @@ bool Node::init() {
   activation_params_.activation_delay_blocks = cfg_.network.activation_delay_blocks;
   activation_state_.current_version = activation_params_.initial_version;
   p2p::AddrPolicy addr_policy;
-  if (cfg_.mainnet) {
-    addr_policy.required_port = cfg_.network.p2p_default_port;
-    addr_policy.reject_unroutable = true;
-  }
+  addr_policy.required_port = cfg_.network.p2p_default_port;
+  addr_policy.reject_unroutable = true;
   addrman_.set_policy(addr_policy);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
   }
-  if (cfg_.mainnet && !init_mainnet_genesis()) {
+  if (!init_mainnet_genesis()) {
     std::cerr << "mainnet genesis init failed\n";
     return false;
   }
@@ -168,57 +157,28 @@ bool Node::init() {
   }
 
   {
-    bool key_loaded = false;
-    if (cfg_.mainnet || cfg_.nextnet || !cfg_.validator_key_file.empty()) {
-      const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
-                                                        ? keystore::default_validator_keystore_path(cfg_.db_path)
-                                                        : cfg_.validator_key_file);
-      keystore::ValidatorKey vk;
-      std::string kerr;
-      if (keystore::keystore_exists(key_path)) {
-        if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
-          std::cerr << "failed to load validator keystore: " << kerr << "\n";
-          return false;
-        }
-      } else {
-        if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
-                                                 keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
-                                                 &kerr)) {
-          std::cerr << "failed to create validator keystore: " << kerr << "\n";
-          return false;
-        }
-        log_line("created validator keystore path=" + key_path);
-      }
-      local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
-      local_key_.public_key = vk.pubkey;
-      log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
-      key_loaded = true;
-    }
-
-    const auto keys = devnet_keypairs();
-    if (!key_loaded) {
-      if (keys.empty()) {
-        std::cerr << "no key material available\n";
+    const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
+                                                      ? keystore::default_validator_keystore_path(cfg_.db_path)
+                                                      : cfg_.validator_key_file);
+    keystore::ValidatorKey vk;
+    std::string kerr;
+    if (keystore::keystore_exists(key_path)) {
+      if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
+        std::cerr << "failed to load validator keystore: " << kerr << "\n";
         return false;
       }
-      const int safe_node_id = std::max(0, cfg_.node_id);
-      local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
-    }
-
-    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet || cfg_.nextnet)) {
-      const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
-      for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
-        const auto& kp = keys[idx];
-        consensus::ValidatorInfo vi;
-        vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
-        vi.joined_height = 0;
-        vi.has_bond = (idx < n_active);
-        vi.bond_outpoint = OutPoint{zero_hash(), 0};
-        vi.unbond_height = 0;
-        validators_.upsert(kp.public_key, vi);
-        db_.put_validator(kp.public_key, vi);
+    } else {
+      if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
+                                               keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
+                                               &kerr)) {
+        std::cerr << "failed to create validator keystore: " << kerr << "\n";
+        return false;
       }
+      log_line("created validator keystore path=" + key_path);
     }
+    local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
+    local_key_.public_key = vk.pubkey;
+    log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
     is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
   }
 
@@ -229,10 +189,10 @@ bool Node::init() {
   load_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
-  if ((cfg_.testnet || cfg_.mainnet || cfg_.nextnet) && cfg_.seeds.empty()) {
+  if (cfg_.seeds.empty()) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
   }
-  if ((cfg_.mainnet || cfg_.testnet || cfg_.nextnet) && cfg_.dns_seeds) {
+  if (cfg_.dns_seeds) {
     dns_seed_peers_ = resolve_dns_seeds_once();
     for (const auto& d : dns_seed_peers_) bootstrap_peers_.push_back(d);
   }
@@ -289,7 +249,7 @@ bool Node::init() {
           } else if (klass == "TLS") {
             log_line("peer sent TLS handshake bytes; do not place TLS/proxy in front of P2P port");
           } else if (token_value(detail, "reason") == "MAGIC_MISMATCH") {
-            log_line("magic mismatch: peer is likely on a different network (devnet/testnet/mainnet)");
+            log_line("magic mismatch: peer is likely on a different network");
           }
         }
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
@@ -1049,7 +1009,7 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
     if (!mempool_.accept_tx(tx, utxos_, &err, cfg_.min_relay_fee, &fee)) {
       return false;
     }
-    if (cfg_.testnet && fee < cfg_.min_relay_fee) return false;
+    if (fee < cfg_.min_relay_fee) return false;
     txid = tx.txid();
     log_line("mempool-accept txid=" + hex_encode32(txid) + " mempool_size=" + std::to_string(mempool_.size()));
   }
@@ -1465,18 +1425,18 @@ std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
 
   consensus::ValidatorRegistry replay_validators;
   UtxoSet replay_utxos;
-
-  if (cfg_.devnet || cfg_.testnet || cfg_.nextnet) {
-    const auto keys = devnet_keypairs();
-    const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
-    for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
-      consensus::ValidatorInfo vi;
-      vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
-      vi.joined_height = 0;
-      vi.has_bond = (idx < n_active);
-      vi.bond_outpoint = OutPoint{zero_hash(), 0};
-      vi.unbond_height = 0;
-      replay_validators.upsert(keys[idx].public_key, vi);
+  if (auto gj = db_.get("G:J"); gj.has_value()) {
+    const std::string js(gj->begin(), gj->end());
+    if (auto gd = genesis::parse_json(js); gd.has_value()) {
+      for (const auto& pub : gd->initial_validators) {
+        consensus::ValidatorInfo vi;
+        vi.status = consensus::ValidatorStatus::ACTIVE;
+        vi.joined_height = 0;
+        vi.has_bond = true;
+        vi.bond_outpoint = OutPoint{zero_hash(), 0};
+        vi.unbond_height = 0;
+        replay_validators.upsert(pub, vi);
+      }
     }
   }
 
@@ -1795,7 +1755,6 @@ std::string Node::peer_ip_for(int peer_id) const {
 
 std::optional<p2p::NetAddress> Node::addrman_address_for_peer(const p2p::PeerInfo& info) const {
   if (info.ip.empty()) return std::nullopt;
-  if (cfg_.mainnet) return p2p::NetAddress{info.ip, cfg_.network.p2p_default_port};
   if (!info.inbound) {
     auto parsed = p2p::parse_endpoint(info.endpoint);
     if (parsed.has_value()) return *parsed;
@@ -1883,7 +1842,7 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
   cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
-  cfg.network = devnet_network();
+  cfg.network = mainnet_network();
   cfg.p2p_port = cfg.network.p2p_default_port;
   cfg.max_committee = cfg.network.max_committee;
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
@@ -1903,42 +1862,9 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       return std::string(argv[++i]);
     };
 
-    if (a == "--devnet") {
-      cfg.devnet = true;
-      cfg.testnet = false;
-      cfg.mainnet = false;
-      cfg.nextnet = false;
-      cfg.dns_seeds = false;
-      cfg.network = devnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--testnet") {
-      cfg.testnet = true;
-      cfg.devnet = false;
-      cfg.mainnet = false;
-      cfg.nextnet = false;
+    if (a == "--mainnet") {
+      // Accepted for backward CLI compatibility; mainnet is always selected.
       cfg.dns_seeds = true;
-      cfg.network = testnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--mainnet") {
-      cfg.mainnet = true;
-      cfg.devnet = false;
-      cfg.testnet = false;
-      cfg.nextnet = false;
-      cfg.dns_seeds = true;
-      cfg.network = mainnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--nextnet") {
-      cfg.nextnet = true;
-      cfg.mainnet = false;
-      cfg.devnet = false;
-      cfg.testnet = false;
-      cfg.dns_seeds = true;
-      cfg.network = nextnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -2008,10 +1934,6 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     } else if (a == "--public") {
       cfg.public_mode = true;
       cfg.listen = true;
-    } else if (a == "--devnet-initial-active") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.devnet_initial_active_validators = std::stoi(*v);
     } else if (a == "--max-committee") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -2065,8 +1987,8 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     }
   }
 
-  if (cfg.mainnet && !cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
-    std::cerr << "--genesis override on --mainnet requires --allow-unsafe-genesis-override\n";
+  if (!cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
+    std::cerr << "--genesis override on mainnet requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
   }
   if (cfg.validator_passphrase.empty() && !validator_passphrase_env.empty()) {

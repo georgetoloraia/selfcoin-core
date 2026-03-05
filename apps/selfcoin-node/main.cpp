@@ -14,7 +14,7 @@ void on_sigint(int) { g_stop = 1; }
 int main(int argc, char** argv) {
   auto cfg = selfcoin::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: selfcoin-node [--devnet|--testnet|--mainnet|--nextnet] --node-id <id> [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
+    std::cerr << "usage: selfcoin-node [--mainnet] [--node-id <id>] [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
                  "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] "
                  "[--public] [--listen] [--bind <ip>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "

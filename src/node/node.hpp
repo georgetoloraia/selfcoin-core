@@ -26,11 +26,7 @@
 namespace selfcoin::node {
 
 struct NodeConfig {
-  bool devnet{true};
-  bool testnet{false};
-  bool mainnet{false};
-  bool nextnet{false};
-  NetworkConfig network{devnet_network()};
+  NetworkConfig network{mainnet_network()};
   bool allow_unsafe_genesis_override{false};
   std::string validator_key_file;
   std::string validator_passphrase;
@@ -38,7 +34,7 @@ struct NodeConfig {
   std::string bind_ip{"127.0.0.1"};
   bool listen{true};
   bool public_mode{false};
-  bool dns_seeds{false};
+  bool dns_seeds{true};
   std::size_t outbound_target{8};
   std::size_t max_inbound{64};
   std::uint16_t p2p_port{18444};
@@ -48,7 +44,6 @@ struct NodeConfig {
   std::string genesis_path;
   bool disable_p2p{false};
   bool log_json{false};
-  int devnet_initial_active_validators{4};
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};
   std::uint32_t frame_timeout_ms{3'000};
@@ -133,7 +128,7 @@ class Node {
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   std::uint16_t p2p_port_for_test() const;
 
-  static std::vector<crypto::KeyPair> devnet_keypairs();
+  static std::vector<crypto::KeyPair> deterministic_test_keypairs();
 
  private:
   void event_loop();
@@ -236,7 +231,7 @@ class Node {
   p2p::AddrMan addrman_{10'000};
   ChainId chain_id_{};
   std::optional<Hash32> expected_genesis_hash_;
-  std::string genesis_source_hint_{"devnet"};
+  std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;
   std::string last_bootstrap_source_{"none"};
   bool restart_debug_{false};

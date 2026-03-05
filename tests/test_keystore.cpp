@@ -52,7 +52,7 @@ TEST(test_keystore_rejects_wrong_passphrase) {
 
   keystore::ValidatorKey created;
   std::string err;
-  ASSERT_TRUE(keystore::create_validator_keystore(ks, "correct", "testnet", "tsc", std::nullopt, &created, &err));
+  ASSERT_TRUE(keystore::create_validator_keystore(ks, "correct", "mainnet", "sc", std::nullopt, &created, &err));
 
   keystore::ValidatorKey loaded;
   ASSERT_TRUE(!keystore::load_validator_keystore(ks, "wrong", &loaded, &err));

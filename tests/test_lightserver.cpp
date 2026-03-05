@@ -8,10 +8,13 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
 #include "address/address.hpp"
 #include "crypto/hash.hpp"
+#include "genesis/genesis.hpp"
+#include "keystore/validator_keystore.hpp"
 #include "lightserver/server.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
@@ -21,6 +24,91 @@
 using namespace selfcoin;
 
 namespace {
+
+std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id) {
+  std::array<std::uint8_t, 32> seed{};
+  const int i = node_id + 1;
+  for (std::size_t j = 0; j < seed.size(); ++j) seed[j] = static_cast<std::uint8_t>(i * 19 + static_cast<int>(j));
+  return seed;
+}
+
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 1) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  if (keys.size() < n_validators) return false;
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = static_cast<std::uint32_t>(n_validators);
+  d.initial_committee_params.min_committee = static_cast<std::uint32_t>(n_validators);
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
+  d.seeds = mainnet_network().default_seeds;
+  d.note = "lightserver-tests";
+  d.initial_validators.clear();
+  for (std::size_t i = 0; i < n_validators; ++i) d.initial_validators.push_back(keys[i].public_key);
+
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+  std::ofstream out(path, std::ios::trunc);
+  if (!out.good()) return false;
+  out << genesis::to_json(d);
+  return out.good();
+}
+
+struct Cluster {
+  std::vector<std::unique_ptr<node::Node>> nodes;
+  Cluster() = default;
+  Cluster(const Cluster&) = delete;
+  Cluster& operator=(const Cluster&) = delete;
+  Cluster(Cluster&&) = default;
+  Cluster& operator=(Cluster&&) = default;
+  ~Cluster() {
+    for (auto& n : nodes) {
+      if (n) n->stop();
+    }
+  }
+};
+
+Cluster make_cluster(const std::string& base, int node_count = 4) {
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  if (!write_mainnet_genesis_file(gpath, static_cast<std::size_t>(node_count))) {
+    throw std::runtime_error("failed to write genesis");
+  }
+
+  Cluster c;
+  c.nodes.reserve(static_cast<std::size_t>(node_count));
+  for (int i = 0; i < node_count; ++i) {
+    node::NodeConfig cfg;
+    cfg.node_id = i;
+    cfg.disable_p2p = true;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.max_committee = static_cast<std::size_t>(node_count);
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    keystore::ValidatorKey created_key;
+    std::string kerr;
+    if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                             deterministic_seed_for_node_id(i), &created_key, &kerr)) {
+      throw std::runtime_error("failed to create validator keystore");
+    }
+    auto n = std::make_unique<node::Node>(cfg);
+    if (!n->init()) throw std::runtime_error("cluster init failed");
+    c.nodes.push_back(std::move(n));
+  }
+  for (auto& n : c.nodes) n->start();
+  return c;
+}
 
 bool wait_for(const std::function<bool()>& pred, std::chrono::milliseconds timeout) {
   const auto start = std::chrono::steady_clock::now();
@@ -71,21 +159,10 @@ std::optional<std::string> http_post_rpc(const std::string& host, std::uint16_t 
 
 TEST(test_lightserver_indexing_after_finalization) {
   const std::string base = "/tmp/selfcoin_light_idx";
-  std::filesystem::remove_all(base);
-  std::filesystem::create_directories(base);
+  auto cluster = make_cluster(base);
+  auto& node = *cluster.nodes[0];
 
-  node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.node_id = 0;
-  cfg.disable_p2p = true;
-  cfg.devnet_initial_active_validators = 1;
-  cfg.db_path = base + "/node0";
-  cfg.max_committee = 1;
-  node::Node node(cfg);
-  ASSERT_TRUE(node.init());
-  node.start();
-
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 2);
   ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, std::chrono::seconds(30)));
 
@@ -104,7 +181,7 @@ TEST(test_lightserver_indexing_after_finalization) {
   ASSERT_TRUE(wait_for([&]() { return !node.mempool_contains_for_test(txid); }, std::chrono::seconds(30)));
 
   storage::DB db;
-  ASSERT_TRUE(db.open_readonly(cfg.db_path));
+  ASSERT_TRUE(db.open_readonly(base + "/node0"));
   auto loc = db.get_tx_index(txid);
   ASSERT_TRUE(loc.has_value());
   ASSERT_TRUE(loc->tx_bytes == tx->serialize());
@@ -118,28 +195,15 @@ TEST(test_lightserver_indexing_after_finalization) {
   }
   ASSERT_TRUE(found);
 
-  node.stop();
 }
 
 TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   const std::string base = "/tmp/selfcoin_light_rpc";
-  std::filesystem::remove_all(base);
-  std::filesystem::create_directories(base);
-
-  node::NodeConfig ncfg;
-  ncfg.devnet = true;
-  ncfg.node_id = 0;
-  ncfg.disable_p2p = true;
-  ncfg.devnet_initial_active_validators = 1;
-  ncfg.max_committee = 1;
-  ncfg.db_path = base + "/node0";
-  ncfg.p2p_port = 19040;
-  auto node = std::make_unique<node::Node>(ncfg);
-  ASSERT_TRUE(node->init());
-  node->start();
+  auto cluster = make_cluster(base);
+  auto& node = cluster.nodes[0];
   ASSERT_TRUE(wait_for([&]() { return node->status().height >= 6; }, std::chrono::seconds(30)));
 
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   const auto sender_pkh = crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end()));
   OutPoint spend_op{};
   auto spend_out = node->find_utxo_by_pubkey_hash_for_test(sender_pkh, &spend_op);
@@ -154,13 +218,10 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   ASSERT_TRUE(node->inject_tx_for_test(*tx, false));
   ASSERT_TRUE(wait_for([&]() { return !node->mempool_contains_for_test(txid); }, std::chrono::seconds(45)));
   const auto blk_hash = node->status().tip_hash;
-  node->stop();
 
   lightserver::Config lcfg;
-  lcfg.db_path = ncfg.db_path;
+  lcfg.db_path = base + "/node0";
   lcfg.bind_ip = "127.0.0.1";
-  lcfg.devnet = true;
-  lcfg.devnet_initial_active_validators = 1;
   lcfg.max_committee = 1;
   lcfg.tx_relay_host = "127.0.0.1";
   lcfg.tx_relay_port = 29999;  // expected to be unavailable in test env

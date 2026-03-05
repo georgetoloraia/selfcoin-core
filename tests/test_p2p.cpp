@@ -9,7 +9,7 @@ using namespace selfcoin;
 TEST(test_version_message_v07_roundtrip) {
   p2p::VersionMsg v;
   v.proto_version = 7;
-  v.network_id = devnet_network().network_id;
+  v.network_id = mainnet_network().network_id;
   v.feature_flags = 0xA5A5;
   v.services = 11;
   v.timestamp = 22;

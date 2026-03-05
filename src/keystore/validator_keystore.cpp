@@ -130,8 +130,8 @@ std::string default_validator_keystore_path(const std::string& db_dir) {
 }
 
 std::string hrp_for_network(const std::string& network_name) {
-  if (network_name == "mainnet") return "sc";
-  return "tsc";
+  (void)network_name;
+  return "sc";
 }
 
 bool create_validator_keystore(const std::string& path, const std::string& passphrase, const std::string& network_name,

@@ -142,17 +142,22 @@ TEST(test_activation_malformed_coinbase_signal_is_ignored) {
   ASSERT_EQ(s.pending_activation_height, 6u);
 }
 
-TEST(test_node_parse_args_nextnet) {
-  std::vector<std::string> args = {"selfcoin-node", "--nextnet", "--node-id", "3", "--disable-p2p"};
+TEST(test_node_parse_args_mainnet_only) {
+  std::vector<std::string> args = {"selfcoin-node", "--node-id", "3", "--disable-p2p"};
   std::vector<char*> argv;
   argv.reserve(args.size());
   for (auto& s : args) argv.push_back(s.data());
   auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
   ASSERT_TRUE(cfg.has_value());
-  ASSERT_TRUE(cfg->nextnet);
-  ASSERT_EQ(cfg->network.name, std::string("nextnet"));
-  ASSERT_EQ(cfg->network.activation_enabled, true);
+  ASSERT_EQ(cfg->network.name, std::string("mainnet"));
+  ASSERT_EQ(cfg->network.activation_enabled, false);
   ASSERT_EQ(cfg->network.initial_consensus_version, 1u);
+
+  std::vector<std::string> bad = {"selfcoin-node", "--nextnet", "--node-id", "3"};
+  std::vector<char*> bad_argv;
+  bad_argv.reserve(bad.size());
+  for (auto& s : bad) bad_argv.push_back(s.data());
+  ASSERT_TRUE(!node::parse_args(static_cast<int>(bad_argv.size()), bad_argv.data()).has_value());
 }
 
 void register_activation_tests() {}

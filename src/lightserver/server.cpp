@@ -18,7 +18,7 @@
 #include "common/paths.hpp"
 #include "consensus/validators.hpp"
 #include "crypto/hash.hpp"
-#include "node/node.hpp"
+#include "genesis/genesis.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "utxo/validate.hpp"
@@ -221,15 +221,16 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
 
   consensus::ValidatorRegistry vr;
   UtxoSet utxos;
-  if (cfg_.devnet) {
-    const auto keys = node::Node::devnet_keypairs();
-    const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
-    for (int i = 0; i < static_cast<int>(keys.size()); ++i) {
-      consensus::ValidatorInfo vi;
-      vi.status = (i < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
-      vi.has_bond = (i < n_active);
-      vi.joined_height = 0;
-      vr.upsert(keys[i].public_key, vi);
+  if (auto gj = db_.get("G:J"); gj.has_value()) {
+    const std::string js(gj->begin(), gj->end());
+    if (auto gd = genesis::parse_json(js); gd.has_value()) {
+      for (const auto& pub : gd->initial_validators) {
+        consensus::ValidatorInfo vi;
+        vi.status = consensus::ValidatorStatus::ACTIVE;
+        vi.has_bond = true;
+        vi.joined_height = 0;
+        vr.upsert(pub, vi);
+      }
     }
   }
 
@@ -490,7 +491,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
 
 std::optional<Config> parse_args(int argc, char** argv) {
   Config cfg;
-  cfg.network = devnet_network();
+  cfg.network = mainnet_network();
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
   cfg.port = cfg.network.lightserver_default_port;
   cfg.tx_relay_port = cfg.network.p2p_default_port;
@@ -528,44 +529,8 @@ std::optional<Config> parse_args(int argc, char** argv) {
       if (!v) return std::nullopt;
       cfg.tx_relay_port = static_cast<std::uint16_t>(std::stoul(*v));
       relay_port_explicit = true;
-    } else if (a == "--devnet") {
-      cfg.devnet = true;
-      cfg.testnet = false;
-      cfg.mainnet = false;
-      cfg.network = devnet_network();
-      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
-      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--testnet") {
-      cfg.testnet = true;
-      cfg.devnet = false;
-      cfg.mainnet = false;
-      cfg.network = testnet_network();
-      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
-      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--mainnet") {
-      cfg.mainnet = true;
-      cfg.devnet = false;
-      cfg.testnet = false;
-      cfg.nextnet = false;
-      cfg.network = mainnet_network();
-      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
-      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--nextnet") {
-      cfg.nextnet = true;
-      cfg.mainnet = false;
-      cfg.devnet = false;
-      cfg.testnet = false;
-      cfg.network = nextnet_network();
-      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
-      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--devnet-initial-active") {
-      auto v = next();
-      if (!v) return std::nullopt;
-      cfg.devnet_initial_active_validators = std::stoi(*v);
+      // Accepted for backward CLI compatibility; mainnet is always selected.
     } else if (a == "--max-committee") {
       auto v = next();
       if (!v) return std::nullopt;

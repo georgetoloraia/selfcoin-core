@@ -33,10 +33,7 @@ struct NetworkConfig {
   std::vector<std::string> default_seeds;
 };
 
-const NetworkConfig& devnet_network();
-const NetworkConfig& testnet_network();
 const NetworkConfig& mainnet_network();
-const NetworkConfig& nextnet_network();
-const NetworkConfig& network_by_name(const std::string& name);
+const NetworkConfig& network_by_name(const std::string& name);  // mainnet only
 
 }  // namespace selfcoin

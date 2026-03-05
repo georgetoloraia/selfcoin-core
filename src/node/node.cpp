@@ -2889,24 +2889,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
-    } else if (a == "--activation-enabled") {
-      cfg.activation_enabled_override = true;
-    } else if (a == "--activation-max-version") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_max_version_override = static_cast<std::uint32_t>(std::stoul(*v));
-    } else if (a == "--activation-window-blocks") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
-    } else if (a == "--activation-threshold-percent") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
-    } else if (a == "--activation-delay-blocks") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_delay_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-enabled" || a == "--activation-max-version" || a == "--activation-window-blocks" ||
+               a == "--activation-threshold-percent" || a == "--activation-delay-blocks") {
+      std::cerr << "activation flags are not supported in fixed-cv7 mode\n";
+      return std::nullopt;
     } else if (a == "--validator-min-bond") {
       auto v = next(a);
       if (!v) return std::nullopt;

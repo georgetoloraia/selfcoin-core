@@ -1948,7 +1948,7 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "genesis load failed: " << err << "\n";
     return false;
   }
-  if (!genesis::validate_document(*doc, cfg_.network, &err, 4)) {
+  if (!genesis::validate_document(*doc, cfg_.network, &err, 2)) {
     std::cerr << "genesis validation failed: " << err << "\n";
     return false;
   }

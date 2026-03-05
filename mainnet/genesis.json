@@ -7,14 +7,12 @@
   "genesis_time_unix": 1735689600,
   "initial_height": 0,
   "initial_validators": [
-    "41a8bb1006fe0d973bfbc1bf46843a1a5829a4e44deb63b2c1d6e423e756b606",
-    "2ef12bfd4b305a75f0e14cc93836b53cfcefbbcfaf1382c347e538dca29626ed",
-    "a0d5dbc324bd67c12b00e7e7995549ba4530f59e79490ce5b4c89c87dcae2239",
-    "f28bf89cddc6b57fe6a39a8ebee874067fc1dc68ae84a1914125ed5beb8ea806"
+    "3ae5ced7dd151d5fca1913fb1ef646e9390dd864d581d8ff01b9b910bb3fe97b",
+    "97e5ca9c7f021cde712795f57ac79c5ab820db41b4837b3ac63707babffa0ad6"
   ],
-  "initial_active_set_size": 4,
+  "initial_active_set_size": 2,
   "initial_committee_params": {
-    "min_committee": 4,
+    "min_committee": 2,
     "max_committee": 128,
     "sizing_rule": "min(MAX_COMMITTEE,ACTIVE_SIZE)",
     "C": 2
@@ -24,5 +22,5 @@
     "seed1.mainnet.selfcoin.example:19440",
     "seed2.mainnet.selfcoin.example:19440"
   ],
-  "note": "template genesis for deterministic tooling and dry-runs"
+  "note": "mainnet genesis with two initial validators"
 }

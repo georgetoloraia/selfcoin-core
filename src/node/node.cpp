@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +72,36 @@ std::string token_value(const std::string& s, const std::string& key) {
   auto end = s.find(' ', pos + needle.size());
   if (end == std::string::npos) end = s.size();
   return s.substr(pos + needle.size(), end - (pos + needle.size()));
+}
+
+std::string ascii_lower(std::string s) {
+  for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return s;
+}
+
+std::string network_id_hex(const NetworkConfig& cfg) {
+  return hex_encode(Bytes(cfg.network_id.begin(), cfg.network_id.end()));
+}
+
+std::string local_software_version_fingerprint(const NetworkConfig& cfg, const ChainId& chain_id, std::uint32_t cv) {
+  std::ostringstream oss;
+  oss << "selfcoin-node/0.7"
+      << ";genesis=" << chain_id.genesis_hash_hex << ";network_id=" << network_id_hex(cfg) << ";cv=" << cv;
+  return oss.str();
+}
+
+std::optional<std::string> software_fingerprint_value(const std::string& ua, const std::string& key) {
+  const std::string needle = key + "=";
+  std::size_t start = 0;
+  while (start <= ua.size()) {
+    std::size_t end = ua.find(';', start);
+    if (end == std::string::npos) end = ua.size();
+    const std::string part = ua.substr(start, end - start);
+    if (part.rfind(needle, 0) == 0) return part.substr(needle.size());
+    if (end == ua.size()) break;
+    start = end + 1;
+  }
+  return std::nullopt;
 }
 
 std::mutex g_local_bus_mu;
@@ -949,7 +980,8 @@ void Node::send_version(int peer_id) {
   v.nonce = static_cast<std::uint32_t>(cfg_.node_id + 1000);
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
-  v.node_software_version = "selfcoin-node/0.7";
+  v.node_software_version =
+      local_software_version_fingerprint(cfg_.network, chain_id_, activation_state_.current_version);
 
   (void)p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   p2p_.mark_handshake_tx(peer_id, true, false);
@@ -994,6 +1026,20 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       }
       log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=unsupported-protocol peer_proto=" +
                std::to_string(v->proto_version) + " local_proto=" + std::to_string(cfg_.network.protocol_version));
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    const std::string local_genesis = ascii_lower(chain_id_.genesis_hash_hex);
+    const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
+    const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
+    const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
+    if (peer_genesis.has_value() && ascii_lower(*peer_genesis) != local_genesis) {
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=genesis-fingerprint-mismatch");
+      p2p_.disconnect_peer(peer_id);
+      return;
+    }
+    if (peer_nid.has_value() && ascii_lower(*peer_nid) != local_nid) {
+      log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-fingerprint-mismatch");
       p2p_.disconnect_peer(peer_id);
       return;
     }

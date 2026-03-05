@@ -23,7 +23,11 @@ int main(int argc, char** argv) {
                  "[--invalid-frame-ban-threshold <n>] [--invalid-frame-window-seconds <s>] "
                  "[--min-relay-fee <sats>] [--activation-enabled] [--activation-max-version <n>] "
                  "[--activation-window-blocks <n>] [--activation-threshold-percent <n>] "
-                 "[--activation-delay-blocks <n>]\n";
+                 "[--activation-delay-blocks <n>] "
+                 "[--validator-min-bond <u64>] [--validator-warmup-blocks <n>] [--validator-cooldown-blocks <n>] "
+                 "[--validator-join-limit-window-blocks <n>] [--validator-join-limit-max-new <n>] "
+                 "[--liveness-window-blocks <n>] [--miss-rate-suspend-threshold-percent <n>] "
+                 "[--miss-rate-exit-threshold-percent <n>] [--suspend-duration-blocks <n>]\n";
     return 1;
   }
 

@@ -80,12 +80,18 @@ bool v3_active_for_height(const consensus::ActivationState& st, const consensus:
   return params.enabled && consensus::version_for_height(st, params, height) >= 3;
 }
 
+bool v4_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 4;
+}
+
 struct StateRootsV3 {
   Hash32 utxo_root{};
   Hash32 validators_root{};
 };
 
-StateRootsV3 compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators) {
+StateRootsV3 compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators,
+                                     std::uint32_t consensus_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
@@ -95,7 +101,8 @@ StateRootsV3 compute_roots_for_state(const UtxoSet& utxos, const consensus::Vali
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(validators.all().size());
   for (const auto& [pub, info] : validators.all()) {
-    validator_leaves.push_back({consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info)});
+    validator_leaves.push_back(
+        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, consensus_version)});
   }
 
   StateRootsV3 roots;
@@ -113,6 +120,10 @@ std::string root_index_key(const std::string& kind, std::uint64_t height) {
   w.u64le(height);
   return "ROOT:" + kind + ":" + hex_encode(w.data());
 }
+
+constexpr const char* kV4JoinWindowStartKey = "PV4:JOIN_WINDOW_START";
+constexpr const char* kV4JoinWindowCountKey = "PV4:JOIN_WINDOW_COUNT";
+constexpr const char* kV4LivenessEpochStartKey = "PV4:LIVENESS_EPOCH_START";
 
 std::string marker_error_to_string(consensus::MarkerError err) {
   switch (err) {
@@ -140,7 +151,7 @@ void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vecto
 }
 
 StateRootsV3 persist_v3_state_roots(storage::DB& db, std::uint64_t height, const UtxoSet& utxos,
-                                    const consensus::ValidatorRegistry& validators) {
+                                    const consensus::ValidatorRegistry& validators, std::uint32_t consensus_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
   utxo_leaves.reserve(utxos.size());
   for (const auto& [op, ue] : utxos) {
@@ -149,7 +160,8 @@ StateRootsV3 persist_v3_state_roots(storage::DB& db, std::uint64_t height, const
   std::vector<std::pair<Hash32, Bytes>> validator_leaves;
   validator_leaves.reserve(validators.all().size());
   for (const auto& [pub, info] : validators.all()) {
-    validator_leaves.push_back({consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info)});
+    validator_leaves.push_back(
+        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, consensus_version)});
   }
 
   sync_smt_tree(db, kSmtTreeUtxo, utxo_leaves);
@@ -168,7 +180,7 @@ StateRootsV3 persist_v3_state_roots(storage::DB& db, std::uint64_t height, const
 }
 
 void apply_validator_changes_in_memory(consensus::ValidatorRegistry* registry, const Block& block, const UtxoSet& pre_utxos,
-                                       std::uint64_t height) {
+                                       std::uint64_t height, bool enforce_v4) {
   if (!registry) return;
   for (size_t txi = 1; txi < block.txs.size(); ++txi) {
     const auto& tx = block.txs[txi];
@@ -188,8 +200,12 @@ void apply_validator_changes_in_memory(consensus::ValidatorRegistry* registry, c
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
-      if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-        registry->register_bond(pub, OutPoint{txid, out_i}, height);
+      if (is_validator_register_script(out.script_pubkey, &pub)) {
+        if (enforce_v4) {
+          (void)registry->register_bond(pub, OutPoint{txid, out_i}, height, out.value, nullptr);
+        } else if (out.value == BOND_AMOUNT) {
+          registry->register_bond_legacy(pub, OutPoint{txid, out_i}, height);
+        }
       }
     }
   }
@@ -198,12 +214,13 @@ void apply_validator_changes_in_memory(consensus::ValidatorRegistry* registry, c
 
 std::optional<StateRootsV3> compute_post_state_roots_for_block(const Block& block, const UtxoSet& pre_utxos,
                                                                 const consensus::ValidatorRegistry& pre_validators,
-                                                                std::uint64_t height) {
+                                                                std::uint64_t height, bool enforce_v4,
+                                                                std::uint32_t consensus_version) {
   UtxoSet post_utxos = pre_utxos;
   consensus::ValidatorRegistry post_validators = pre_validators;
-  apply_validator_changes_in_memory(&post_validators, block, pre_utxos, height);
+  apply_validator_changes_in_memory(&post_validators, block, pre_utxos, height, enforce_v4);
   apply_block_to_utxo(block, post_utxos);
-  return compute_roots_for_state(post_utxos, post_validators);
+  return compute_roots_for_state(post_utxos, post_validators, consensus_version);
 }
 
 }  // namespace
@@ -256,6 +273,33 @@ bool Node::init() {
     activation_params_.threshold_percent = *cfg_.activation_threshold_percent_override;
   if (cfg_.activation_delay_blocks_override.has_value())
     activation_params_.activation_delay_blocks = *cfg_.activation_delay_blocks_override;
+  v4_min_bond_ = cfg_.network.validator_min_bond;
+  v4_warmup_blocks_ = cfg_.network.validator_warmup_blocks;
+  v4_cooldown_blocks_ = cfg_.network.validator_cooldown_blocks;
+  v4_join_limit_window_blocks_ = cfg_.network.validator_join_limit_window_blocks;
+  v4_join_limit_max_new_ = cfg_.network.validator_join_limit_max_new;
+  v4_liveness_window_blocks_ = cfg_.network.liveness_window_blocks;
+  v4_miss_rate_suspend_threshold_percent_ = cfg_.network.miss_rate_suspend_threshold_percent;
+  v4_miss_rate_exit_threshold_percent_ = cfg_.network.miss_rate_exit_threshold_percent;
+  v4_suspend_duration_blocks_ = cfg_.network.suspend_duration_blocks;
+  if (cfg_.validator_min_bond_override.has_value()) v4_min_bond_ = *cfg_.validator_min_bond_override;
+  if (cfg_.validator_warmup_blocks_override.has_value()) v4_warmup_blocks_ = *cfg_.validator_warmup_blocks_override;
+  if (cfg_.validator_cooldown_blocks_override.has_value()) v4_cooldown_blocks_ = *cfg_.validator_cooldown_blocks_override;
+  if (cfg_.validator_join_limit_window_blocks_override.has_value())
+    v4_join_limit_window_blocks_ = *cfg_.validator_join_limit_window_blocks_override;
+  if (cfg_.validator_join_limit_max_new_override.has_value()) v4_join_limit_max_new_ = *cfg_.validator_join_limit_max_new_override;
+  if (cfg_.liveness_window_blocks_override.has_value()) v4_liveness_window_blocks_ = *cfg_.liveness_window_blocks_override;
+  if (cfg_.miss_rate_suspend_threshold_percent_override.has_value())
+    v4_miss_rate_suspend_threshold_percent_ = *cfg_.miss_rate_suspend_threshold_percent_override;
+  if (cfg_.miss_rate_exit_threshold_percent_override.has_value())
+    v4_miss_rate_exit_threshold_percent_ = *cfg_.miss_rate_exit_threshold_percent_override;
+  if (cfg_.suspend_duration_blocks_override.has_value()) v4_suspend_duration_blocks_ = *cfg_.suspend_duration_blocks_override;
+
+  validators_.set_rules(consensus::ValidatorRules{
+      .min_bond = v4_min_bond_,
+      .warmup_blocks = v4_warmup_blocks_,
+      .cooldown_blocks = v4_cooldown_blocks_,
+  });
   activation_state_.current_version = activation_params_.initial_version;
   if (activation_params_.enabled) {
     log_line("activation override enabled max_version=" + std::to_string(activation_params_.max_version) +
@@ -496,6 +540,7 @@ NodeStatus Node::status() const {
   s.consensus_version = activation_state_.current_version;
   s.pending_consensus_version = activation_state_.pending_version;
   s.pending_activation_height = activation_state_.pending_activation_height;
+  s.participation_eligible_signers = static_cast<std::uint64_t>(last_participation_eligible_signers_);
   return s;
 }
 
@@ -606,6 +651,16 @@ std::uint16_t Node::p2p_port_for_test() const { return cfg_.p2p_port; }
 
 std::optional<Block> Node::build_proposal_for_test(std::uint64_t height, std::uint32_t round) {
   return build_proposal_block(height, round);
+}
+
+std::pair<std::uint64_t, std::uint32_t> Node::v4_join_window_state_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return {v4_join_window_start_height_, v4_join_count_in_window_};
+}
+
+std::uint64_t Node::v4_liveness_epoch_start_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return v4_liveness_epoch_start_height_;
 }
 
 void Node::event_loop() {
@@ -893,20 +948,25 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         std::set<PubKey32> committee_set(committee.begin(), committee.end());
         std::set<PubKey32> seen;
         std::size_t valid_sigs = 0;
+        std::vector<FinalitySig> filtered_sigs;
+        filtered_sigs.reserve(blk->finality_proof.sigs.size());
         for (const auto& s : blk->finality_proof.sigs) {
           if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
           if (!seen.insert(s.validator_pubkey).second) continue;
           Bytes bid_bytes(bid.begin(), bid.end());
           if (!crypto::ed25519_verify(bid_bytes, s.signature, s.validator_pubkey)) continue;
           ++valid_sigs;
+          filtered_sigs.push_back(s);
         }
         if (valid_sigs >= quorum) {
+          if (!validate_v4_registration_rules(*blk, blk->header.height)) return;
           if (persist_finalized_block(*blk)) {
             std::vector<Hash32> confirmed_txids;
             confirmed_txids.reserve(blk->txs.size());
             for (const auto& tx : blk->txs) confirmed_txids.push_back(tx.txid());
             mempool_.remove_confirmed(confirmed_txids);
             UtxoSet pre_utxos = utxos_;
+            update_v4_liveness_from_finality(blk->header.height, blk->header.round, filtered_sigs);
             apply_validator_state_changes(*blk, pre_utxos, blk->header.height);
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
@@ -919,7 +979,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                 log_line("v3-marker-invalid mode=finalized-block error=" + marker_error_to_string(me));
                 return;
               }
-              const auto roots = persist_v3_state_roots(db_, blk->header.height, utxos_, validators_);
+              const std::uint32_t cv =
+                  consensus::version_for_height(activation_state_, activation_params_, blk->header.height);
+              const auto roots = persist_v3_state_roots(db_, blk->header.height, utxos_, validators_, cv);
               if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return;
             }
             finalized_height_ = blk->header.height;
@@ -1075,15 +1137,18 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
                                   [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
                                     return is_committee_member_for(pub, h, round);
                                   }};
-    const auto reward_signers = committee_for_height_round(msg.height, msg.round);
+    const auto reward_signers = reward_signers_for_height_round(msg.height, msg.round);
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
+    if (!validate_v4_registration_rules(*blk, msg.height)) return false;
 
     if (v3_active_for_height(activation_state_, activation_params_, msg.height)) {
       if (blk->txs.empty() || blk->txs[0].inputs.empty()) return false;
       const auto got = consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, nullptr);
       if (!got.has_value()) return false;
-      auto expected = compute_post_state_roots_for_block(*blk, utxos_, validators_, msg.height);
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, msg.height);
+      auto expected = compute_post_state_roots_for_block(*blk, utxos_, validators_, msg.height,
+                                                         v4_active_for_height(msg.height), cv);
       if (!expected.has_value()) return false;
       if (got->utxo_root != expected->utxo_root || got->validators_root != expected->validators_root) return false;
     }
@@ -1221,6 +1286,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   Block b = blk_it->second;
   b.finality_proof.sigs = filtered;
+  if (!validate_v4_registration_rules(b, height)) return false;
 
   if (!persist_finalized_block(b)) return false;
 
@@ -1229,6 +1295,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   for (const auto& tx : b.txs) confirmed_txids.push_back(tx.txid());
   mempool_.remove_confirmed(confirmed_txids);
   UtxoSet pre_utxos = utxos_;
+  update_v4_liveness_from_finality(height, round, filtered);
   apply_validator_state_changes(b, pre_utxos, height);
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
@@ -1238,7 +1305,8 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     consensus::MarkerError me = consensus::MarkerError::kNone;
     const auto got = consensus::find_scr3_roots_marker(b.txs[0].inputs[0].script_sig, &me);
     if (!got.has_value()) return false;
-    const auto roots = persist_v3_state_roots(db_, height, utxos_, validators_);
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+    const auto roots = persist_v3_state_roots(db_, height, utxos_, validators_, cv);
     if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return false;
   }
 
@@ -1310,8 +1378,8 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
     if (vr.ok) total_fees += vr.fee;
   }
 
-  const auto committee = committee_for_height_round(height, round);
-  const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, committee);
+  const auto reward_signers = reward_signers_for_height_round(height, round);
+  const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, reward_signers);
 
   {
     const auto pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
@@ -1332,7 +1400,8 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   b.txs.insert(b.txs.end(), picked.begin(), picked.end());
 
   if (v3_active_for_height(activation_state_, activation_params_, height)) {
-    auto roots = compute_post_state_roots_for_block(b, utxos_, validators_, height);
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+    auto roots = compute_post_state_roots_for_block(b, utxos_, validators_, height, v4_active_for_height(height), cv);
     if (!roots.has_value()) return std::nullopt;
     b.txs[0].inputs[0].script_sig =
         consensus::append_v3_roots_to_coinbase_script(b.txs[0].inputs[0].script_sig, roots->utxo_root, roots->validators_root);
@@ -1557,7 +1626,19 @@ bool Node::init_mainnet_genesis() {
       vr.upsert(pub, vi);
     }
     const UtxoSet empty_utxos;
-    (void)persist_v3_state_roots(db_, 0, empty_utxos, vr);
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, 0);
+    (void)persist_v3_state_roots(db_, 0, empty_utxos, vr, cv);
+  }
+  {
+    codec::ByteWriter w0;
+    w0.u64le(0);
+    (void)db_.put(kV4JoinWindowStartKey, w0.take());
+    codec::ByteWriter w1;
+    w1.u32le(0);
+    (void)db_.put(kV4JoinWindowCountKey, w1.take());
+    codec::ByteWriter w2;
+    w2.u64le(0);
+    (void)db_.put(kV4LivenessEpochStartKey, w2.take());
   }
   return db_.flush();
 }
@@ -1588,6 +1669,38 @@ bool Node::load_state() {
 
   if (auto act = db_.get_activation_state(); act.has_value()) {
     activation_state_ = *act;
+  }
+  if (auto b = db_.get(kV4JoinWindowStartKey); b.has_value()) {
+    (void)codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto s = r.u64le();
+      if (!s) return false;
+      v4_join_window_start_height_ = *s;
+      return true;
+    });
+  }
+  if (auto b = db_.get(kV4JoinWindowCountKey); b.has_value()) {
+    (void)codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto c = r.u32le();
+      if (!c) return false;
+      v4_join_count_in_window_ = *c;
+      return true;
+    });
+  }
+  bool loaded_liveness_epoch = false;
+  if (auto b = db_.get(kV4LivenessEpochStartKey); b.has_value()) {
+    loaded_liveness_epoch = codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto s = r.u64le();
+      if (!s) return false;
+      v4_liveness_epoch_start_height_ = *s;
+      return true;
+    });
+  }
+  if (!loaded_liveness_epoch) {
+    if (v4_liveness_window_blocks_ > 0) {
+      v4_liveness_epoch_start_height_ = (finalized_height_ / v4_liveness_window_blocks_) * v4_liveness_window_blocks_;
+    } else {
+      v4_liveness_epoch_start_height_ = 0;
+    }
   }
 
   if (validators_.all().empty() && finalized_height_ > 0) {
@@ -1622,7 +1735,8 @@ bool Node::load_state() {
   if (v3_active_for_height(activation_state_, activation_params_, finalized_height_)) {
     const auto existing = db_.get(root_index_key("UTXO", finalized_height_));
     if (!existing.has_value() || existing->size() != 32) {
-      (void)persist_v3_state_roots(db_, finalized_height_, utxos_, validators_);
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_);
+      (void)persist_v3_state_roots(db_, finalized_height_, utxos_, validators_, cv);
     }
   }
 
@@ -1631,6 +1745,25 @@ bool Node::load_state() {
 
 std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
   return committee_for_height_round(height, 0);
+}
+
+std::vector<PubKey32> Node::reward_signers_for_height_round(std::uint64_t height, std::uint32_t round) const {
+  auto committee = committee_for_height_round(height, round);
+  if (!v4_active_for_height(height)) return committee;
+
+  std::vector<PubKey32> out;
+  out.reserve(committee.size());
+  for (const auto& pub : committee) {
+    auto it = validators_.all().find(pub);
+    if (it == validators_.all().end()) continue;
+    const auto& vi = it->second;
+    if (vi.status == consensus::ValidatorStatus::SUSPENDED) continue;
+    if (vi.eligible_count_window == 0 || vi.participated_count_window > 0) {
+      out.push_back(pub);
+    }
+  }
+  if (out.empty()) return committee;
+  return out;
 }
 
 std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std::uint32_t round) const {
@@ -1649,6 +1782,7 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
     }
   } else {
     consensus::ValidatorRegistry replay_validators;
+    replay_validators.set_rules(validators_.rules());
     UtxoSet replay_utxos;
     if (auto gj = db_.get("G:J"); gj.has_value()) {
       const std::string js(gj->begin(), gj->end());
@@ -1751,7 +1885,97 @@ bool Node::is_committee_member_for(const PubKey32& pub, std::uint64_t height, st
   return std::find(committee.begin(), committee.end(), pub) != committee.end();
 }
 
+bool Node::v4_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v4_active_for_height(activation_state_, activation_params_, height);
+}
+
+bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t height) const {
+  if (!v4_active_for_height(height)) return true;
+
+  std::uint64_t window_start = v4_join_window_start_height_;
+  std::uint32_t window_count = v4_join_count_in_window_;
+  consensus::v4_advance_join_window(height, v4_join_limit_window_blocks_, &window_start, &window_count);
+
+  auto registry = validators_;
+  std::size_t new_regs = 0;
+  for (std::size_t txi = 0; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
+      PubKey32 pub{};
+      if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
+
+      std::string err;
+      if (!registry.can_register_bond(pub, height, out.value, &err)) return false;
+      if (v4_join_limit_window_blocks_ > 0 && v4_join_limit_max_new_ > 0 &&
+          window_count + static_cast<std::uint32_t>(new_regs + 1) > v4_join_limit_max_new_) {
+        return false;
+      }
+      if (!registry.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err)) return false;
+      ++new_regs;
+    }
+  }
+  return true;
+}
+
+void Node::update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
+                                            const std::vector<FinalitySig>& finality_sigs) {
+  if (!v4_active_for_height(height)) return;
+
+  const auto committee = committee_for_height_round(height, round);
+  if (committee.empty()) return;
+  const auto participants = consensus::committee_participants_from_finality(committee, finality_sigs);
+  std::set<PubKey32> participant_set(participants.begin(), participants.end());
+  last_participation_eligible_signers_ = participant_set.size();
+
+  auto& all = validators_.mutable_all();
+  for (const auto& pub : committee) {
+    auto it = all.find(pub);
+    if (it == all.end()) continue;
+    auto& info = it->second;
+    if (info.status != consensus::ValidatorStatus::ACTIVE && info.status != consensus::ValidatorStatus::SUSPENDED) continue;
+    info.liveness_window_start = v4_liveness_epoch_start_height_;
+    ++info.eligible_count_window;
+    if (participant_set.find(pub) != participant_set.end()) ++info.participated_count_window;
+  }
+
+  const bool evaluate =
+      consensus::v4_liveness_should_rollover(height, v4_liveness_epoch_start_height_, v4_liveness_window_blocks_);
+  if (!evaluate) return;
+
+  for (auto& [pub, info] : all) {
+    const std::uint64_t eligible = info.eligible_count_window;
+    const std::uint64_t participated = info.participated_count_window;
+    if (eligible >= 10) {
+      const std::uint64_t miss = (eligible >= participated) ? (eligible - participated) : 0;
+      const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
+      if (miss_rate >= v4_miss_rate_exit_threshold_percent_) {
+        info.status = consensus::ValidatorStatus::EXITING;
+        info.last_exit_height = height;
+        info.unbond_height = height;
+        info.penalty_strikes += 1;
+      } else if (miss_rate >= v4_miss_rate_suspend_threshold_percent_) {
+        info.status = consensus::ValidatorStatus::SUSPENDED;
+        info.suspended_until_height = height + v4_suspend_duration_blocks_;
+        info.penalty_strikes += 1;
+      }
+    }
+    info.eligible_count_window = 0;
+    info.participated_count_window = 0;
+    info.liveness_window_start = height + 1;
+    (void)db_.put_validator(pub, info);
+  }
+  v4_liveness_epoch_start_height_ =
+      consensus::v4_liveness_next_epoch_start(height, v4_liveness_epoch_start_height_, v4_liveness_window_blocks_);
+}
+
 void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
+  if (v4_active_for_height(height)) {
+    consensus::v4_advance_join_window(height, v4_join_limit_window_blocks_, &v4_join_window_start_height_,
+                                      &v4_join_count_in_window_);
+  }
+
   for (size_t txi = 1; txi < block.txs.size(); ++txi) {
     const auto& tx = block.txs[txi];
     for (const auto& in : tx.inputs) {
@@ -1776,13 +2000,30 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
-      if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-        validators_.register_bond(pub, OutPoint{txid, out_i}, height);
+      if (is_validator_register_script(out.script_pubkey, &pub)) {
+        std::string err;
+        if (validators_.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err)) {
+          if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
+            ++v4_join_count_in_window_;
+          }
+        } else if (!v4_active_for_height(height) && out.value == BOND_AMOUNT) {
+          // Preserve pre-v4 behavior.
+          validators_.register_bond_legacy(pub, OutPoint{txid, out_i}, height);
+        }
       }
     }
   }
 
   validators_.advance_height(height + 1);
+  codec::ByteWriter w_start;
+  w_start.u64le(v4_join_window_start_height_);
+  (void)db_.put(kV4JoinWindowStartKey, w_start.take());
+  codec::ByteWriter w_count;
+  w_count.u32le(v4_join_count_in_window_);
+  (void)db_.put(kV4JoinWindowCountKey, w_count.take());
+  codec::ByteWriter w_epoch;
+  w_epoch.u64le(v4_liveness_epoch_start_height_);
+  (void)db_.put(kV4LivenessEpochStartKey, w_epoch.take());
   for (const auto& [pub, info] : validators_.all()) {
     db_.put_validator(pub, info);
   }
@@ -2252,6 +2493,42 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.activation_delay_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-min-bond") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_min_bond_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-warmup-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_warmup_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-cooldown-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_cooldown_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-join-limit-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_join_limit_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-join-limit-max-new") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_join_limit_max_new_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--liveness-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.liveness_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--miss-rate-suspend-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.miss_rate_suspend_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--miss-rate-exit-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.miss_rate_exit_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--suspend-duration-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.suspend_duration_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

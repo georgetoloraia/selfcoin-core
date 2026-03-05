@@ -116,6 +116,7 @@ add_executable(selfcoin-tests
   tests/test_smt.cpp
   tests/test_activation.cpp
   tests/test_bonding.cpp
+  tests/test_validator_v4.cpp
   tests/test_mempool.cpp
   tests/test_hardening.cpp
   tests/test_genesis.cpp

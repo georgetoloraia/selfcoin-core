@@ -59,6 +59,15 @@ struct NodeConfig {
   std::optional<std::uint64_t> activation_window_blocks_override;
   std::optional<std::uint32_t> activation_threshold_percent_override;
   std::optional<std::uint64_t> activation_delay_blocks_override;
+  std::optional<std::uint64_t> validator_min_bond_override;
+  std::optional<std::uint64_t> validator_warmup_blocks_override;
+  std::optional<std::uint64_t> validator_cooldown_blocks_override;
+  std::optional<std::uint64_t> validator_join_limit_window_blocks_override;
+  std::optional<std::uint32_t> validator_join_limit_max_new_override;
+  std::optional<std::uint64_t> liveness_window_blocks_override;
+  std::optional<std::uint32_t> miss_rate_suspend_threshold_percent_override;
+  std::optional<std::uint32_t> miss_rate_exit_threshold_percent_override;
+  std::optional<std::uint64_t> suspend_duration_blocks_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -104,6 +113,7 @@ struct NodeStatus {
   std::uint32_t consensus_version{1};
   std::uint32_t pending_consensus_version{0};
   std::uint64_t pending_activation_height{0};
+  std::uint64_t participation_eligible_signers{0};
 };
 
 class Node {
@@ -134,6 +144,8 @@ class Node {
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   std::uint16_t p2p_port_for_test() const;
   std::optional<Block> build_proposal_for_test(std::uint64_t height, std::uint32_t round);
+  std::pair<std::uint64_t, std::uint32_t> v4_join_window_state_for_test() const;
+  std::uint64_t v4_liveness_epoch_start_for_test() const;
 
   static std::vector<crypto::KeyPair> deterministic_test_keypairs();
 
@@ -162,6 +174,7 @@ class Node {
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
   std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
   std::vector<PubKey32> committee_for_height_round(std::uint64_t height, std::uint32_t round) const;
+  std::vector<PubKey32> reward_signers_for_height_round(std::uint64_t height, std::uint32_t round) const;
   std::optional<PubKey32> leader_for_height_round(std::uint64_t height, std::uint32_t round) const;
   void load_persisted_peers();
   void persist_peers() const;
@@ -181,6 +194,10 @@ class Node {
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
   void apply_activation_signal(const Block& block, std::uint64_t height);
+  bool validate_v4_registration_rules(const Block& block, std::uint64_t height) const;
+  void update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
+                                        const std::vector<FinalitySig>& finality_sigs);
+  bool v4_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -215,6 +232,19 @@ class Node {
   std::uint64_t rejected_pre_handshake_{0};
   consensus::ActivationState activation_state_{};
   consensus::ActivationParams activation_params_{};
+  std::uint64_t v4_min_bond_{BOND_AMOUNT};
+  std::uint64_t v4_warmup_blocks_{WARMUP_BLOCKS};
+  std::uint64_t v4_cooldown_blocks_{0};
+  std::uint64_t v4_join_limit_window_blocks_{0};
+  std::uint32_t v4_join_limit_max_new_{0};
+  std::uint64_t v4_join_window_start_height_{0};
+  std::uint32_t v4_join_count_in_window_{0};
+  std::uint64_t v4_liveness_window_blocks_{10'000};
+  std::uint64_t v4_liveness_epoch_start_height_{0};
+  std::uint32_t v4_miss_rate_suspend_threshold_percent_{30};
+  std::uint32_t v4_miss_rate_exit_threshold_percent_{60};
+  std::uint64_t v4_suspend_duration_blocks_{1'000};
+  std::size_t last_participation_eligible_signers_{0};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

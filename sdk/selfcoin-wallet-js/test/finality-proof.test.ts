@@ -55,4 +55,24 @@ describe('finality proof verification', () => {
 
     expect(verifyFinalityProof(blockHashHex, sigs, committee)).toBe(false);
   });
+
+  it('rejects duplicate signer pubkeys as quorum spoofing', () => {
+    const blockHash = new Uint8Array(32);
+    for (let i = 0; i < blockHash.length; i++) blockHash[i] = (i * 5 + 9) & 0xff;
+    const blockHashHex = bytesToHex(blockHash);
+
+    const a = keypairFromSeed32(seed(21));
+    const b = keypairFromSeed32(seed(22));
+    const c = keypairFromSeed32(seed(23));
+    const committee = [a.pubkeyHex, b.pubkeyHex, c.pubkeyHex];
+
+    // quorum(3)=3; duplicate signer A should count once, so this must fail.
+    const sigA = bytesToHex(signEd25519(blockHash, a.privkeyHex));
+    const sigs = [
+      { pubkey_hex: a.pubkeyHex, sig_hex: sigA },
+      { pubkey_hex: a.pubkeyHex, sig_hex: sigA },
+      { pubkey_hex: b.pubkeyHex, sig_hex: bytesToHex(signEd25519(blockHash, b.privkeyHex)) },
+    ];
+    expect(verifyFinalityProof(blockHashHex, sigs, committee)).toBe(false);
+  });
 });

@@ -127,6 +127,13 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   w.bytes_fixed(info.bond_outpoint.txid);
   w.u32le(info.bond_outpoint.index);
   w.u64le(info.unbond_height);
+  w.u64le(info.eligible_count_window);
+  w.u64le(info.participated_count_window);
+  w.u64le(info.liveness_window_start);
+  w.u64le(info.suspended_until_height);
+  w.u64le(info.last_join_height);
+  w.u64le(info.last_exit_height);
+  w.u32le(info.penalty_strikes);
   return w.take();
 }
 
@@ -152,6 +159,22 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.has_bond = (*has_bond != 0);
         info.bond_outpoint = OutPoint{*txid, *idx};
         info.unbond_height = *unbond;
+        if (r.eof()) return true;
+        auto eligible = r.u64le();
+        auto participated = r.u64le();
+        auto lstart = r.u64le();
+        auto suspended = r.u64le();
+        auto last_join = r.u64le();
+        auto last_exit = r.u64le();
+        auto strikes = r.u32le();
+        if (!eligible || !participated || !lstart || !suspended || !last_join || !last_exit || !strikes) return false;
+        info.eligible_count_window = *eligible;
+        info.participated_count_window = *participated;
+        info.liveness_window_start = *lstart;
+        info.suspended_until_height = *suspended;
+        info.last_join_height = *last_join;
+        info.last_exit_height = *last_exit;
+        info.penalty_strikes = *strikes;
         return true;
       })) {
     return std::nullopt;

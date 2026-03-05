@@ -30,6 +30,15 @@ struct NetworkConfig {
   std::uint64_t activation_window_blocks{0};
   std::uint32_t activation_threshold_percent{0};
   std::uint64_t activation_delay_blocks{0};
+  std::uint64_t validator_min_bond{BOND_AMOUNT};
+  std::uint64_t validator_warmup_blocks{WARMUP_BLOCKS};
+  std::uint64_t validator_cooldown_blocks{0};
+  std::uint64_t validator_join_limit_window_blocks{0};
+  std::uint32_t validator_join_limit_max_new{0};
+  std::uint64_t liveness_window_blocks{10'000};
+  std::uint32_t miss_rate_suspend_threshold_percent{30};
+  std::uint32_t miss_rate_exit_threshold_percent{60};
+  std::uint64_t suspend_duration_blocks{1'000};
   std::vector<std::string> default_seeds;
 };
 

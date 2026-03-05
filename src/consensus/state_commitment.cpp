@@ -29,7 +29,7 @@ Hash32 validator_commitment_key(const PubKey32& pub) {
   return crypto::sha256(w.data());
 }
 
-Bytes validator_commitment_value(const ValidatorInfo& info) {
+Bytes validator_commitment_value_v3(const ValidatorInfo& info) {
   codec::ByteWriter w;
   w.u8(static_cast<std::uint8_t>(info.status));
   w.u64le(info.joined_height);
@@ -38,6 +38,29 @@ Bytes validator_commitment_value(const ValidatorInfo& info) {
   w.u32le(info.bond_outpoint.index);
   w.u64le(info.unbond_height);
   return w.take();
+}
+
+Bytes validator_commitment_value_v4(const ValidatorInfo& info) {
+  codec::ByteWriter w;
+  w.u8(static_cast<std::uint8_t>(info.status));
+  w.u64le(info.joined_height);
+  w.u8(info.has_bond ? 1 : 0);
+  w.bytes_fixed(info.bond_outpoint.txid);
+  w.u32le(info.bond_outpoint.index);
+  w.u64le(info.unbond_height);
+  w.u64le(info.eligible_count_window);
+  w.u64le(info.participated_count_window);
+  w.u64le(info.liveness_window_start);
+  w.u64le(info.suspended_until_height);
+  w.u64le(info.last_join_height);
+  w.u64le(info.last_exit_height);
+  w.u32le(info.penalty_strikes);
+  return w.take();
+}
+
+Bytes validator_commitment_value(const ValidatorInfo& info, std::uint32_t consensus_version) {
+  if (consensus_version >= 4) return validator_commitment_value_v4(info);
+  return validator_commitment_value_v3(info);
 }
 
 Bytes append_v3_roots_to_coinbase_script(const Bytes& base_script, const Hash32& utxo_root, const Hash32& validators_root) {

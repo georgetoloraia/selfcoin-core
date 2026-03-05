@@ -1,6 +1,7 @@
 #include "consensus/validators.hpp"
 
 #include <algorithm>
+#include <set>
 
 #include "codec/bytes.hpp"
 #include "crypto/hash.hpp"
@@ -9,13 +10,52 @@ namespace selfcoin::consensus {
 
 void ValidatorRegistry::upsert(PubKey32 pub, ValidatorInfo info) { validators_[pub] = info; }
 
-void ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
+bool ValidatorRegistry::can_register_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t bond_amount,
+                                          std::string* err) const {
+  if (bond_amount < rules_.min_bond) {
+    if (err) *err = "bond below min";
+    return false;
+  }
+  const auto it = validators_.find(pub);
+  if (it == validators_.end()) return true;
+  const auto& v = it->second;
+  if (v.status == ValidatorStatus::BANNED) {
+    if (err) *err = "validator banned";
+    return false;
+  }
+  if (v.status == ValidatorStatus::ACTIVE || v.status == ValidatorStatus::PENDING || v.status == ValidatorStatus::SUSPENDED) {
+    if (err) *err = "validator already registered";
+    return false;
+  }
+  if (rules_.cooldown_blocks > 0 && v.last_exit_height > 0 && height < v.last_exit_height + rules_.cooldown_blocks) {
+    if (err) *err = "validator cooldown";
+    return false;
+  }
+  return true;
+}
+
+void ValidatorRegistry::register_bond_legacy(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
   auto& v = validators_[pub];
   v.status = ValidatorStatus::PENDING;
   v.joined_height = joined_height;
   v.has_bond = true;
   v.bond_outpoint = bond_outpoint;
   v.unbond_height = 0;
+  v.last_join_height = joined_height;
+}
+
+bool ValidatorRegistry::register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height,
+                                      std::uint64_t bond_amount, std::string* err) {
+  if (!can_register_bond(pub, joined_height, bond_amount, err)) return false;
+  auto& v = validators_[pub];
+  v.status = ValidatorStatus::PENDING;
+  v.joined_height = joined_height;
+  v.has_bond = true;
+  v.bond_outpoint = bond_outpoint;
+  v.unbond_height = 0;
+  v.last_join_height = joined_height;
+  if (v.liveness_window_start == 0) v.liveness_window_start = joined_height;
+  return true;
 }
 
 bool ValidatorRegistry::request_unbond(const PubKey32& pub, std::uint64_t height) {
@@ -25,6 +65,7 @@ bool ValidatorRegistry::request_unbond(const PubKey32& pub, std::uint64_t height
   if (!it->second.has_bond) return false;
   it->second.status = ValidatorStatus::EXITING;
   it->second.unbond_height = height;
+  it->second.last_exit_height = height;
   return true;
 }
 
@@ -33,22 +74,35 @@ void ValidatorRegistry::ban(const PubKey32& pub) {
   if (it != validators_.end()) {
     it->second.status = ValidatorStatus::BANNED;
     it->second.has_bond = false;
+    it->second.last_exit_height = std::max(it->second.last_exit_height, it->second.unbond_height);
   }
 }
 
 void ValidatorRegistry::advance_height(std::uint64_t height) {
   for (auto& [_, info] : validators_) {
-    if (info.status == ValidatorStatus::PENDING && height >= info.joined_height + WARMUP_BLOCKS) {
+    if (info.status == ValidatorStatus::SUSPENDED && info.suspended_until_height > 0 && height >= info.suspended_until_height) {
+      info.status = ValidatorStatus::ACTIVE;
+      info.suspended_until_height = 0;
+    }
+    if (info.status == ValidatorStatus::PENDING && height >= info.joined_height + rules_.warmup_blocks) {
       info.status = ValidatorStatus::ACTIVE;
     }
   }
 }
 
+bool ValidatorRegistry::is_effectively_active(const ValidatorInfo& info, std::uint64_t height) const {
+  if (!info.has_bond) return false;
+  if (info.status == ValidatorStatus::BANNED || info.status == ValidatorStatus::EXITING) return false;
+  if (info.status == ValidatorStatus::SUSPENDED) return false;
+  if (info.suspended_until_height > height) return false;
+  if (info.status == ValidatorStatus::ACTIVE) return true;
+  return (info.status == ValidatorStatus::PENDING && height >= info.joined_height + rules_.warmup_blocks);
+}
+
 std::vector<PubKey32> ValidatorRegistry::active_sorted(std::uint64_t height) const {
   std::vector<PubKey32> out;
   for (const auto& [pub, info] : validators_) {
-    if ((info.status == ValidatorStatus::ACTIVE && info.has_bond) ||
-        (info.status == ValidatorStatus::PENDING && height >= info.joined_height + WARMUP_BLOCKS)) {
+    if (is_effectively_active(info, height)) {
       out.push_back(pub);
     }
   }
@@ -59,10 +113,7 @@ std::vector<PubKey32> ValidatorRegistry::active_sorted(std::uint64_t height) con
 bool ValidatorRegistry::is_active_for_height(const PubKey32& pub, std::uint64_t height) const {
   auto it = validators_.find(pub);
   if (it == validators_.end()) return false;
-  if (!it->second.has_bond) return false;
-  if (it->second.status == ValidatorStatus::BANNED || it->second.status == ValidatorStatus::EXITING) return false;
-  if (it->second.status == ValidatorStatus::ACTIVE && it->second.has_bond) return true;
-  return height >= it->second.joined_height + WARMUP_BLOCKS;
+  return is_effectively_active(it->second, height);
 }
 
 std::optional<ValidatorInfo> ValidatorRegistry::get(const PubKey32& pub) const {
@@ -226,6 +277,43 @@ std::vector<PubKey32> select_committee_v2(const std::vector<PubKey32>& active_so
 std::optional<PubKey32> select_leader_v2(const std::vector<PubKey32>& committee) {
   if (committee.empty()) return std::nullopt;
   return committee.front();
+}
+
+std::vector<PubKey32> committee_participants_from_finality(const std::vector<PubKey32>& committee,
+                                                           const std::vector<FinalitySig>& sigs) {
+  std::set<PubKey32> committee_set(committee.begin(), committee.end());
+  std::set<PubKey32> out_set;
+  for (const auto& s : sigs) {
+    if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+    out_set.insert(s.validator_pubkey);
+  }
+  return std::vector<PubKey32>(out_set.begin(), out_set.end());
+}
+
+bool v4_liveness_should_rollover(std::uint64_t height, std::uint64_t epoch_start_height,
+                                 std::uint64_t window_blocks) {
+  if (window_blocks == 0) return false;
+  if (height + 1 < epoch_start_height + window_blocks) return false;
+  return ((height + 1 - epoch_start_height) % window_blocks) == 0;
+}
+
+std::uint64_t v4_liveness_next_epoch_start(std::uint64_t height, std::uint64_t epoch_start_height,
+                                           std::uint64_t window_blocks) {
+  if (window_blocks == 0) return epoch_start_height;
+  if (height + 1 < epoch_start_height + window_blocks) return epoch_start_height;
+  const std::uint64_t completed = (height + 1 - epoch_start_height) / window_blocks;
+  return epoch_start_height + completed * window_blocks;
+}
+
+void v4_advance_join_window(std::uint64_t height, std::uint64_t window_blocks, std::uint64_t* window_start_height,
+                            std::uint32_t* window_count) {
+  if (!window_start_height || !window_count) return;
+  if (window_blocks == 0) return;
+  if (height < *window_start_height + window_blocks) return;
+  const std::uint64_t delta = height - *window_start_height;
+  const std::uint64_t steps = delta / window_blocks;
+  *window_start_height += steps * window_blocks;
+  *window_count = 0;
 }
 
 }  // namespace selfcoin::consensus

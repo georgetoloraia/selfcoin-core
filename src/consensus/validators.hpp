@@ -3,6 +3,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "common/types.hpp"
@@ -15,6 +16,7 @@ enum class ValidatorStatus : std::uint8_t {
   ACTIVE = 1,
   EXITING = 2,
   BANNED = 3,
+  SUSPENDED = 4,
 };
 
 struct ValidatorInfo {
@@ -23,12 +25,34 @@ struct ValidatorInfo {
   bool has_bond{false};
   OutPoint bond_outpoint{};
   std::uint64_t unbond_height{0};
+  std::uint64_t eligible_count_window{0};
+  std::uint64_t participated_count_window{0};
+  std::uint64_t liveness_window_start{0};
+  std::uint64_t suspended_until_height{0};
+  std::uint64_t last_join_height{0};
+  std::uint64_t last_exit_height{0};
+  std::uint32_t penalty_strikes{0};
+};
+
+struct ValidatorRules {
+  std::uint64_t min_bond{BOND_AMOUNT};
+  std::uint64_t warmup_blocks{WARMUP_BLOCKS};
+  std::uint64_t cooldown_blocks{0};
 };
 
 class ValidatorRegistry {
  public:
+  void set_rules(ValidatorRules rules) { rules_ = rules; }
+  const ValidatorRules& rules() const { return rules_; }
   void upsert(PubKey32 pub, ValidatorInfo info);
-  void register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height);
+  bool can_register_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t bond_amount, std::string* err = nullptr) const;
+  void register_bond_legacy(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height);
+  bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height) {
+    register_bond_legacy(pub, bond_outpoint, joined_height);
+    return true;
+  }
+  bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height, std::uint64_t bond_amount,
+                     std::string* err = nullptr);
   bool request_unbond(const PubKey32& pub, std::uint64_t height);
   void ban(const PubKey32& pub);
   void advance_height(std::uint64_t height);
@@ -37,10 +61,14 @@ class ValidatorRegistry {
   bool is_active_for_height(const PubKey32& pub, std::uint64_t height) const;
   std::optional<ValidatorInfo> get(const PubKey32& pub) const;
   std::optional<PubKey32> pubkey_by_bond_outpoint(const OutPoint& op) const;
+  std::map<PubKey32, ValidatorInfo>& mutable_all() { return validators_; }
   const std::map<PubKey32, ValidatorInfo>& all() const { return validators_; }
 
  private:
+  bool is_effectively_active(const ValidatorInfo& info, std::uint64_t height) const;
+
   std::map<PubKey32, ValidatorInfo> validators_;
+  ValidatorRules rules_{};
 };
 
 std::size_t quorum_threshold(std::size_t n_active);
@@ -57,5 +85,13 @@ std::size_t committee_size_for_round_v2(std::size_t active_count, std::size_t co
 std::vector<PubKey32> select_committee_v2(const std::vector<PubKey32>& active_sorted, const Hash32& seed,
                                           std::size_t committee_size);
 std::optional<PubKey32> select_leader_v2(const std::vector<PubKey32>& committee);
+std::vector<PubKey32> committee_participants_from_finality(const std::vector<PubKey32>& committee,
+                                                           const std::vector<FinalitySig>& sigs);
+bool v4_liveness_should_rollover(std::uint64_t height, std::uint64_t epoch_start_height,
+                                 std::uint64_t window_blocks);
+std::uint64_t v4_liveness_next_epoch_start(std::uint64_t height, std::uint64_t epoch_start_height,
+                                           std::uint64_t window_blocks);
+void v4_advance_join_window(std::uint64_t height, std::uint64_t window_blocks, std::uint64_t* window_start_height,
+                            std::uint32_t* window_count);
 
 }  // namespace selfcoin::consensus

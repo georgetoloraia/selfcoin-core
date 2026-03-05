@@ -32,7 +32,8 @@ int main(int argc, char** argv) {
                  "[--v5-voter-target-k <n>] [--v5-round-expand-cap <n>] [--v5-round-expand-factor <n>] "
                  "[--v6-bond-unit <n>] [--v6-units-max <n>] "
                  "[--v6-proposer-expected-num <n>] [--v6-proposer-expected-den <n>] "
-                 "[--v6-voter-target-k <n>] [--v6-round-expand-cap <n>] [--v6-round-expand-factor <n>]\n";
+                 "[--v6-voter-target-k <n>] [--v6-round-expand-cap <n>] [--v6-round-expand-factor <n>] "
+                 "[--v7-min-bond-amount <n>] [--v7-max-bond-amount <n>] [--v7-effective-units-cap <n>]\n";
     return 1;
   }
 

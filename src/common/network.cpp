@@ -31,7 +31,7 @@ const NetworkConfig kMainnet{
     .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
     .activation_enabled = false,
     .initial_consensus_version = 1,
-    .max_consensus_version = 6,
+    .max_consensus_version = 7,
     .activation_window_blocks = 0,
     .activation_threshold_percent = 0,
     .activation_delay_blocks = 0,
@@ -56,6 +56,9 @@ const NetworkConfig kMainnet{
     .v6_voter_target_k = 100,
     .v6_round_expand_cap = 8,
     .v6_round_expand_factor = 2,
+    .v7_min_bond_amount = BOND_AMOUNT,
+    .v7_max_bond_amount = BOND_AMOUNT * 100,
+    .v7_effective_units_cap = 10'000,
     .default_seeds = {
         "212.58.103.170:19440",
         "seed1.gotdns.ch:19440",

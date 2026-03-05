@@ -328,6 +328,12 @@ std::uint64_t validator_weight_units_v6(const ValidatorInfo& info, const Validat
   return units;
 }
 
+std::uint64_t validator_effective_weight_units_v7(const ValidatorInfo& info, const ValidatorWeightParamsV6& v6_params,
+                                                  const ValidatorWeightParamsV7& v7_params) {
+  const std::uint64_t raw = validator_weight_units_v6(info, v6_params);
+  return std::min(raw, v7_params.effective_units_cap);
+}
+
 std::uint64_t total_active_weight_units_v6(const ValidatorRegistry& registry, std::uint64_t height,
                                            const ValidatorWeightParamsV6& params) {
   std::uint64_t total = 0;
@@ -336,6 +342,24 @@ std::uint64_t total_active_weight_units_v6(const ValidatorRegistry& registry, st
     auto active_info = info;
     active_info.status = ValidatorStatus::ACTIVE;
     const std::uint64_t w = validator_weight_units_v6(active_info, params);
+    if (w > 0 && total > std::numeric_limits<std::uint64_t>::max() - w) {
+      total = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      total += w;
+    }
+  }
+  return total;
+}
+
+std::uint64_t total_active_effective_weight_units_v7(const ValidatorRegistry& registry, std::uint64_t height,
+                                                     const ValidatorWeightParamsV6& v6_params,
+                                                     const ValidatorWeightParamsV7& v7_params) {
+  std::uint64_t total = 0;
+  for (const auto& [pub, info] : registry.all()) {
+    if (!registry.is_active_for_height(pub, height)) continue;
+    auto active_info = info;
+    active_info.status = ValidatorStatus::ACTIVE;
+    const std::uint64_t w = validator_effective_weight_units_v7(active_info, v6_params, v7_params);
     if (w > 0 && total > std::numeric_limits<std::uint64_t>::max() - w) {
       total = std::numeric_limits<std::uint64_t>::max();
     } else {

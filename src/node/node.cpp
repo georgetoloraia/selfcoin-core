@@ -98,6 +98,11 @@ bool v6_active_for_height(const consensus::ActivationState& st, const consensus:
   return params.enabled && consensus::version_for_height(st, params, height) >= 6;
 }
 
+bool v7_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 7;
+}
+
 struct StateRootsV3 {
   Hash32 utxo_root{};
   Hash32 validators_root{};
@@ -287,6 +292,9 @@ bool Node::init() {
   if (cfg_.activation_delay_blocks_override.has_value())
     activation_params_.activation_delay_blocks = *cfg_.activation_delay_blocks_override;
   v4_min_bond_ = cfg_.network.validator_min_bond;
+  v7_min_bond_amount_ = cfg_.network.v7_min_bond_amount;
+  v7_max_bond_amount_ = cfg_.network.v7_max_bond_amount;
+  v7_effective_units_cap_ = cfg_.network.v7_effective_units_cap;
   v4_warmup_blocks_ = cfg_.network.validator_warmup_blocks;
   v4_cooldown_blocks_ = cfg_.network.validator_cooldown_blocks;
   v4_join_limit_window_blocks_ = cfg_.network.validator_join_limit_window_blocks;
@@ -308,6 +316,11 @@ bool Node::init() {
   v6_params_.round_expand_cap = cfg_.network.v6_round_expand_cap;
   v6_params_.round_expand_factor = cfg_.network.v6_round_expand_factor;
   if (cfg_.validator_min_bond_override.has_value()) v4_min_bond_ = *cfg_.validator_min_bond_override;
+  if (cfg_.v7_min_bond_amount_override.has_value()) v7_min_bond_amount_ = *cfg_.v7_min_bond_amount_override;
+  if (cfg_.v7_max_bond_amount_override.has_value()) v7_max_bond_amount_ = *cfg_.v7_max_bond_amount_override;
+  if (cfg_.v7_effective_units_cap_override.has_value())
+    v7_effective_units_cap_ = *cfg_.v7_effective_units_cap_override;
+  if (v7_max_bond_amount_ < v7_min_bond_amount_) v7_max_bond_amount_ = v7_min_bond_amount_;
   if (cfg_.validator_warmup_blocks_override.has_value()) v4_warmup_blocks_ = *cfg_.validator_warmup_blocks_override;
   if (cfg_.validator_cooldown_blocks_override.has_value()) v4_cooldown_blocks_ = *cfg_.validator_cooldown_blocks_override;
   if (cfg_.validator_join_limit_window_blocks_override.has_value())
@@ -626,11 +639,17 @@ bool Node::inject_propose_for_test(const Block& block) {
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_ + 1);
   mempool_.set_validation_context(
-      SpecialValidationContext{&validators_, finalized_height_ + 1,
-                               [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                 return is_committee_member_for(pub, h, round);
-                               }});
+      SpecialValidationContext{
+          .validators = &validators_,
+          .current_height = finalized_height_ + 1,
+          .consensus_version = cv,
+          .v7_min_bond_amount = v7_min_bond_amount_,
+          .v7_max_bond_amount = v7_max_bond_amount_,
+          .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+            return is_committee_member_for(pub, h, round);
+          }});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -713,10 +732,17 @@ void Node::event_loop() {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, h);
       mempool_.set_validation_context(
-          SpecialValidationContext{&validators_, h, [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
-                                     return is_committee_member_for(pub, ch, round);
-                                   }});
+          SpecialValidationContext{
+              .validators = &validators_,
+              .current_height = h,
+              .consensus_version = cv,
+              .v7_min_bond_amount = v7_min_bond_amount_,
+              .v7_max_bond_amount = v7_max_bond_amount_,
+              .is_committee_member = [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
+                return is_committee_member_for(pub, ch, round);
+              }});
       const auto committee = committee_for_height_round(h, current_round_);
       const auto leader = leader_for_height_round(h, current_round_);
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
@@ -798,14 +824,21 @@ void Node::event_loop() {
       }
 
       bool can_propose = false;
-      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, h);
       if (v6_active_for_height(h) && cv >= 6) {
         const auto active = validators_.active_sorted(h);
         if (validators_.is_active_for_height(local_key_.public_key, h) && !active.empty()) {
           const auto maybe_info = validators_.get(local_key_.public_key);
           if (maybe_info.has_value()) {
-            const std::uint64_t local_weight = consensus::validator_weight_units_v6(*maybe_info, v6_params_.weight);
-            const std::uint64_t total_weight = consensus::total_active_weight_units_v6(validators_, h, v6_params_.weight);
+            std::uint64_t local_weight = 0;
+            std::uint64_t total_weight = 0;
+            if (cv >= 7 && v7_active_for_height(h)) {
+              const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+              local_weight = consensus::validator_effective_weight_units_v7(*maybe_info, v6_params_.weight, v7w);
+              total_weight = consensus::total_active_effective_weight_units_v7(validators_, h, v6_params_.weight, v7w);
+            } else {
+              local_weight = consensus::validator_weight_units_v6(*maybe_info, v6_params_.weight);
+              total_weight = consensus::total_active_weight_units_v6(validators_, h, v6_params_.weight);
+            }
             if (local_weight > 0 && total_weight > 0) {
               FinalityProof prev_fp{};
               if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
@@ -1265,8 +1298,16 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
       if (!validators_.is_active_for_height(blk->header.leader_pubkey, msg.height)) return false;
       const auto leader_info = validators_.get(blk->header.leader_pubkey);
       if (!leader_info.has_value()) return false;
-      const std::uint64_t leader_weight = consensus::validator_weight_units_v6(*leader_info, v6_params_.weight);
-      const std::uint64_t total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      std::uint64_t leader_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(msg.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        leader_weight = consensus::validator_effective_weight_units_v7(*leader_info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, msg.height, v6_params_.weight, v7w);
+      } else {
+        leader_weight = consensus::validator_weight_units_v6(*leader_info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      }
       if (leader_weight == 0 || total_weight == 0) return false;
       FinalityProof prev_fp{};
       if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
@@ -1317,10 +1358,15 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto merkle_root = merkle::compute_merkle_root_from_txs(tx_bytes);
     if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) return false;
 
-    SpecialValidationContext vctx{&validators_, msg.height,
-                                  [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                    return is_committee_member_for(pub, h, round);
-                                  }};
+    SpecialValidationContext vctx{
+        .validators = &validators_,
+        .current_height = msg.height,
+        .consensus_version = cv,
+        .v7_min_bond_amount = v7_min_bond_amount_,
+        .v7_max_bond_amount = v7_max_bond_amount_,
+        .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+          return is_committee_member_for(pub, h, round);
+        }};
     const auto reward_signers = reward_signers_for_height_round(msg.height, msg.round);
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
@@ -1355,8 +1401,16 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
       if (!validators_.is_active_for_height(local_key_.public_key, msg.height)) return true;
       const auto local_info = validators_.get(local_key_.public_key);
       if (!local_info.has_value()) return true;
-      const std::uint64_t local_weight = consensus::validator_weight_units_v6(*local_info, v6_params_.weight);
-      const std::uint64_t total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      std::uint64_t local_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(msg.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        local_weight = consensus::validator_effective_weight_units_v7(*local_info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, msg.height, v6_params_.weight, v7w);
+      } else {
+        local_weight = consensus::validator_weight_units_v6(*local_info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      }
       if (local_weight == 0 || total_weight == 0) return true;
       FinalityProof prev_fp{};
       if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
@@ -1436,8 +1490,16 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, co
       if (vrf_proof.empty() || !vrf_output) return false;
       const auto info = validators_.get(vote.validator_pubkey);
       if (!info.has_value()) return false;
-      const std::uint64_t validator_weight = consensus::validator_weight_units_v6(*info, v6_params_.weight);
-      const std::uint64_t total_weight = consensus::total_active_weight_units_v6(validators_, vote.height, v6_params_.weight);
+      std::uint64_t validator_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(vote.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        validator_weight = consensus::validator_effective_weight_units_v7(*info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, vote.height, v6_params_.weight, v7w);
+      } else {
+        validator_weight = consensus::validator_weight_units_v6(*info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, vote.height, v6_params_.weight);
+      }
       if (validator_weight == 0 || total_weight == 0) return false;
       FinalityProof prev_fp{};
       if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
@@ -1522,11 +1584,17 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
     if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, tx.inputs.size())), now_ms())) {
       return false;
     }
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_ + 1);
     mempool_.set_validation_context(
-        SpecialValidationContext{&validators_, finalized_height_ + 1,
-                                 [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                   return is_committee_member_for(pub, h, round);
-                                 }});
+        SpecialValidationContext{
+            .validators = &validators_,
+            .current_height = finalized_height_ + 1,
+            .consensus_version = cv,
+            .v7_min_bond_amount = v7_min_bond_amount_,
+            .v7_max_bond_amount = v7_max_bond_amount_,
+            .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+              return is_committee_member_for(pub, h, round);
+            }});
     std::string err;
     std::uint64_t fee = 0;
     if (!mempool_.accept_tx(tx, utxos_, &err, cfg_.min_relay_fee, &fee)) {
@@ -1666,10 +1734,16 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   }
 
   std::uint64_t total_fees = 0;
-  SpecialValidationContext vctx{&validators_, height, [this](const PubKey32& pub, std::uint64_t h,
-                                                             std::uint32_t round) {
-                                  return is_committee_member_for(pub, h, round);
-                                }};
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  SpecialValidationContext vctx{
+      .validators = &validators_,
+      .current_height = height,
+      .consensus_version = cv,
+      .v7_min_bond_amount = v7_min_bond_amount_,
+      .v7_max_bond_amount = v7_max_bond_amount_,
+      .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+        return is_committee_member_for(pub, h, round);
+      }};
   for (const auto& tx : picked) {
     auto vr = validate_tx(tx, 1, utxos_, &vctx);
     if (vr.ok) total_fees += vr.fee;
@@ -2130,8 +2204,14 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
         for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
           const auto& out = tx.outputs[out_i];
           PubKey32 pub{};
-          if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-            replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+          if (is_validator_register_script(out.script_pubkey, &pub)) {
+            const std::uint32_t cvh = consensus::version_for_height(activation_state_, activation_params_, h);
+            if (activation_params_.enabled && cvh >= 4) {
+              std::string err;
+              (void)replay_validators.register_bond(pub, OutPoint{txid, out_i}, h, out.value, &err);
+            } else if (out.value == BOND_AMOUNT) {
+              replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+            }
           }
         }
       }
@@ -2204,8 +2284,13 @@ bool Node::v6_active_for_height(std::uint64_t height) const {
   return ::selfcoin::node::v6_active_for_height(activation_state_, activation_params_, height);
 }
 
+bool Node::v7_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v7_active_for_height(activation_state_, activation_params_, height);
+}
+
 bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t height) const {
   if (!v4_active_for_height(height)) return true;
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
 
   std::uint64_t window_start = v4_join_window_start_height_;
   std::uint32_t window_count = v4_join_count_in_window_;
@@ -2220,6 +2305,7 @@ bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t heig
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
+      if (cv >= 7 && (out.value < v7_min_bond_amount_ || out.value > v7_max_bond_amount_)) return false;
 
       std::string err;
       if (!registry.can_register_bond(pub, height, out.value, &err)) return false;
@@ -2905,6 +2991,18 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.v6_round_expand_factor_override = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--v7-min-bond-amount") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_min_bond_amount_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v7-max-bond-amount") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_max_bond_amount_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v7-effective-units-cap") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_effective_units_cap_override = std::max<std::uint64_t>(1, std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

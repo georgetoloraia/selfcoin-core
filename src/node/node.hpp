@@ -82,6 +82,9 @@ struct NodeConfig {
   std::optional<std::uint32_t> v6_voter_target_k_override;
   std::optional<std::uint32_t> v6_round_expand_cap_override;
   std::optional<std::uint32_t> v6_round_expand_factor_override;
+  std::optional<std::uint64_t> v7_min_bond_amount_override;
+  std::optional<std::uint64_t> v7_max_bond_amount_override;
+  std::optional<std::uint64_t> v7_effective_units_cap_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -215,6 +218,7 @@ class Node {
   bool v4_active_for_height(std::uint64_t height) const;
   bool v5_active_for_height(std::uint64_t height) const;
   bool v6_active_for_height(std::uint64_t height) const;
+  bool v7_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -250,6 +254,9 @@ class Node {
   consensus::ActivationState activation_state_{};
   consensus::ActivationParams activation_params_{};
   std::uint64_t v4_min_bond_{BOND_AMOUNT};
+  std::uint64_t v7_min_bond_amount_{BOND_AMOUNT};
+  std::uint64_t v7_max_bond_amount_{BOND_AMOUNT};
+  std::uint64_t v7_effective_units_cap_{10'000};
   std::uint64_t v4_warmup_blocks_{WARMUP_BLOCKS};
   std::uint64_t v4_cooldown_blocks_{0};
   std::uint64_t v4_join_limit_window_blocks_{0};

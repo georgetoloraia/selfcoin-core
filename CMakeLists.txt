@@ -115,6 +115,7 @@ add_executable(selfcoin-tests
   tests/test_sortition_v2.cpp
   tests/test_sortition_v5.cpp
   tests/test_sortition_v6.cpp
+  tests/test_bond_weight_v7.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp

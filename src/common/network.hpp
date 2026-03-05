@@ -51,6 +51,9 @@ struct NetworkConfig {
   std::uint32_t v6_voter_target_k{100};
   std::uint32_t v6_round_expand_cap{8};
   std::uint32_t v6_round_expand_factor{2};
+  std::uint64_t v7_min_bond_amount{BOND_AMOUNT};
+  std::uint64_t v7_max_bond_amount{BOND_AMOUNT};
+  std::uint64_t v7_effective_units_cap{10'000};
   std::vector<std::string> default_seeds;
 };
 

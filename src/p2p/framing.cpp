@@ -190,7 +190,9 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
     fail_info->prefix_kind = classify_prefix(fail_info->first_bytes);
   }
 
-  codec::ByteReader r(Bytes(hdr.begin(), hdr.end()));
+  // Keep backing storage alive for ByteReader; avoid binding to a temporary.
+  const Bytes hdr_bytes(hdr.begin(), hdr.end());
+  codec::ByteReader r(hdr_bytes);
   auto magic = r.u32le();
   auto version = r.u16le();
   auto msg = r.u16le();

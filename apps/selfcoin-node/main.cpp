@@ -21,7 +21,9 @@ int main(int argc, char** argv) {
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
                  "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "
                  "[--invalid-frame-ban-threshold <n>] [--invalid-frame-window-seconds <s>] "
-                 "[--min-relay-fee <sats>]\n";
+                 "[--min-relay-fee <sats>] [--activation-enabled] [--activation-max-version <n>] "
+                 "[--activation-window-blocks <n>] [--activation-threshold-percent <n>] "
+                 "[--activation-delay-blocks <n>]\n";
     return 1;
   }
 

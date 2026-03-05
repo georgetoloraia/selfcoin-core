@@ -49,5 +49,13 @@ std::optional<PubKey32> select_leader(const Hash32& prev_finalized_hash, std::ui
 std::vector<PubKey32> select_committee(const Hash32& prev_finalized_hash, std::uint64_t height,
                                        const std::vector<PubKey32>& active_sorted,
                                        std::size_t max_committee = MAX_COMMITTEE);
+Hash32 compute_finality_entropy_v2(const Hash32& prev_block_id, const FinalityProof& prev_finality_proof);
+Hash32 make_sortition_seed_v2(const Hash32& prev_entropy, std::uint64_t height, std::uint32_t round);
+std::size_t committee_size_v2(std::size_t active_count, std::size_t configured_max_committee = 128);
+std::size_t committee_size_for_round_v2(std::size_t active_count, std::size_t configured_max_committee,
+                                        std::uint32_t round);
+std::vector<PubKey32> select_committee_v2(const std::vector<PubKey32>& active_sorted, const Hash32& seed,
+                                          std::size_t committee_size);
+std::optional<PubKey32> select_leader_v2(const std::vector<PubKey32>& committee);
 
 }  // namespace selfcoin::consensus

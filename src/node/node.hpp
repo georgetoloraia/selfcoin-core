@@ -54,6 +54,11 @@ struct NodeConfig {
   int invalid_frame_ban_threshold{3};
   std::uint64_t invalid_frame_window_seconds{60};
   std::uint64_t min_relay_fee{0};
+  std::optional<bool> activation_enabled_override;
+  std::optional<std::uint32_t> activation_max_version_override;
+  std::optional<std::uint64_t> activation_window_blocks_override;
+  std::optional<std::uint32_t> activation_threshold_percent_override;
+  std::optional<std::uint64_t> activation_delay_blocks_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -154,6 +159,8 @@ class Node {
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
   std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
+  std::vector<PubKey32> committee_for_height_round(std::uint64_t height, std::uint32_t round) const;
+  std::optional<PubKey32> leader_for_height_round(std::uint64_t height, std::uint32_t round) const;
   void load_persisted_peers();
   void persist_peers() const;
   void load_addrman();

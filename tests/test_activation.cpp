@@ -160,4 +160,34 @@ TEST(test_node_parse_args_mainnet_only) {
   ASSERT_TRUE(!node::parse_args(static_cast<int>(bad_argv.size()), bad_argv.data()).has_value());
 }
 
+TEST(test_node_parse_args_activation_overrides) {
+  std::vector<std::string> args = {
+      "selfcoin-node",
+      "--activation-enabled",
+      "--activation-max-version",
+      "2",
+      "--activation-window-blocks",
+      "64",
+      "--activation-threshold-percent",
+      "90",
+      "--activation-delay-blocks",
+      "32",
+  };
+  std::vector<char*> argv;
+  argv.reserve(args.size());
+  for (auto& s : args) argv.push_back(s.data());
+  auto cfg = node::parse_args(static_cast<int>(argv.size()), argv.data());
+  ASSERT_TRUE(cfg.has_value());
+  ASSERT_TRUE(cfg->activation_enabled_override.has_value());
+  ASSERT_TRUE(*cfg->activation_enabled_override);
+  ASSERT_TRUE(cfg->activation_max_version_override.has_value());
+  ASSERT_EQ(*cfg->activation_max_version_override, 2u);
+  ASSERT_TRUE(cfg->activation_window_blocks_override.has_value());
+  ASSERT_EQ(*cfg->activation_window_blocks_override, 64u);
+  ASSERT_TRUE(cfg->activation_threshold_percent_override.has_value());
+  ASSERT_EQ(*cfg->activation_threshold_percent_override, 90u);
+  ASSERT_TRUE(cfg->activation_delay_blocks_override.has_value());
+  ASSERT_EQ(*cfg->activation_delay_blocks_override, 32u);
+}
+
 void register_activation_tests() {}

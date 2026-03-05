@@ -106,6 +106,7 @@ add_executable(selfcoin-tests
   tests/test_crypto.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_sortition_v2.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp

@@ -112,7 +112,22 @@ bool Node::init() {
   activation_params_.window_blocks = cfg_.network.activation_window_blocks;
   activation_params_.threshold_percent = cfg_.network.activation_threshold_percent;
   activation_params_.activation_delay_blocks = cfg_.network.activation_delay_blocks;
+  if (cfg_.activation_enabled_override.has_value()) activation_params_.enabled = *cfg_.activation_enabled_override;
+  if (cfg_.activation_max_version_override.has_value()) activation_params_.max_version = *cfg_.activation_max_version_override;
+  if (cfg_.activation_window_blocks_override.has_value())
+    activation_params_.window_blocks = *cfg_.activation_window_blocks_override;
+  if (cfg_.activation_threshold_percent_override.has_value())
+    activation_params_.threshold_percent = *cfg_.activation_threshold_percent_override;
+  if (cfg_.activation_delay_blocks_override.has_value())
+    activation_params_.activation_delay_blocks = *cfg_.activation_delay_blocks_override;
+  activation_params_.initial_version = 1;
   activation_state_.current_version = activation_params_.initial_version;
+  if (activation_params_.enabled) {
+    log_line("activation override enabled max_version=" + std::to_string(activation_params_.max_version) +
+             " window=" + std::to_string(activation_params_.window_blocks) +
+             " threshold=" + std::to_string(activation_params_.threshold_percent) +
+             " delay=" + std::to_string(activation_params_.activation_delay_blocks));
+  }
   p2p::AddrPolicy addr_policy;
   addr_policy.required_port = cfg_.network.p2p_default_port;
   addr_policy.reject_unroutable = true;
@@ -327,13 +342,12 @@ NodeStatus Node::status() const {
   s.round = current_round_;
   s.tip_hash = finalized_hash_;
   s.tip_hash_short = short_hash_hex(finalized_hash_);
-  const auto active = validators_.active_sorted(finalized_height_ + 1);
-  auto leader = consensus::select_leader(finalized_hash_, finalized_height_ + 1, current_round_, active);
+  auto leader = leader_for_height_round(finalized_height_ + 1, current_round_);
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
   s.peers = peer_count();
   s.mempool_size = mempool_.size();
-  const auto committee = committee_for_height(finalized_height_ + 1);
+  const auto committee = committee_for_height_round(finalized_height_ + 1, current_round_);
   s.committee_size = committee.size();
   s.quorum_threshold = consensus::quorum_threshold(committee.size());
   s.addrman_size = addrman_.size();
@@ -353,7 +367,7 @@ NodeStatus Node::status() const {
 std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers,
                                          std::size_t* quorum_threshold) const {
   const std::uint64_t h = finalized_height_ + 1;
-  const auto committee = committee_for_height(h);
+  const auto committee = committee_for_height_round(h, current_round_);
   const std::size_t quorum = consensus::quorum_threshold(committee.size());
   if (quorum_threshold) *quorum_threshold = quorum;
 
@@ -439,7 +453,7 @@ std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
 }
 std::vector<PubKey32> Node::committee_for_next_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
-  return committee_for_height(finalized_height_ + 1);
+  return committee_for_height_round(finalized_height_ + 1, current_round_);
 }
 std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
   std::lock_guard<std::mutex> lk(mu_);
@@ -458,9 +472,8 @@ void Node::event_loop() {
           SpecialValidationContext{&validators_, h, [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
                                      return is_committee_member_for(pub, ch, round);
                                    }});
-      const auto active = validators_.active_sorted(h);
-      const auto committee = consensus::select_committee(finalized_hash_, h, active, cfg_.max_committee);
-      const auto leader = consensus::select_leader(finalized_hash_, h, current_round_, active);
+      const auto committee = committee_for_height_round(h, current_round_);
+      const auto leader = leader_for_height_round(h, current_round_);
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
 
       const std::uint64_t now_ms = now_unix() * 1000;
@@ -727,7 +740,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           if (total + sz > kMaxCandidateBlockBytes) return;
           candidate_block_sizes_[bid] = sz;
         }
-        const auto committee = committee_for_height(blk->header.height);
+        const auto committee = committee_for_height_round(blk->header.height, blk->header.round);
         if (committee.empty()) return;
         const std::size_t quorum = consensus::quorum_threshold(committee.size());
         std::set<PubKey32> committee_set(committee.begin(), committee.end());
@@ -891,8 +904,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     if (!blk.has_value()) return false;
     if (blk->header.height != msg.height || blk->header.round != msg.round) return false;
 
-    const auto active = validators_.active_sorted(msg.height);
-    auto expected = consensus::select_leader(finalized_hash_, msg.height, msg.round, active);
+    auto expected = leader_for_height_round(msg.height, msg.round);
     if (!expected.has_value() || blk->header.leader_pubkey != *expected) return false;
 
     std::vector<Bytes> tx_bytes;
@@ -905,7 +917,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
                                   [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
                                     return is_committee_member_for(pub, h, round);
                                   }};
-    const auto reward_signers = committee_for_height(msg.height);
+    const auto reward_signers = committee_for_height_round(msg.height, msg.round);
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
 
@@ -1023,7 +1035,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (blk_it == candidate_blocks_.end()) return false;
 
   auto sigs = votes_.signatures_for(height, round, block_id);
-  const auto committee = committee_for_height(height);
+  const auto committee = committee_for_height_round(height, round);
   if (committee.empty()) return false;
   const std::size_t quorum = consensus::quorum_threshold(committee.size());
   std::set<PubKey32> committee_set(committee.begin(), committee.end());
@@ -1124,7 +1136,7 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
     if (vr.ok) total_fees += vr.fee;
   }
 
-  const auto committee = committee_for_height(height);
+  const auto committee = committee_for_height_round(height, round);
   const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, committee);
 
   {
@@ -1416,86 +1428,124 @@ bool Node::load_state() {
 }
 
 std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
+  return committee_for_height_round(height, 0);
+}
+
+std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std::uint32_t round) const {
   if (height == 0) return {};
-  if (height == finalized_height_ + 1) {
-    const auto active = validators_.active_sorted(height);
-    return consensus::select_committee(finalized_hash_, height, active, cfg_.max_committee);
-  }
-  if (height > finalized_height_) return {};
+  if (height > finalized_height_ + 1) return {};
 
-  consensus::ValidatorRegistry replay_validators;
-  UtxoSet replay_utxos;
-  if (auto gj = db_.get("G:J"); gj.has_value()) {
-    const std::string js(gj->begin(), gj->end());
-    if (auto gd = genesis::parse_json(js); gd.has_value()) {
-      for (const auto& pub : gd->initial_validators) {
-        consensus::ValidatorInfo vi;
-        vi.status = consensus::ValidatorStatus::ACTIVE;
-        vi.joined_height = 0;
-        vi.has_bond = true;
-        vi.bond_outpoint = OutPoint{zero_hash(), 0};
-        vi.unbond_height = 0;
-        replay_validators.upsert(pub, vi);
-      }
-    }
-  }
-
-  auto apply_changes = [&](const Block& block, std::uint64_t h) {
-    for (size_t txi = 1; txi < block.txs.size(); ++txi) {
-      const auto& tx = block.txs[txi];
-      for (const auto& in : tx.inputs) {
-        OutPoint op{in.prev_txid, in.prev_index};
-        auto it = replay_utxos.find(op);
-        if (it == replay_utxos.end()) continue;
-        PubKey32 pub{};
-        if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
-
-        SlashEvidence evidence;
-        if (parse_slash_script_sig(in.script_sig, &evidence)) {
-          replay_validators.ban(pub);
-        } else {
-          replay_validators.request_unbond(pub, h);
-        }
-      }
-    }
-
-    for (const auto& tx : block.txs) {
-      const Hash32 txid = tx.txid();
-      for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-        const auto& out = tx.outputs[out_i];
-        PubKey32 pub{};
-        if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-          replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
-        }
-      }
-    }
-    replay_validators.advance_height(h + 1);
-  };
-
-  for (std::uint64_t h = 1; h <= height - 1; ++h) {
-    auto bh = db_.get_height_hash(h);
-    if (!bh.has_value()) return {};
-    auto bb = db_.get_block(*bh);
-    if (!bb.has_value()) return {};
-    auto blk = Block::parse(*bb);
-    if (!blk.has_value()) return {};
-    apply_changes(*blk, h);
-    apply_block_to_utxo(*blk, replay_utxos);
-  }
-
+  std::vector<PubKey32> active;
   Hash32 prev_hash = zero_hash();
-  if (height > 1) {
-    auto prev = db_.get_height_hash(height - 1);
-    if (!prev.has_value()) return {};
-    prev_hash = *prev;
+  FinalityProof prev_fp{};
+
+  if (height == finalized_height_ + 1) {
+    active = validators_.active_sorted(height);
+    prev_hash = finalized_hash_;
+    if (auto bb = db_.get_block(prev_hash); bb.has_value()) {
+      if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+    }
+  } else {
+    consensus::ValidatorRegistry replay_validators;
+    UtxoSet replay_utxos;
+    if (auto gj = db_.get("G:J"); gj.has_value()) {
+      const std::string js(gj->begin(), gj->end());
+      if (auto gd = genesis::parse_json(js); gd.has_value()) {
+        for (const auto& pub : gd->initial_validators) {
+          consensus::ValidatorInfo vi;
+          vi.status = consensus::ValidatorStatus::ACTIVE;
+          vi.joined_height = 0;
+          vi.has_bond = true;
+          vi.bond_outpoint = OutPoint{zero_hash(), 0};
+          vi.unbond_height = 0;
+          replay_validators.upsert(pub, vi);
+        }
+      }
+    }
+
+    auto apply_changes = [&](const Block& block, std::uint64_t h) {
+      for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+        const auto& tx = block.txs[txi];
+        for (const auto& in : tx.inputs) {
+          OutPoint op{in.prev_txid, in.prev_index};
+          auto it = replay_utxos.find(op);
+          if (it == replay_utxos.end()) continue;
+          PubKey32 pub{};
+          if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+
+          SlashEvidence evidence;
+          if (parse_slash_script_sig(in.script_sig, &evidence)) {
+            replay_validators.ban(pub);
+          } else {
+            replay_validators.request_unbond(pub, h);
+          }
+        }
+      }
+
+      for (const auto& tx : block.txs) {
+        const Hash32 txid = tx.txid();
+        for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+          const auto& out = tx.outputs[out_i];
+          PubKey32 pub{};
+          if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
+            replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+          }
+        }
+      }
+      replay_validators.advance_height(h + 1);
+    };
+
+    for (std::uint64_t h = 1; h <= height - 1; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) return {};
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) return {};
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) return {};
+      apply_changes(*blk, h);
+      apply_block_to_utxo(*blk, replay_utxos);
+    }
+
+    if (height > 1) {
+      auto prev = db_.get_height_hash(height - 1);
+      if (!prev.has_value()) return {};
+      prev_hash = *prev;
+      if (auto bb = db_.get_block(prev_hash); bb.has_value()) {
+        if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+      }
+    }
+    active = replay_validators.active_sorted(height);
   }
-  const auto active = replay_validators.active_sorted(height);
+
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  if (activation_params_.enabled && cv >= 2) {
+    const Hash32 entropy = consensus::compute_finality_entropy_v2(prev_hash, prev_fp);
+    const Hash32 seed = consensus::make_sortition_seed_v2(entropy, height, round);
+    const std::size_t k = consensus::committee_size_for_round_v2(active.size(), cfg_.max_committee, round);
+    return consensus::select_committee_v2(active, seed, k);
+  }
+
   return consensus::select_committee(prev_hash, height, active, cfg_.max_committee);
 }
 
+std::optional<PubKey32> Node::leader_for_height_round(std::uint64_t height, std::uint32_t round) const {
+  if (height == 0 || height > finalized_height_ + 1) return std::nullopt;
+  const auto active = (height == finalized_height_ + 1) ? validators_.active_sorted(height) : std::vector<PubKey32>{};
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  if (activation_params_.enabled && cv >= 2) {
+    const auto committee = committee_for_height_round(height, round);
+    return consensus::select_leader_v2(committee);
+  }
+  if (!active.empty()) return consensus::select_leader(finalized_hash_, height, round, active);
+
+  // Historical heights are only used in verification/test paths; derive via round-aware committee fallback.
+  const auto committee = committee_for_height_round(height, round);
+  if (committee.empty()) return std::nullopt;
+  return committee.front();
+}
+
 bool Node::is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const {
-  (void)round;
-  const auto committee = committee_for_height(height);
+  const auto committee = committee_for_height_round(height, round);
   return std::find(committee.begin(), committee.end(), pub) != committee.end();
 }
 
@@ -1981,6 +2031,24 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-enabled") {
+      cfg.activation_enabled_override = true;
+    } else if (a == "--activation-max-version") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_max_version_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--activation-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--activation-delay-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_delay_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;

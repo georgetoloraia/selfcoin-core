@@ -211,12 +211,12 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage:\n"
               << "  selfcoin-cli tip --db <dir>\n"
-              << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp tsc]\n"
-              << "  selfcoin-cli wallet_create --out <path> [--pass <pass>] [--network <mainnet|testnet|devnet>] [--seed-hex <32b-hex>]\n"
+              << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
+              << "  selfcoin-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
               << "  selfcoin-cli wallet_address --file <path> [--pass <pass>]\n"
               << "  selfcoin-cli wallet_export --file <path> [--pass <pass>]\n"
-              << "  selfcoin-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network <mainnet|testnet|devnet>]\n"
-              << "  selfcoin-cli address_from_pubkey --hrp <sc|tsc> --pubkey <hex32>\n"
+              << "  selfcoin-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
+              << "  selfcoin-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
               << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
@@ -472,7 +472,7 @@ int main(int argc, char** argv) {
 
   if (cmd == "create_keypair") {
     std::string seed_hex;
-    std::string hrp = "tsc";
+    std::string hrp = "sc";
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--seed-hex" && i + 1 < argc) seed_hex = argv[++i];
@@ -520,6 +520,10 @@ int main(int argc, char** argv) {
     }
     if (out_path.empty()) {
       std::cerr << "--out is required\n";
+      return 1;
+    }
+    if (network_name != "mainnet") {
+      std::cerr << "only --network mainnet is supported\n";
       return 1;
     }
     std::optional<std::array<std::uint8_t, 32>> seed_override;
@@ -609,6 +613,10 @@ int main(int argc, char** argv) {
       std::cerr << "--out and --privkey(32-byte hex) are required\n";
       return 1;
     }
+    if (network_name != "mainnet") {
+      std::cerr << "only --network mainnet is supported\n";
+      return 1;
+    }
     selfcoin::keystore::ValidatorKey vk;
     std::string err;
     const std::optional<std::array<std::uint8_t, 32>> seed_override = *priv;
@@ -626,7 +634,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "address_from_pubkey" || cmd == "addr") {
-    std::string hrp = "tsc";
+    std::string hrp = "sc";
     std::string pub_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];

@@ -34,6 +34,8 @@ add_library(selfcoin_core
   src/codec/varint.cpp
   src/crypto/hash.cpp
   src/crypto/ed25519.cpp
+  src/crypto/vrf.cpp
+  src/crypto/smt.cpp
   src/keystore/validator_keystore.cpp
   src/genesis/genesis.cpp
   src/genesis/embedded_mainnet.cpp
@@ -44,6 +46,10 @@ add_library(selfcoin_core
   src/utxo/signing.cpp
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
+  src/consensus/activation.cpp
+  src/consensus/sortition_v5.cpp
+  src/consensus/sortition_v6.cpp
+  src/consensus/state_commitment.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
@@ -103,12 +109,21 @@ add_executable(selfcoin-tests
   tests/test_codec.cpp
   tests/test_chain_id.cpp
   tests/test_crypto.cpp
+  tests/test_vrf.cpp
   tests/test_address.cpp
   tests/test_consensus.cpp
+  tests/test_sortition_v2.cpp
+  tests/test_sortition_v5.cpp
+  tests/test_sortition_v6.cpp
+  tests/test_bond_weight_v7.cpp
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp
+  tests/test_state_commitment.cpp
+  tests/test_smt.cpp
+  tests/test_activation.cpp
   tests/test_bonding.cpp
+  tests/test_validator_v4.cpp
   tests/test_mempool.cpp
   tests/test_hardening.cpp
   tests/test_genesis.cpp

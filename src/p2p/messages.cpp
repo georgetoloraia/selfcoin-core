@@ -88,12 +88,16 @@ std::optional<FinalizedTipMsg> de_finalized_tip(const Bytes& b) {
   return m;
 }
 
-Bytes ser_propose(const ProposeMsg& m) {
+Bytes ser_propose(const ProposeMsg& m, std::uint32_t consensus_version) {
   codec::ByteWriter w;
   w.u64le(m.height);
   w.u32le(m.round);
   w.bytes_fixed(m.prev_finalized_hash);
   w.varbytes(m.block_bytes);
+  if (consensus_version >= 5) {
+    w.varbytes(m.vrf_proof);
+    w.bytes_fixed(m.vrf_output);
+  }
   return w.take();
 }
 
@@ -109,18 +113,30 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
         m.round = *round;
         m.prev_finalized_hash = *prev;
         m.block_bytes = *blk;
+        if (r.remaining() > 0) {
+          auto proof = r.varbytes();
+          auto out = r.bytes_fixed<32>();
+          if (!proof || !out) return false;
+          m.vrf_proof = *proof;
+          m.vrf_output = *out;
+        }
         return true;
-      })) return std::nullopt;
+      }))
+    return std::nullopt;
   return m;
 }
 
-Bytes ser_vote(const VoteMsg& m) {
+Bytes ser_vote(const VoteMsg& m, std::uint32_t consensus_version) {
   codec::ByteWriter w;
   w.u64le(m.vote.height);
   w.u32le(m.vote.round);
   w.bytes_fixed(m.vote.block_id);
   w.bytes_fixed(m.vote.validator_pubkey);
   w.bytes_fixed(m.vote.signature);
+  if (consensus_version >= 5) {
+    w.varbytes(m.vrf_proof);
+    w.bytes_fixed(m.vrf_output);
+  }
   return w.take();
 }
 
@@ -138,6 +154,13 @@ std::optional<VoteMsg> de_vote(const Bytes& b) {
         m.vote.block_id = *block;
         m.vote.validator_pubkey = *pub;
         m.vote.signature = *sig;
+        if (r.remaining() > 0) {
+          auto proof = r.varbytes();
+          auto out = r.bytes_fixed<32>();
+          if (!proof || !out) return false;
+          m.vrf_proof = *proof;
+          m.vrf_output = *out;
+        }
         return true;
       })) return std::nullopt;
   return m;

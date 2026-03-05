@@ -38,6 +38,43 @@ std::optional<TipState> parse_tip(const Bytes& b) {
   return t;
 }
 
+Bytes serialize_activation_state(const consensus::ActivationState& s) {
+  codec::ByteWriter w;
+  w.u32le(s.current_version);
+  w.u32le(s.pending_version);
+  w.u64le(s.pending_activation_height);
+  w.u64le(s.last_height);
+  w.u64le(s.window_start_height);
+  w.u64le(s.window_signal_count);
+  w.u64le(s.window_total_count);
+  return w.take();
+}
+
+std::optional<consensus::ActivationState> parse_activation_state(const Bytes& b) {
+  consensus::ActivationState s;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto current = r.u32le();
+        auto pending = r.u32le();
+        auto pending_h = r.u64le();
+        auto last_h = r.u64le();
+        auto win_start = r.u64le();
+        auto win_sig = r.u64le();
+        auto win_total = r.u64le();
+        if (!current || !pending || !pending_h || !last_h || !win_start || !win_sig || !win_total) return false;
+        s.current_version = *current;
+        s.pending_version = *pending;
+        s.pending_activation_height = *pending_h;
+        s.last_height = *last_h;
+        s.window_start_height = *win_start;
+        s.window_signal_count = *win_sig;
+        s.window_total_count = *win_total;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return s;
+}
+
 Bytes serialize_outpoint(const OutPoint& op) {
   codec::ByteWriter w;
   w.bytes_fixed(op.txid);
@@ -90,6 +127,14 @@ Bytes serialize_validator(const consensus::ValidatorInfo& info) {
   w.bytes_fixed(info.bond_outpoint.txid);
   w.u32le(info.bond_outpoint.index);
   w.u64le(info.unbond_height);
+  w.u64le(info.eligible_count_window);
+  w.u64le(info.participated_count_window);
+  w.u64le(info.liveness_window_start);
+  w.u64le(info.suspended_until_height);
+  w.u64le(info.last_join_height);
+  w.u64le(info.last_exit_height);
+  w.u32le(info.penalty_strikes);
+  w.u64le(info.bonded_amount);
   return w.take();
 }
 
@@ -103,6 +148,7 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.joined_height = *h;
         if (r.eof()) {
           // Backward compatibility for v0 records.
+          info.bonded_amount = BOND_AMOUNT;
           info.has_bond = true;
           info.unbond_height = 0;
           return true;
@@ -115,6 +161,29 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
         info.has_bond = (*has_bond != 0);
         info.bond_outpoint = OutPoint{*txid, *idx};
         info.unbond_height = *unbond;
+        if (r.eof()) return true;
+        auto eligible = r.u64le();
+        auto participated = r.u64le();
+        auto lstart = r.u64le();
+        auto suspended = r.u64le();
+        auto last_join = r.u64le();
+        auto last_exit = r.u64le();
+        auto strikes = r.u32le();
+        if (!eligible || !participated || !lstart || !suspended || !last_join || !last_exit || !strikes) return false;
+        info.eligible_count_window = *eligible;
+        info.participated_count_window = *participated;
+        info.liveness_window_start = *lstart;
+        info.suspended_until_height = *suspended;
+        info.last_join_height = *last_join;
+        info.last_exit_height = *last_exit;
+        info.penalty_strikes = *strikes;
+        if (!r.eof()) {
+          auto bonded = r.u64le();
+          if (!bonded || !r.eof()) return false;
+          info.bonded_amount = *bonded;
+        } else {
+          info.bonded_amount = BOND_AMOUNT;
+        }
         return true;
       })) {
     return std::nullopt;
@@ -445,6 +514,16 @@ std::vector<DB::ScriptHistoryEntry> DB::get_script_history(const Hash32& scripth
     return a.txid < b.txid;
   });
   return out;
+}
+
+bool DB::set_activation_state(const consensus::ActivationState& state) {
+  return put("AV:", serialize_activation_state(state));
+}
+
+std::optional<consensus::ActivationState> DB::get_activation_state() const {
+  auto b = get("AV:");
+  if (!b.has_value()) return std::nullopt;
+  return parse_activation_state(*b);
 }
 
 #ifndef SC_HAS_ROCKSDB

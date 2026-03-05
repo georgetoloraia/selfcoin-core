@@ -138,9 +138,15 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
 
   for (const auto& out : tx.outputs) {
     PubKey32 pub{};
-    if (is_validator_register_script(out.script_pubkey, &pub) && out.value != BOND_AMOUNT) {
+    if (is_validator_register_script(out.script_pubkey, &pub)) {
       (void)pub;
-      return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
+      if (ctx && ctx->consensus_version >= 7) {
+        if (out.value < ctx->v7_min_bond_amount || out.value > ctx->v7_max_bond_amount) {
+          return {false, "SCVALREG output out of v7 bond range", 0};
+        }
+      } else if (out.value != BOND_AMOUNT) {
+        return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
+      }
     }
   }
 

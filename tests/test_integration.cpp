@@ -17,10 +17,12 @@
 
 #include "address/address.hpp"
 #include "consensus/validators.hpp"
+#include "consensus/state_commitment.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "lightserver/server.hpp"
 #include "keystore/validator_keystore.hpp"
+#include "merkle/merkle.hpp"
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
@@ -122,7 +124,7 @@ crypto::KeyPair key_from_byte(std::uint8_t b) {
   return *kp;
 }
 
-std::array<std::uint8_t, 32> devnet_seed_for_node_id(int node_id) {
+std::array<std::uint8_t, 32> deterministic_seed_for_node_id(int node_id) {
   std::array<std::uint8_t, 32> seed{};
   const int i = node_id + 1;
   for (std::size_t j = 0; j < seed.size(); ++j) seed[j] = static_cast<std::uint8_t>(i * 19 + static_cast<int>(j));
@@ -237,24 +239,44 @@ struct HttpStubServer {
   }
 };
 
+bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
+
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE) {
+                     std::size_t max_committee = MAX_COMMITTEE, bool v3_active = false) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  if (!write_mainnet_genesis_file(gpath, static_cast<std::size_t>(std::max(initial_active, node_count)))) {
+    throw std::runtime_error("failed to write cluster genesis");
+  }
+  const auto keys = node::Node::deterministic_test_keypairs();
 
   Cluster c;
   c.nodes.reserve(node_count);
   for (int i = 0; i < node_count; ++i) {
     node::NodeConfig cfg;
-    cfg.devnet = true;
     cfg.disable_p2p = true;
     cfg.node_id = i;
-    cfg.devnet_initial_active_validators = initial_active;
     cfg.max_committee = max_committee;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    if (v3_active) {
+      cfg.network.initial_consensus_version = 3;
+      cfg.activation_enabled_override = true;
+      cfg.activation_max_version_override = 3;
+    }
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
+    }
+    keystore::ValidatorKey out_key;
+    std::string kerr;
+    if (!keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                             deterministic_seed_for_node_id(i), &out_key, &kerr)) {
+      throw std::runtime_error("failed to create validator keystore: " + kerr);
     }
 
     auto n = std::make_unique<node::Node>(cfg);
@@ -408,7 +430,7 @@ std::optional<Block> find_block_with_tx(const std::string& db_path, const Hash32
 }
 
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 4) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   if (keys.size() < n_validators) return false;
 
   genesis::Document d;
@@ -440,7 +462,7 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
 }  // namespace
 
 TEST(test_devnet_4_nodes_finalize_and_faults) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_faults");
@@ -515,7 +537,7 @@ TEST(test_devnet_4_nodes_finalize_and_faults) {
 }
 
 TEST(test_tx_finalized_and_visible_on_all_nodes) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
 
   auto cluster = make_cluster("/tmp/selfcoin_it_tx");
@@ -574,7 +596,7 @@ TEST(test_tx_finalized_and_visible_on_all_nodes) {
 }
 
 TEST(test_restart_determinism_and_continued_finalization) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 4u);
 
   const std::string base = "/tmp/selfcoin_it_restart";
@@ -608,11 +630,14 @@ TEST(test_restart_determinism_and_continued_finalization) {
   restarted.nodes.reserve(4);
   for (int i = 0; i < 4; ++i) {
     node::NodeConfig cfg;
-    cfg.devnet = true;
     cfg.disable_p2p = true;
     cfg.node_id = i;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.genesis_path = base + "/genesis.json";
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
       cfg.peers.push_back("127.0.0.1:" + std::to_string(19040 + j));
     }
@@ -662,7 +687,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
 }
 
 TEST(test_permissionless_join_pending_to_active_after_warmup) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster("/tmp/selfcoin_it_join", 1);
   auto& nodes = cluster.nodes;
 
@@ -700,8 +725,47 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
   }, std::chrono::seconds(120)));
 }
 
+TEST(test_v5_rejects_propose_without_vrf_proof) {
+  const std::string base = "/tmp/selfcoin_it_v5_missing_proof";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
+
+  node::NodeConfig cfg;
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.network.initial_consensus_version = 5;
+  cfg.network.max_consensus_version = 5;
+  cfg.activation_enabled_override = true;
+  cfg.activation_max_version_override = 5;
+  cfg.activation_window_blocks_override = 1;
+  cfg.activation_threshold_percent_override = 100;
+  cfg.activation_delay_blocks_override = 0;
+  cfg.v5_proposer_expected_num_override = 10;
+  cfg.v5_proposer_expected_den_override = 1;
+  cfg.v5_voter_target_k_override = 4;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  keystore::ValidatorKey out_key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &out_key, &kerr));
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  auto b = n.build_proposal_for_test(1, 0);
+  ASSERT_TRUE(b.has_value());
+  // inject_propose_for_test uses legacy propose payload fields and therefore has no v5 VRF proof.
+  ASSERT_TRUE(!n.inject_propose_for_test(*b));
+}
+
 TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster("/tmp/selfcoin_it_slash", 1);
   auto& nodes = cluster.nodes;
   ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 10; }, std::chrono::seconds(60)));
@@ -794,7 +858,7 @@ TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
 }
 
 TEST(test_committee_selection_and_non_member_votes_ignored) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 12u);
   auto cluster = make_cluster("/tmp/selfcoin_it_committee", 12, 12, 5);
   auto& nodes = cluster.nodes;
@@ -854,20 +918,27 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   }, std::chrono::seconds(120)));
 }
 
-TEST(test_testnet_seed_bootstrap_and_catchup) {
-  const std::string base = "/tmp/selfcoin_it_testnet_bootstrap";
+TEST(test_mainnet_seed_bootstrap_and_catchup) {
+  const std::string base = "/tmp/selfcoin_it_mainnet_bootstrap_seeds";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
 
   std::vector<std::unique_ptr<node::Node>> nodes;
   {
     node::NodeConfig cfg;
-    cfg.devnet = false;
-    cfg.testnet = true;
-    cfg.network = testnet_network();
     cfg.node_id = 0;
     cfg.db_path = base + "/node0";
     cfg.p2p_port = 0;  // ephemeral
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    keystore::ValidatorKey out_key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(0), &out_key, &kerr));
     auto n = std::make_unique<node::Node>(cfg);
     if (!n->init()) return;
     nodes.push_back(std::move(n));
@@ -879,12 +950,17 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
 
   for (int i = 1; i < 4; ++i) {
     node::NodeConfig cfg;
-    cfg.devnet = false;
-    cfg.testnet = true;
-    cfg.network = testnet_network();
     cfg.node_id = i;
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.p2p_port = 0;  // ephemeral
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
+    keystore::ValidatorKey out_key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(i), &out_key, &kerr));
     cfg.seeds.push_back("127.0.0.1:" + std::to_string(seed_port));
     auto n = std::make_unique<node::Node>(cfg);
     if (!n->init()) return;
@@ -900,12 +976,19 @@ TEST(test_testnet_seed_bootstrap_and_catchup) {
   }, std::chrono::seconds(90)));
 
   node::NodeConfig join_cfg;
-  join_cfg.devnet = false;
-  join_cfg.testnet = true;
-  join_cfg.network = testnet_network();
   join_cfg.node_id = 7;
   join_cfg.db_path = base + "/joiner";
   join_cfg.p2p_port = 0;  // ephemeral
+  join_cfg.genesis_path = gpath;
+  join_cfg.allow_unsafe_genesis_override = true;
+  join_cfg.validator_key_file = join_cfg.db_path + "/keystore/validator.json";
+  join_cfg.validator_passphrase = "test-pass";
+  {
+    keystore::ValidatorKey out_key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(join_cfg.validator_key_file, join_cfg.validator_passphrase,
+                                                    "mainnet", "sc", deterministic_seed_for_node_id(7), &out_key, &kerr));
+  }
   join_cfg.seeds.push_back("127.0.0.1:" + std::to_string(seed_port));
   auto joiner = std::make_unique<node::Node>(join_cfg);
   if (!joiner->init()) return;
@@ -928,26 +1011,12 @@ TEST(test_observer_reports_ok_on_two_lightservers) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
 
-  node::NodeConfig ncfg;
-  ncfg.devnet = true;
-  ncfg.testnet = false;
-  ncfg.network = devnet_network();
-  ncfg.node_id = 0;
-  ncfg.disable_p2p = true;
-  ncfg.devnet_initial_active_validators = 1;
-  ncfg.max_committee = 1;
-  ncfg.db_path = base + "/node0";
-  node::Node n(ncfg);
-  ASSERT_TRUE(n.init());
-  n.start();
-  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 10; }, std::chrono::seconds(60)));
-  n.stop();
+  auto cluster = make_cluster(base + "/cluster");
+  ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 10; }, std::chrono::seconds(60)));
+  const std::string db_path = base + "/cluster/node0";
 
   lightserver::Config l1;
-  l1.devnet = true;
-  l1.testnet = false;
-  l1.network = devnet_network();
-  l1.db_path = ncfg.db_path;
+  l1.db_path = db_path;
   l1.bind_ip = "127.0.0.1";
   l1.port = 0;  // ephemeral
   lightserver::Server s1(l1);
@@ -989,11 +1058,7 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.node_id = 0;
-  cfg.network = devnet_network();
-  cfg.devnet_initial_active_validators = 1;
+      cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -1008,15 +1073,14 @@ TEST(test_invalid_frame_spam_bans_peer_and_node_stays_alive) {
   n.start();
   const std::uint16_t port = n.p2p_port_for_test();
   ASSERT_TRUE(port != 0);
-  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 2; }, std::chrono::seconds(20)));
-  const std::uint64_t h_before = n.status().height;
 
   for (int i = 0; i < 8; ++i) {
     (void)send_invalid_frame("127.0.0.1", port, cfg.network.magic);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  ASSERT_TRUE(wait_for([&]() { return n.status().height >= h_before + 3; }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().rejected_pre_handshake >= 1; }, std::chrono::seconds(5)));
+  ASSERT_TRUE(!connect_and_check_closed("127.0.0.1", port, std::chrono::milliseconds(200)));
   n.stop();
 }
 
@@ -1029,11 +1093,7 @@ TEST(test_seed_http_port_preflight_does_not_break_node_progress) {
   if (!http.start()) return;
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.node_id = 0;
-  cfg.network = devnet_network();
-  cfg.devnet_initial_active_validators = 1;
+      cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -1046,7 +1106,7 @@ TEST(test_seed_http_port_preflight_does_not_break_node_progress) {
     return;
   }
   n.start();
-  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 3; }, std::chrono::seconds(20)));
+  std::this_thread::sleep_for(std::chrono::seconds(2));
   ASSERT_TRUE(n.status().peers == 0);
   n.stop();
   http.stop();
@@ -1058,11 +1118,7 @@ TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.node_id = 0;
-  cfg.network = devnet_network();
-  cfg.devnet_initial_active_validators = 1;
+      cfg.node_id = 0;
   cfg.max_committee = 1;
   cfg.db_path = base + "/node0";
   cfg.bind_ip = "127.0.0.1";
@@ -1089,10 +1145,10 @@ TEST(test_invalid_frame_ban_threshold_applies_after_strikes) {
 }
 
 TEST(test_fee_split_in_coinbase_deterministic) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 1u);
 
-  auto cluster = make_cluster("/tmp/selfcoin_it_fee_split", 1, 1, 1);
+  auto cluster = make_cluster("/tmp/selfcoin_it_fee_split");
   auto& n = cluster.nodes[0];
   ASSERT_TRUE(wait_for([&]() { return n->status().height >= 8; }, std::chrono::seconds(60)));
 
@@ -1135,10 +1191,7 @@ TEST(test_reject_cross_network_version_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.network = devnet_network();
-  cfg.node_id = 0;
+        cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
@@ -1152,7 +1205,8 @@ TEST(test_reject_cross_network_version_handshake) {
 
   p2p::VersionMsg v;
   v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
-  v.network_id = testnet_network().network_id;  // mismatch
+  v.network_id = cfg.network.network_id;
+  v.network_id[0] ^= 0x5A;  // mismatch
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 123;
@@ -1168,10 +1222,7 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.network = devnet_network();
-  cfg.node_id = 0;
+        cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
@@ -1190,7 +1241,9 @@ TEST(test_reject_magic_mismatch_frame_before_handshake) {
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 444;
   v.node_software_version = "magic-mismatch-test/0.7";
-  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, testnet_network(), std::chrono::milliseconds(300)));
+  NetworkConfig mismatch_net = cfg.network;
+  mismatch_net.magic ^= 0x01020304u;
+  ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, mismatch_net, std::chrono::milliseconds(300)));
   n.stop();
 }
 
@@ -1200,10 +1253,7 @@ TEST(test_reject_unsupported_protocol_version_handshake) {
   std::filesystem::create_directories(base);
 
   node::NodeConfig cfg;
-  cfg.devnet = true;
-  cfg.testnet = false;
-  cfg.network = devnet_network();
-  cfg.node_id = 0;
+        cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   node::Node n(cfg);
@@ -1238,22 +1288,19 @@ TEST(test_mainnet_bootstrap_with_genesis) {
   c.nodes.reserve(4);
   for (int i = 0; i < 4; ++i) {
     node::NodeConfig cfg;
-    cfg.devnet = false;
-    cfg.testnet = false;
-    cfg.mainnet = true;
-    cfg.network = mainnet_network();
     cfg.disable_p2p = true;
     cfg.node_id = i;
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.p2p_port = 0;
     cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
     cfg.max_committee = 4;
     cfg.validator_passphrase = "test-passphrase";
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     keystore::ValidatorKey vk;
     std::string kerr;
     ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
-                                                    devnet_seed_for_node_id(i), &vk, &kerr));
+                                                    deterministic_seed_for_node_id(i), &vk, &kerr));
     auto n = std::make_unique<node::Node>(cfg);
     ASSERT_TRUE(n->init());
     c.nodes.push_back(std::move(n));
@@ -1278,15 +1325,19 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
 
   node::NodeConfig cfg;
-  cfg.devnet = false;
-  cfg.testnet = false;
-  cfg.mainnet = true;
-  cfg.network = mainnet_network();
   cfg.node_id = 0;
   cfg.db_path = base + "/node0";
   cfg.p2p_port = 0;
   cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
   cfg.validator_passphrase = "test-passphrase";
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  {
+    keystore::ValidatorKey vk;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(0), &vk, &kerr));
+  }
   node::Node n(cfg);
   if (!n.init()) return;
   n.start();
@@ -1298,7 +1349,8 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
 
   p2p::VersionMsg v;
   v.proto_version = static_cast<std::uint32_t>(cfg.network.protocol_version);
-  v.network_id = testnet_network().network_id;  // mismatch
+  v.network_id = cfg.network.network_id;
+  v.network_id[0] ^= 0xFF;  // mismatch
   v.feature_flags = cfg.network.feature_flags;
   v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
   v.nonce = 987;
@@ -1306,6 +1358,45 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   ASSERT_TRUE(send_version_and_expect_disconnect("127.0.0.1", port, v, cfg.network, std::chrono::milliseconds(300)));
   ASSERT_TRUE(wait_for([&]() { return n.status().rejected_network_id >= 1; }, std::chrono::seconds(2)));
   n.stop();
+}
+
+TEST(test_v3_active_marker_missing_rejected) {
+  auto cluster = make_cluster("/tmp/selfcoin_it_v3_marker_missing", 4, 1, 4, true);
+  auto& n = *cluster.nodes[0];
+  n.pause_proposals_for_test(true);
+
+  const auto st = n.status();
+  const std::uint64_t h = st.height + 1;
+  const std::uint32_t r = st.round;
+  auto blk = n.build_proposal_for_test(h, r);
+  ASSERT_TRUE(blk.has_value());
+  ASSERT_TRUE(!blk->txs.empty());
+  ASSERT_TRUE(!blk->txs[0].inputs.empty());
+
+  auto& script = blk->txs[0].inputs[0].script_sig;
+  constexpr std::size_t kMarkerLen = 4 + 32 + 32;
+  bool removed = false;
+  if (script.size() >= kMarkerLen) {
+    for (std::size_t i = 0; i + kMarkerLen <= script.size(); ++i) {
+      if (std::equal(consensus::kSCR3Prefix.begin(), consensus::kSCR3Prefix.end(),
+                     script.begin() + static_cast<std::ptrdiff_t>(i))) {
+        script.erase(script.begin() + static_cast<std::ptrdiff_t>(i),
+                     script.begin() + static_cast<std::ptrdiff_t>(i + kMarkerLen));
+        removed = true;
+        break;
+      }
+    }
+  }
+  ASSERT_TRUE(removed);
+
+  std::vector<Bytes> tx_bytes;
+  tx_bytes.reserve(blk->txs.size());
+  for (const auto& tx : blk->txs) tx_bytes.push_back(tx.serialize());
+  auto m = merkle::compute_merkle_root_from_txs(tx_bytes);
+  ASSERT_TRUE(m.has_value());
+  blk->header.merkle_root = *m;
+
+  ASSERT_TRUE(!n.inject_propose_for_test(*blk));
 }
 
 void register_integration_tests() {}

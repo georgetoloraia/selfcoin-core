@@ -11,7 +11,7 @@ using namespace selfcoin;
 namespace {
 
 std::string make_mainnet_genesis_json(bool duplicate = false, bool bad_pub = false) {
-  const auto keys = node::Node::devnet_keypairs();
+  const auto keys = node::Node::deterministic_test_keypairs();
   std::vector<std::string> pubs;
   for (int i = 0; i < 4; ++i) {
     pubs.push_back(hex_encode(Bytes(keys[i].public_key.begin(), keys[i].public_key.end())));

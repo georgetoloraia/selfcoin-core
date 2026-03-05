@@ -9,7 +9,7 @@ using namespace selfcoin;
 TEST(test_version_message_v07_roundtrip) {
   p2p::VersionMsg v;
   v.proto_version = 7;
-  v.network_id = devnet_network().network_id;
+  v.network_id = mainnet_network().network_id;
   v.feature_flags = 0xA5A5;
   v.services = 11;
   v.timestamp = 22;
@@ -37,6 +37,48 @@ TEST(test_prefix_classification) {
   ASSERT_EQ(p2p::classify_prefix(Bytes{'{', '"', 'a'}), p2p::PrefixKind::JSON);
   ASSERT_EQ(p2p::classify_prefix(Bytes{0x16, 0x03, 0x01, 0x00}), p2p::PrefixKind::TLS);
   ASSERT_EQ(p2p::classify_prefix(Bytes{0x01, 0x02, 0x03}), p2p::PrefixKind::UNKNOWN);
+}
+
+TEST(test_propose_v5_codec_roundtrip) {
+  p2p::ProposeMsg p;
+  p.height = 10;
+  p.round = 3;
+  p.prev_finalized_hash.fill(0x11);
+  p.block_bytes = Bytes{0xAA, 0xBB, 0xCC};
+  p.vrf_proof = Bytes{1, 2, 3, 4};
+  p.vrf_output.fill(0x22);
+
+  const Bytes b = p2p::ser_propose(p, 5);
+  auto d = p2p::de_propose(b);
+  ASSERT_TRUE(d.has_value());
+  ASSERT_EQ(d->height, p.height);
+  ASSERT_EQ(d->round, p.round);
+  ASSERT_EQ(d->prev_finalized_hash, p.prev_finalized_hash);
+  ASSERT_EQ(d->block_bytes, p.block_bytes);
+  ASSERT_EQ(d->vrf_proof, p.vrf_proof);
+  ASSERT_EQ(d->vrf_output, p.vrf_output);
+}
+
+TEST(test_vote_v5_codec_roundtrip) {
+  p2p::VoteMsg m;
+  m.vote.height = 7;
+  m.vote.round = 2;
+  m.vote.block_id.fill(0x31);
+  m.vote.validator_pubkey.fill(0x41);
+  m.vote.signature.fill(0x51);
+  m.vrf_proof = Bytes{9, 8, 7};
+  m.vrf_output.fill(0x61);
+
+  const Bytes b = p2p::ser_vote(m, 5);
+  auto d = p2p::de_vote(b);
+  ASSERT_TRUE(d.has_value());
+  ASSERT_EQ(d->vote.height, m.vote.height);
+  ASSERT_EQ(d->vote.round, m.vote.round);
+  ASSERT_EQ(d->vote.block_id, m.vote.block_id);
+  ASSERT_EQ(d->vote.validator_pubkey, m.vote.validator_pubkey);
+  ASSERT_EQ(d->vote.signature, m.vote.signature);
+  ASSERT_EQ(d->vrf_proof, m.vrf_proof);
+  ASSERT_EQ(d->vrf_output, m.vrf_output);
 }
 
 void register_p2p_tests() {}

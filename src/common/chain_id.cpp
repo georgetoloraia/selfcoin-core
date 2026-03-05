@@ -16,7 +16,6 @@ std::optional<Hash32> expected_genesis_hash(const NetworkConfig& cfg, const std:
 std::string default_genesis_source(const NetworkConfig& cfg, const std::optional<genesis::Document>& doc) {
   if (doc.has_value()) return "file";
   if (cfg.name == "mainnet") return "embedded";
-  if (cfg.name == "devnet") return "devnet";
   return "file";
 }
 

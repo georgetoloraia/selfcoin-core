@@ -30,7 +30,37 @@ export interface HeaderEntry {
   height: bigint;
   header_hex: Hex;
   block_hash: Hex;
+  utxo_root?: Hex;
+  validators_root?: Hex;
   finality_proof: FinalitySig[];
+}
+
+export interface RootPair {
+  height: bigint;
+  utxo_root: Hex;
+  validators_root: Hex;
+}
+
+export interface UtxoProof {
+  proof_format: 'smt_v0';
+  height: bigint;
+  key_hex: Hex;
+  root_hex: Hex;
+  utxo_root: Hex;
+  value_hex: Hex | null;
+  siblings_hex: Hex[];
+  siblings: Hex[];
+}
+
+export interface ValidatorProof {
+  proof_format: 'smt_v0';
+  height: bigint;
+  key_hex: Hex;
+  root_hex: Hex;
+  validators_root: Hex;
+  value_hex: Hex | null;
+  siblings_hex: Hex[];
+  siblings: Hex[];
 }
 
 export interface TxLookup {

@@ -7,3 +7,5 @@ export * from './wallet/SelfCoinWallet.js';
 export * from './wallet/coinSelection.js';
 export * from './crypto/ed25519.js';
 export * from './crypto/hash.js';
+export * from './proofs/smt.js';
+export * from './proofs/finality.js';

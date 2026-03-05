@@ -16,11 +16,17 @@
 
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
+#include "consensus/activation.hpp"
+#include "consensus/sortition_v5.hpp"
+#include "consensus/sortition_v6.hpp"
+#include "consensus/state_commitment.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/monetary.hpp"
 #include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "crypto/smt.hpp"
+#include "crypto/vrf.hpp"
 #include "genesis/embedded_mainnet.hpp"
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
@@ -43,11 +49,6 @@ std::string short_pub_hex(const PubKey32& pub) {
 std::string short_hash_hex(const Hash32& h) {
   Bytes b(h.begin(), h.begin() + 4);
   return hex_encode(b);
-}
-
-Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
-  std::string msg = "cb:" + std::to_string(h) + ":" + std::to_string(r);
-  return Bytes(msg.begin(), msg.end());
 }
 
 bool restart_debug_enabled() {
@@ -74,6 +75,172 @@ std::string token_value(const std::string& s, const std::string& key) {
 std::mutex g_local_bus_mu;
 std::vector<Node*> g_local_bus_nodes;
 
+constexpr const char* kSmtTreeUtxo = "utxo";
+constexpr const char* kSmtTreeValidators = "validators";
+
+bool v3_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 3;
+}
+
+bool v4_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 4;
+}
+
+bool v5_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 5;
+}
+
+bool v6_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 6;
+}
+
+bool v7_active_for_height(const consensus::ActivationState& st, const consensus::ActivationParams& params,
+                          std::uint64_t height) {
+  return params.enabled && consensus::version_for_height(st, params, height) >= 7;
+}
+
+struct StateRootsV3 {
+  Hash32 utxo_root{};
+  Hash32 validators_root{};
+};
+
+StateRootsV3 compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators,
+                                     std::uint32_t consensus_version) {
+  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
+  utxo_leaves.reserve(utxos.size());
+  for (const auto& [op, ue] : utxos) {
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+  }
+
+  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
+  validator_leaves.reserve(validators.all().size());
+  for (const auto& [pub, info] : validators.all()) {
+    validator_leaves.push_back(
+        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, consensus_version)});
+  }
+
+  StateRootsV3 roots;
+  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
+  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
+  return roots;
+}
+
+std::string smt_leaf_prefix(const std::string& tree_id) { return "SMTL:" + tree_id + ":"; }
+std::string smt_leaf_key(const std::string& tree_id, const Hash32& key) {
+  return smt_leaf_prefix(tree_id) + hex_encode(Bytes(key.begin(), key.end()));
+}
+std::string root_index_key(const std::string& kind, std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "ROOT:" + kind + ":" + hex_encode(w.data());
+}
+
+constexpr const char* kV4JoinWindowStartKey = "PV4:JOIN_WINDOW_START";
+constexpr const char* kV4JoinWindowCountKey = "PV4:JOIN_WINDOW_COUNT";
+constexpr const char* kV4LivenessEpochStartKey = "PV4:LIVENESS_EPOCH_START";
+
+std::string marker_error_to_string(consensus::MarkerError err) {
+  switch (err) {
+    case consensus::MarkerError::kNone:
+      return "none";
+    case consensus::MarkerError::kMissing:
+      return "missing";
+    case consensus::MarkerError::kMultipleMarkers:
+      return "multiple";
+    case consensus::MarkerError::kWrongLength:
+      return "wrong-length";
+  }
+  return "unknown";
+}
+
+void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vector<std::pair<Hash32, Bytes>>& leaves) {
+  const std::string prefix = smt_leaf_prefix(tree_id);
+  std::set<std::string> desired;
+  desired.clear();
+  for (const auto& [k, _] : leaves) desired.insert(smt_leaf_key(tree_id, k));
+  for (const auto& [k, _] : db.scan_prefix(prefix)) {
+    if (desired.find(k) == desired.end()) (void)db.put(k, {});
+  }
+  for (const auto& [k, v] : leaves) (void)db.put(smt_leaf_key(tree_id, k), v);
+}
+
+StateRootsV3 persist_v3_state_roots(storage::DB& db, std::uint64_t height, const UtxoSet& utxos,
+                                    const consensus::ValidatorRegistry& validators, std::uint32_t consensus_version) {
+  std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
+  utxo_leaves.reserve(utxos.size());
+  for (const auto& [op, ue] : utxos) {
+    utxo_leaves.push_back({consensus::utxo_commitment_key(op), consensus::utxo_commitment_value(ue.out)});
+  }
+  std::vector<std::pair<Hash32, Bytes>> validator_leaves;
+  validator_leaves.reserve(validators.all().size());
+  for (const auto& [pub, info] : validators.all()) {
+    validator_leaves.push_back(
+        {consensus::validator_commitment_key(pub), consensus::validator_commitment_value(info, consensus_version)});
+  }
+
+  sync_smt_tree(db, kSmtTreeUtxo, utxo_leaves);
+  sync_smt_tree(db, kSmtTreeValidators, validator_leaves);
+
+  StateRootsV3 roots{};
+  roots.utxo_root = crypto::SparseMerkleTree::compute_root_from_leaves(utxo_leaves);
+  roots.validators_root = crypto::SparseMerkleTree::compute_root_from_leaves(validator_leaves);
+  crypto::SparseMerkleTree utxo_tree(db, kSmtTreeUtxo);
+  crypto::SparseMerkleTree validators_tree(db, kSmtTreeValidators);
+  (void)utxo_tree.set_root_for_height(height, roots.utxo_root);
+  (void)validators_tree.set_root_for_height(height, roots.validators_root);
+  (void)db.put(root_index_key("UTXO", height), Bytes(roots.utxo_root.begin(), roots.utxo_root.end()));
+  (void)db.put(root_index_key("VAL", height), Bytes(roots.validators_root.begin(), roots.validators_root.end()));
+  return roots;
+}
+
+void apply_validator_changes_in_memory(consensus::ValidatorRegistry* registry, const Block& block, const UtxoSet& pre_utxos,
+                                       std::uint64_t height, bool enforce_v4) {
+  if (!registry) return;
+  for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    for (const auto& in : tx.inputs) {
+      OutPoint op{in.prev_txid, in.prev_index};
+      auto it = pre_utxos.find(op);
+      if (it == pre_utxos.end()) continue;
+      PubKey32 pub{};
+      if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) registry->ban(pub);
+      else registry->request_unbond(pub, height);
+    }
+  }
+  for (const auto& tx : block.txs) {
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
+      PubKey32 pub{};
+      if (is_validator_register_script(out.script_pubkey, &pub)) {
+        if (enforce_v4) {
+          (void)registry->register_bond(pub, OutPoint{txid, out_i}, height, out.value, nullptr);
+        } else if (out.value == BOND_AMOUNT) {
+          registry->register_bond_legacy(pub, OutPoint{txid, out_i}, height);
+        }
+      }
+    }
+  }
+  registry->advance_height(height + 1);
+}
+
+std::optional<StateRootsV3> compute_post_state_roots_for_block(const Block& block, const UtxoSet& pre_utxos,
+                                                                const consensus::ValidatorRegistry& pre_validators,
+                                                                std::uint64_t height, bool enforce_v4,
+                                                                std::uint32_t consensus_version) {
+  UtxoSet post_utxos = pre_utxos;
+  consensus::ValidatorRegistry post_validators = pre_validators;
+  apply_validator_changes_in_memory(&post_validators, block, pre_utxos, height, enforce_v4);
+  apply_block_to_utxo(block, post_utxos);
+  return compute_roots_for_state(post_utxos, post_validators, consensus_version);
+}
+
 }  // namespace
 
 Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
@@ -83,7 +250,7 @@ Node::Node(NodeConfig cfg) : cfg_(std::move(cfg)) {
 
 Node::~Node() { stop(); }
 
-std::vector<crypto::KeyPair> Node::devnet_keypairs() {
+std::vector<crypto::KeyPair> Node::deterministic_test_keypairs() {
   std::vector<crypto::KeyPair> out;
   for (int i = 1; i <= 16; ++i) {
     std::array<std::uint8_t, 32> seed{};
@@ -96,14 +263,7 @@ std::vector<crypto::KeyPair> Node::devnet_keypairs() {
 
 bool Node::init() {
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
-  if (cfg_.testnet && cfg_.min_relay_fee == 0) cfg_.min_relay_fee = 1000;
-  if (cfg_.mainnet) {
-    genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
-  } else if (cfg_.devnet) {
-    genesis_source_hint_ = "devnet";
-  } else {
-    genesis_source_hint_ = "file";
-  }
+  genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   cfg_.db_path = expand_user_home(cfg_.db_path);
   const std::filesystem::path dbp(cfg_.db_path);
   const auto parent = dbp.parent_path();
@@ -117,17 +277,100 @@ bool Node::init() {
   }
   discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds, cfg_.invalid_frame_ban_threshold,
                                     cfg_.invalid_frame_window_seconds);
-  p2p::AddrPolicy addr_policy;
-  if (cfg_.mainnet) {
-    addr_policy.required_port = cfg_.network.p2p_default_port;
-    addr_policy.reject_unroutable = true;
+  activation_params_.enabled = cfg_.network.activation_enabled;
+  activation_params_.initial_version = cfg_.network.initial_consensus_version;
+  activation_params_.max_version = cfg_.network.max_consensus_version;
+  activation_params_.window_blocks = cfg_.network.activation_window_blocks;
+  activation_params_.threshold_percent = cfg_.network.activation_threshold_percent;
+  activation_params_.activation_delay_blocks = cfg_.network.activation_delay_blocks;
+  if (cfg_.activation_enabled_override.has_value()) activation_params_.enabled = *cfg_.activation_enabled_override;
+  if (cfg_.activation_max_version_override.has_value()) activation_params_.max_version = *cfg_.activation_max_version_override;
+  if (cfg_.activation_window_blocks_override.has_value())
+    activation_params_.window_blocks = *cfg_.activation_window_blocks_override;
+  if (cfg_.activation_threshold_percent_override.has_value())
+    activation_params_.threshold_percent = *cfg_.activation_threshold_percent_override;
+  if (cfg_.activation_delay_blocks_override.has_value())
+    activation_params_.activation_delay_blocks = *cfg_.activation_delay_blocks_override;
+  v4_min_bond_ = cfg_.network.validator_min_bond;
+  v7_min_bond_amount_ = cfg_.network.v7_min_bond_amount;
+  v7_max_bond_amount_ = cfg_.network.v7_max_bond_amount;
+  v7_effective_units_cap_ = cfg_.network.v7_effective_units_cap;
+  v4_warmup_blocks_ = cfg_.network.validator_warmup_blocks;
+  v4_cooldown_blocks_ = cfg_.network.validator_cooldown_blocks;
+  v4_join_limit_window_blocks_ = cfg_.network.validator_join_limit_window_blocks;
+  v4_join_limit_max_new_ = cfg_.network.validator_join_limit_max_new;
+  v4_liveness_window_blocks_ = cfg_.network.liveness_window_blocks;
+  v4_miss_rate_suspend_threshold_percent_ = cfg_.network.miss_rate_suspend_threshold_percent;
+  v4_miss_rate_exit_threshold_percent_ = cfg_.network.miss_rate_exit_threshold_percent;
+  v4_suspend_duration_blocks_ = cfg_.network.suspend_duration_blocks;
+  v5_params_.proposer_expected_num = cfg_.network.v5_proposer_expected_num;
+  v5_params_.proposer_expected_den = cfg_.network.v5_proposer_expected_den;
+  v5_params_.voter_target_k = cfg_.network.v5_voter_target_k;
+  v5_params_.round_expand_cap = cfg_.network.v5_round_expand_cap;
+  v5_params_.round_expand_factor = cfg_.network.v5_round_expand_factor;
+  v6_params_.weight.bond_unit = cfg_.network.v6_bond_unit;
+  v6_params_.weight.units_max = cfg_.network.v6_units_max;
+  v6_params_.proposer_expected_num = cfg_.network.v6_proposer_expected_num;
+  v6_params_.proposer_expected_den = cfg_.network.v6_proposer_expected_den;
+  v6_params_.voter_target_k = cfg_.network.v6_voter_target_k;
+  v6_params_.round_expand_cap = cfg_.network.v6_round_expand_cap;
+  v6_params_.round_expand_factor = cfg_.network.v6_round_expand_factor;
+  if (cfg_.validator_min_bond_override.has_value()) v4_min_bond_ = *cfg_.validator_min_bond_override;
+  if (cfg_.v7_min_bond_amount_override.has_value()) v7_min_bond_amount_ = *cfg_.v7_min_bond_amount_override;
+  if (cfg_.v7_max_bond_amount_override.has_value()) v7_max_bond_amount_ = *cfg_.v7_max_bond_amount_override;
+  if (cfg_.v7_effective_units_cap_override.has_value())
+    v7_effective_units_cap_ = *cfg_.v7_effective_units_cap_override;
+  if (v7_max_bond_amount_ < v7_min_bond_amount_) v7_max_bond_amount_ = v7_min_bond_amount_;
+  if (cfg_.validator_warmup_blocks_override.has_value()) v4_warmup_blocks_ = *cfg_.validator_warmup_blocks_override;
+  if (cfg_.validator_cooldown_blocks_override.has_value()) v4_cooldown_blocks_ = *cfg_.validator_cooldown_blocks_override;
+  if (cfg_.validator_join_limit_window_blocks_override.has_value())
+    v4_join_limit_window_blocks_ = *cfg_.validator_join_limit_window_blocks_override;
+  if (cfg_.validator_join_limit_max_new_override.has_value()) v4_join_limit_max_new_ = *cfg_.validator_join_limit_max_new_override;
+  if (cfg_.liveness_window_blocks_override.has_value()) v4_liveness_window_blocks_ = *cfg_.liveness_window_blocks_override;
+  if (cfg_.miss_rate_suspend_threshold_percent_override.has_value())
+    v4_miss_rate_suspend_threshold_percent_ = *cfg_.miss_rate_suspend_threshold_percent_override;
+  if (cfg_.miss_rate_exit_threshold_percent_override.has_value())
+    v4_miss_rate_exit_threshold_percent_ = *cfg_.miss_rate_exit_threshold_percent_override;
+  if (cfg_.suspend_duration_blocks_override.has_value()) v4_suspend_duration_blocks_ = *cfg_.suspend_duration_blocks_override;
+  if (cfg_.v5_proposer_expected_num_override.has_value())
+    v5_params_.proposer_expected_num = *cfg_.v5_proposer_expected_num_override;
+  if (cfg_.v5_proposer_expected_den_override.has_value())
+    v5_params_.proposer_expected_den = std::max<std::uint64_t>(1, *cfg_.v5_proposer_expected_den_override);
+  if (cfg_.v5_voter_target_k_override.has_value()) v5_params_.voter_target_k = *cfg_.v5_voter_target_k_override;
+  if (cfg_.v5_round_expand_cap_override.has_value()) v5_params_.round_expand_cap = *cfg_.v5_round_expand_cap_override;
+  if (cfg_.v5_round_expand_factor_override.has_value())
+    v5_params_.round_expand_factor = std::max<std::uint32_t>(2, *cfg_.v5_round_expand_factor_override);
+  if (cfg_.v6_bond_unit_override.has_value()) v6_params_.weight.bond_unit = std::max<std::uint64_t>(1, *cfg_.v6_bond_unit_override);
+  if (cfg_.v6_units_max_override.has_value()) v6_params_.weight.units_max = std::max<std::uint64_t>(1, *cfg_.v6_units_max_override);
+  if (cfg_.v6_proposer_expected_num_override.has_value()) v6_params_.proposer_expected_num = *cfg_.v6_proposer_expected_num_override;
+  if (cfg_.v6_proposer_expected_den_override.has_value())
+    v6_params_.proposer_expected_den = std::max<std::uint64_t>(1, *cfg_.v6_proposer_expected_den_override);
+  if (cfg_.v6_voter_target_k_override.has_value()) v6_params_.voter_target_k = *cfg_.v6_voter_target_k_override;
+  if (cfg_.v6_round_expand_cap_override.has_value()) v6_params_.round_expand_cap = *cfg_.v6_round_expand_cap_override;
+  if (cfg_.v6_round_expand_factor_override.has_value())
+    v6_params_.round_expand_factor = std::max<std::uint32_t>(2, *cfg_.v6_round_expand_factor_override);
+
+  validators_.set_rules(consensus::ValidatorRules{
+      .min_bond = v4_min_bond_,
+      .warmup_blocks = v4_warmup_blocks_,
+      .cooldown_blocks = v4_cooldown_blocks_,
+  });
+  activation_state_.current_version = activation_params_.initial_version;
+  if (activation_params_.enabled) {
+    log_line("activation override enabled max_version=" + std::to_string(activation_params_.max_version) +
+             " window=" + std::to_string(activation_params_.window_blocks) +
+             " threshold=" + std::to_string(activation_params_.threshold_percent) +
+             " delay=" + std::to_string(activation_params_.activation_delay_blocks));
   }
+  p2p::AddrPolicy addr_policy;
+  addr_policy.required_port = cfg_.network.p2p_default_port;
+  addr_policy.reject_unroutable = true;
   addrman_.set_policy(addr_policy);
   if (!db_.open(cfg_.db_path)) {
     std::cerr << "db open failed: " << cfg_.db_path << "\n";
     return false;
   }
-  if (cfg_.mainnet && !init_mainnet_genesis()) {
+  if (!init_mainnet_genesis()) {
     std::cerr << "mainnet genesis init failed\n";
     return false;
   }
@@ -163,57 +406,28 @@ bool Node::init() {
   }
 
   {
-    bool key_loaded = false;
-    if (cfg_.mainnet || !cfg_.validator_key_file.empty()) {
-      const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
-                                                        ? keystore::default_validator_keystore_path(cfg_.db_path)
-                                                        : cfg_.validator_key_file);
-      keystore::ValidatorKey vk;
-      std::string kerr;
-      if (keystore::keystore_exists(key_path)) {
-        if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
-          std::cerr << "failed to load validator keystore: " << kerr << "\n";
-          return false;
-        }
-      } else {
-        if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
-                                                 keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
-                                                 &kerr)) {
-          std::cerr << "failed to create validator keystore: " << kerr << "\n";
-          return false;
-        }
-        log_line("created validator keystore path=" + key_path);
-      }
-      local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
-      local_key_.public_key = vk.pubkey;
-      log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
-      key_loaded = true;
-    }
-
-    const auto keys = devnet_keypairs();
-    if (!key_loaded) {
-      if (keys.empty()) {
-        std::cerr << "no key material available\n";
+    const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
+                                                      ? keystore::default_validator_keystore_path(cfg_.db_path)
+                                                      : cfg_.validator_key_file);
+    keystore::ValidatorKey vk;
+    std::string kerr;
+    if (keystore::keystore_exists(key_path)) {
+      if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
+        std::cerr << "failed to load validator keystore: " << kerr << "\n";
         return false;
       }
-      const int safe_node_id = std::max(0, cfg_.node_id);
-      local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
-    }
-
-    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet)) {
-      const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
-      for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
-        const auto& kp = keys[idx];
-        consensus::ValidatorInfo vi;
-        vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
-        vi.joined_height = 0;
-        vi.has_bond = (idx < n_active);
-        vi.bond_outpoint = OutPoint{zero_hash(), 0};
-        vi.unbond_height = 0;
-        validators_.upsert(kp.public_key, vi);
-        db_.put_validator(kp.public_key, vi);
+    } else {
+      if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
+                                               keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
+                                               &kerr)) {
+        std::cerr << "failed to create validator keystore: " << kerr << "\n";
+        return false;
       }
+      log_line("created validator keystore path=" + key_path);
     }
+    local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
+    local_key_.public_key = vk.pubkey;
+    log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
     is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
   }
 
@@ -224,10 +438,10 @@ bool Node::init() {
   load_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
-  if ((cfg_.testnet || cfg_.mainnet) && cfg_.seeds.empty()) {
+  if (cfg_.seeds.empty()) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
   }
-  if ((cfg_.mainnet || cfg_.testnet) && cfg_.dns_seeds) {
+  if (cfg_.dns_seeds) {
     dns_seed_peers_ = resolve_dns_seeds_once();
     for (const auto& d : dns_seed_peers_) bootstrap_peers_.push_back(d);
   }
@@ -284,7 +498,7 @@ bool Node::init() {
           } else if (klass == "TLS") {
             log_line("peer sent TLS handshake bytes; do not place TLS/proxy in front of P2P port");
           } else if (token_value(detail, "reason") == "MAGIC_MISMATCH") {
-            log_line("magic mismatch: peer is likely on a different network (devnet/testnet/mainnet)");
+            log_line("magic mismatch: peer is likely on a different network");
           }
         }
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
@@ -362,13 +576,12 @@ NodeStatus Node::status() const {
   s.round = current_round_;
   s.tip_hash = finalized_hash_;
   s.tip_hash_short = short_hash_hex(finalized_hash_);
-  const auto active = validators_.active_sorted(finalized_height_ + 1);
-  auto leader = consensus::select_leader(finalized_hash_, finalized_height_ + 1, current_round_, active);
+  auto leader = leader_for_height_round(finalized_height_ + 1, current_round_);
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
   s.peers = peer_count();
   s.mempool_size = mempool_.size();
-  const auto committee = committee_for_height(finalized_height_ + 1);
+  const auto committee = committee_for_height_round(finalized_height_ + 1, current_round_);
   s.committee_size = committee.size();
   s.quorum_threshold = consensus::quorum_threshold(committee.size());
   s.addrman_size = addrman_.size();
@@ -379,13 +592,17 @@ NodeStatus Node::status() const {
   s.rejected_network_id = rejected_network_id_;
   s.rejected_protocol_version = rejected_protocol_version_;
   s.rejected_pre_handshake = rejected_pre_handshake_;
+  s.consensus_version = activation_state_.current_version;
+  s.pending_consensus_version = activation_state_.pending_version;
+  s.pending_activation_height = activation_state_.pending_activation_height;
+  s.participation_eligible_signers = static_cast<std::uint64_t>(last_participation_eligible_signers_);
   return s;
 }
 
 std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers,
                                          std::size_t* quorum_threshold) const {
   const std::uint64_t h = finalized_height_ + 1;
-  const auto committee = committee_for_height(h);
+  const auto committee = committee_for_height_round(h, current_round_);
   const std::size_t quorum = consensus::quorum_threshold(committee.size());
   if (quorum_threshold) *quorum_threshold = quorum;
 
@@ -410,15 +627,29 @@ std::string Node::consensus_state_locked(std::uint64_t now_ms, std::size_t* obse
   return "FINALIZING";
 }
 
-bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0); }
+bool Node::inject_vote_for_test(const Vote& vote) { return handle_vote(vote, false, 0, {}, nullptr); }
+bool Node::inject_propose_for_test(const Block& block) {
+  p2p::ProposeMsg p;
+  p.height = block.header.height;
+  p.round = block.header.round;
+  p.prev_finalized_hash = block.header.prev_finalized_hash;
+  p.block_bytes = block.serialize();
+  return handle_propose(p, false);
+}
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_ + 1);
   mempool_.set_validation_context(
-      SpecialValidationContext{&validators_, finalized_height_ + 1,
-                               [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                 return is_committee_member_for(pub, h, round);
-                               }});
+      SpecialValidationContext{
+          .validators = &validators_,
+          .current_height = finalized_height_ + 1,
+          .consensus_version = cv,
+          .v7_min_bond_amount = v7_min_bond_amount_,
+          .v7_max_bond_amount = v7_max_bond_amount_,
+          .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+            return is_committee_member_for(pub, h, round);
+          }});
   std::string err;
   return mempool_.accept_tx(tx, utxos_, &err);
 }
@@ -471,7 +702,7 @@ std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
 }
 std::vector<PubKey32> Node::committee_for_next_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
-  return committee_for_height(finalized_height_ + 1);
+  return committee_for_height_round(finalized_height_ + 1, current_round_);
 }
 std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
   std::lock_guard<std::mutex> lk(mu_);
@@ -479,20 +710,41 @@ std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubK
 }
 std::uint16_t Node::p2p_port_for_test() const { return cfg_.p2p_port; }
 
+std::optional<Block> Node::build_proposal_for_test(std::uint64_t height, std::uint32_t round) {
+  return build_proposal_block(height, round);
+}
+
+std::pair<std::uint64_t, std::uint32_t> Node::v4_join_window_state_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return {v4_join_window_start_height_, v4_join_count_in_window_};
+}
+
+std::uint64_t Node::v4_liveness_epoch_start_for_test() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return v4_liveness_epoch_start_height_;
+}
+
 void Node::event_loop() {
   while (running_) {
     std::optional<Block> to_propose;
+    p2p::ProposeMsg v5_local_propose_msg{};
     {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
       validators_.advance_height(h);
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, h);
       mempool_.set_validation_context(
-          SpecialValidationContext{&validators_, h, [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
-                                     return is_committee_member_for(pub, ch, round);
-                                   }});
-      const auto active = validators_.active_sorted(h);
-      const auto committee = consensus::select_committee(finalized_hash_, h, active, cfg_.max_committee);
-      const auto leader = consensus::select_leader(finalized_hash_, h, current_round_, active);
+          SpecialValidationContext{
+              .validators = &validators_,
+              .current_height = h,
+              .consensus_version = cv,
+              .v7_min_bond_amount = v7_min_bond_amount_,
+              .v7_max_bond_amount = v7_max_bond_amount_,
+              .is_committee_member = [this](const PubKey32& pub, std::uint64_t ch, std::uint32_t round) {
+                return is_committee_member_for(pub, ch, round);
+              }});
+      const auto committee = committee_for_height_round(h, current_round_);
+      const auto leader = leader_for_height_round(h, current_round_);
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
 
       const std::uint64_t now_ms = now_unix() * 1000;
@@ -523,6 +775,8 @@ void Node::event_loop() {
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
             << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
             << ",\"committee_size\":" << committee.size() << ",\"addrman_size\":" << addrman_.size()
+            << ",\"consensus_version\":" << activation_state_.current_version
+            << ",\"pending_consensus_version\":" << activation_state_.pending_version
             << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\""
             << ",\"genesis_source\":\"" << chain_id_.genesis_source << "\""
             << ",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false")
@@ -554,25 +808,101 @@ void Node::event_loop() {
             << ",\"outbound_target\":" << cfg_.outbound_target << ",\"addrman_size\":" << addrman_.size()
             << ",\"bootstrap_source_last\":\"" << last_bootstrap_source_ << "\",\"committee_size\":" << committee.size()
             << ",\"quorum_threshold\":" << q << ",\"observed_signers\":" << observed
-            << ",\"consensus_state\":\"" << state << "\"}";
+            << ",\"consensus_state\":\"" << state << "\",\"consensus_version\":" << activation_state_.current_version
+            << ",\"pending_consensus_version\":" << activation_state_.pending_version
+            << ",\"pending_activation_height\":" << activation_state_.pending_activation_height << "}";
           std::cout << j.str() << "\n";
         } else {
           std::cout << cfg_.network.name << " h=" << finalized_height_ << " tip=" << short_hash_hex(finalized_hash_)
                     << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8)
                     << " peers=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
                     << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
-                    << " addrman=" << addrman_.size() << " state=" << state << "\n";
+                    << " addrman=" << addrman_.size() << " cv=" << activation_state_.current_version << " state=" << state
+                    << "\n";
         }
         last_summary_log_ms_ = now_ms;
       }
 
-      if (!pause_proposals_.load() && leader.has_value() && *leader == local_key_.public_key) {
+      bool can_propose = false;
+      if (v6_active_for_height(h) && cv >= 6) {
+        const auto active = validators_.active_sorted(h);
+        if (validators_.is_active_for_height(local_key_.public_key, h) && !active.empty()) {
+          const auto maybe_info = validators_.get(local_key_.public_key);
+          if (maybe_info.has_value()) {
+            std::uint64_t local_weight = 0;
+            std::uint64_t total_weight = 0;
+            if (cv >= 7 && v7_active_for_height(h)) {
+              const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+              local_weight = consensus::validator_effective_weight_units_v7(*maybe_info, v6_params_.weight, v7w);
+              total_weight = consensus::total_active_effective_weight_units_v7(validators_, h, v6_params_.weight, v7w);
+            } else {
+              local_weight = consensus::validator_weight_units_v6(*maybe_info, v6_params_.weight);
+              total_weight = consensus::total_active_weight_units_v6(validators_, h, v6_params_.weight);
+            }
+            if (local_weight > 0 && total_weight > 0) {
+              FinalityProof prev_fp{};
+              if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+                if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+              }
+              const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+              const auto seed = consensus::make_vrf_seed_v5(prev_entropy, h, current_round_);
+              const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::PROPOSER);
+              const Bytes transcript = consensus::make_v5_vrf_transcript(
+                  consensus::V5Role::PROPOSER, h, current_round_, role_seed, cfg_.network.network_id);
+              auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);
+              if (proof.has_value()) {
+                const auto threshold = consensus::threshold_weighted_v6(
+                    total_weight, local_weight, v6_params_.proposer_expected_num, v6_params_.proposer_expected_den);
+                can_propose = consensus::eligible_weighted_v6(proof->output, threshold);
+                if (can_propose) {
+                  v5_local_propose_msg.height = h;
+                  v5_local_propose_msg.round = current_round_;
+                  v5_local_propose_msg.prev_finalized_hash = finalized_hash_;
+                  v5_local_propose_msg.vrf_proof = proof->proof;
+                  v5_local_propose_msg.vrf_output = proof->output;
+                }
+              }
+            }
+          }
+        }
+      } else if (v5_active_for_height(h) && cv >= 5) {
+        const auto active = validators_.active_sorted(h);
+        if (validators_.is_active_for_height(local_key_.public_key, h) && !active.empty()) {
+          FinalityProof prev_fp{};
+          if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+            if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+          }
+          const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+          const auto seed = consensus::make_vrf_seed_v5(prev_entropy, h, current_round_);
+          const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::PROPOSER);
+          const Bytes transcript = consensus::make_v5_vrf_transcript(
+              consensus::V5Role::PROPOSER, h, current_round_, role_seed, cfg_.network.network_id);
+          auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);
+          if (proof.has_value()) {
+            can_propose = consensus::is_output_below_probability_threshold(
+                proof->output, v5_params_.proposer_expected_num,
+                std::max<std::uint64_t>(1, v5_params_.proposer_expected_den * active.size()));
+            if (can_propose) {
+              v5_local_propose_msg.height = h;
+              v5_local_propose_msg.round = current_round_;
+              v5_local_propose_msg.prev_finalized_hash = finalized_hash_;
+              v5_local_propose_msg.vrf_proof = proof->proof;
+              v5_local_propose_msg.vrf_output = proof->output;
+            }
+          }
+        }
+      } else if (leader.has_value() && *leader == local_key_.public_key) {
+        can_propose = true;
+      }
+
+      if (!pause_proposals_.load() && can_propose) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           auto b = build_proposal_block(h, current_round_);
           if (b.has_value()) {
             proposed_in_round_[key] = true;
             candidate_blocks_[b->header.block_id()] = *b;
+            if (v5_active_for_height(h) && cv >= 5) v5_local_propose_msg.block_bytes = b->serialize();
             to_propose = *b;
           }
         }
@@ -580,10 +910,15 @@ void Node::event_loop() {
     }
 
     if (to_propose.has_value()) {
-      broadcast_propose(*to_propose);
-      handle_propose(p2p::ProposeMsg{to_propose->header.height, to_propose->header.round,
-                                     to_propose->header.prev_finalized_hash, to_propose->serialize()},
-                     false);
+      p2p::ProposeMsg local_msg{to_propose->header.height, to_propose->header.round,
+                                to_propose->header.prev_finalized_hash, to_propose->serialize()};
+      if (v5_active_for_height(to_propose->header.height)) {
+        local_msg.vrf_proof = v5_local_propose_msg.vrf_proof;
+        local_msg.vrf_output = v5_local_propose_msg.vrf_output;
+      }
+      broadcast_propose(*to_propose, local_msg.vrf_proof,
+                        local_msg.vrf_proof.empty() ? nullptr : &local_msg.vrf_output);
+      handle_propose(local_msg, false);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -754,29 +1089,66 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
           if (total + sz > kMaxCandidateBlockBytes) return;
           candidate_block_sizes_[bid] = sz;
         }
-        const auto committee = committee_for_height(blk->header.height);
-        if (committee.empty()) return;
-        const std::size_t quorum = consensus::quorum_threshold(committee.size());
-        std::set<PubKey32> committee_set(committee.begin(), committee.end());
+        const std::uint32_t cv =
+            consensus::version_for_height(activation_state_, activation_params_, blk->header.height);
+        std::set<PubKey32> committee_set;
+        std::size_t quorum = 0;
+        if (cv >= 6 && v6_active_for_height(blk->header.height)) {
+          const auto active = validators_.active_sorted(blk->header.height);
+          if (active.empty()) return;
+          const std::size_t k_eff = std::max<std::size_t>(
+              2, std::min<std::size_t>(active.size(), consensus::voter_target_k_v6(active.size(), blk->header.round, v6_params_)));
+          quorum = consensus::quorum_threshold(k_eff);
+        } else if (cv >= 5 && v5_active_for_height(blk->header.height)) {
+          const auto active = validators_.active_sorted(blk->header.height);
+          if (active.empty()) return;
+          const std::size_t k_eff = std::max<std::size_t>(
+              2, std::min<std::size_t>(active.size(), consensus::voter_target_k_v5(active.size(), blk->header.round, v5_params_)));
+          quorum = consensus::quorum_threshold(k_eff);
+        } else {
+          const auto committee = committee_for_height_round(blk->header.height, blk->header.round);
+          if (committee.empty()) return;
+          quorum = consensus::quorum_threshold(committee.size());
+          committee_set.insert(committee.begin(), committee.end());
+        }
         std::set<PubKey32> seen;
         std::size_t valid_sigs = 0;
+        std::vector<FinalitySig> filtered_sigs;
+        filtered_sigs.reserve(blk->finality_proof.sigs.size());
         for (const auto& s : blk->finality_proof.sigs) {
-          if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+          if (!committee_set.empty() && committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
           if (!seen.insert(s.validator_pubkey).second) continue;
           Bytes bid_bytes(bid.begin(), bid.end());
           if (!crypto::ed25519_verify(bid_bytes, s.signature, s.validator_pubkey)) continue;
           ++valid_sigs;
+          filtered_sigs.push_back(s);
         }
-        if (valid_sigs >= quorum) {
+        if (cv < 5 && valid_sigs >= quorum) {
+          if (!validate_v4_registration_rules(*blk, blk->header.height)) return;
           if (persist_finalized_block(*blk)) {
             std::vector<Hash32> confirmed_txids;
             confirmed_txids.reserve(blk->txs.size());
             for (const auto& tx : blk->txs) confirmed_txids.push_back(tx.txid());
             mempool_.remove_confirmed(confirmed_txids);
             UtxoSet pre_utxos = utxos_;
+            update_v4_liveness_from_finality(blk->header.height, blk->header.round, filtered_sigs);
             apply_validator_state_changes(*blk, pre_utxos, blk->header.height);
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
+            apply_activation_signal(*blk, blk->header.height);
+            if (v3_active_for_height(activation_state_, activation_params_, blk->header.height)) {
+              if (blk->txs.empty() || blk->txs[0].inputs.empty()) return;
+              consensus::MarkerError me = consensus::MarkerError::kNone;
+              const auto got = consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, &me);
+              if (!got.has_value()) {
+                log_line("v3-marker-invalid mode=finalized-block error=" + marker_error_to_string(me));
+                return;
+              }
+              const std::uint32_t cv =
+                  consensus::version_for_height(activation_state_, activation_params_, blk->header.height);
+              const auto roots = persist_v3_state_roots(db_, blk->header.height, utxos_, validators_, cv);
+              if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return;
+            }
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             last_finalized_progress_ms_ = now_unix() * 1000;
@@ -813,7 +1185,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
         return;
       }
-      if (!handle_vote(v->vote, true, peer_id)) {
+      if (!handle_vote(v->vote, true, peer_id, v->vrf_proof, v->vrf_proof.empty() ? nullptr : &v->vrf_output)) {
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_VOTE_SIGNATURE, "invalid-vote");
       }
       break;
@@ -908,18 +1280,77 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
   if (from_network && !running_) return false;
   std::optional<Vote> maybe_vote;
+  Bytes maybe_vote_proof;
+  Hash32 maybe_vote_output{};
+  bool maybe_vote_has_output = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (msg.height != finalized_height_ + 1) return false;
     if (msg.prev_finalized_hash != finalized_hash_) return false;
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, msg.height);
 
     auto blk = Block::parse(msg.block_bytes);
     if (!blk.has_value()) return false;
     if (blk->header.height != msg.height || blk->header.round != msg.round) return false;
 
-    const auto active = validators_.active_sorted(msg.height);
-    auto expected = consensus::select_leader(finalized_hash_, msg.height, msg.round, active);
-    if (!expected.has_value() || blk->header.leader_pubkey != *expected) return false;
+    if (cv >= 6 && v6_active_for_height(msg.height)) {
+      if (msg.vrf_proof.empty()) return false;
+      if (!validators_.is_active_for_height(blk->header.leader_pubkey, msg.height)) return false;
+      const auto leader_info = validators_.get(blk->header.leader_pubkey);
+      if (!leader_info.has_value()) return false;
+      std::uint64_t leader_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(msg.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        leader_weight = consensus::validator_effective_weight_units_v7(*leader_info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, msg.height, v6_params_.weight, v7w);
+      } else {
+        leader_weight = consensus::validator_weight_units_v6(*leader_info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      }
+      if (leader_weight == 0 || total_weight == 0) return false;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, msg.height, msg.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::PROPOSER);
+      crypto::VrfProof p{msg.vrf_proof, msg.vrf_output};
+      if (!consensus::is_v5_eligible(blk->header.leader_pubkey, consensus::V5Role::PROPOSER, msg.height, msg.round,
+                                     role_seed, cfg_.network.network_id, 1, 1, p)) {
+        return false;
+      }
+      const auto threshold = consensus::threshold_weighted_v6(
+          total_weight, leader_weight, v6_params_.proposer_expected_num, v6_params_.proposer_expected_den);
+      if (!consensus::eligible_weighted_v6(p.output, threshold)) return false;
+      auto& seen_props = received_proposers_v5_[{msg.height, msg.round}];
+      if (!seen_props.insert(blk->header.leader_pubkey).second) return false;
+    } else if (cv >= 5 && v5_active_for_height(msg.height)) {
+      if (msg.vrf_proof.empty()) return false;
+      if (!validators_.is_active_for_height(blk->header.leader_pubkey, msg.height)) return false;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, msg.height, msg.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::PROPOSER);
+      const auto active = validators_.active_sorted(msg.height);
+      if (active.empty()) return false;
+      crypto::VrfProof p{msg.vrf_proof, msg.vrf_output};
+      if (!consensus::is_v5_eligible(
+              blk->header.leader_pubkey, consensus::V5Role::PROPOSER, msg.height, msg.round, role_seed,
+              cfg_.network.network_id, v5_params_.proposer_expected_num,
+              std::max<std::uint64_t>(1, v5_params_.proposer_expected_den * active.size()), p)) {
+        return false;
+      }
+      auto& seen_props = received_proposers_v5_[{msg.height, msg.round}];
+      if (!seen_props.insert(blk->header.leader_pubkey).second) return false;
+    } else {
+      auto expected = leader_for_height_round(msg.height, msg.round);
+      if (!expected.has_value() || blk->header.leader_pubkey != *expected) return false;
+    }
 
     std::vector<Bytes> tx_bytes;
     tx_bytes.reserve(blk->txs.size());
@@ -927,13 +1358,30 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto merkle_root = merkle::compute_merkle_root_from_txs(tx_bytes);
     if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) return false;
 
-    SpecialValidationContext vctx{&validators_, msg.height,
-                                  [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                    return is_committee_member_for(pub, h, round);
-                                  }};
-    const auto reward_signers = committee_for_height(msg.height);
+    SpecialValidationContext vctx{
+        .validators = &validators_,
+        .current_height = msg.height,
+        .consensus_version = cv,
+        .v7_min_bond_amount = v7_min_bond_amount_,
+        .v7_max_bond_amount = v7_max_bond_amount_,
+        .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+          return is_committee_member_for(pub, h, round);
+        }};
+    const auto reward_signers = reward_signers_for_height_round(msg.height, msg.round);
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) return false;
+    if (!validate_v4_registration_rules(*blk, msg.height)) return false;
+
+    if (v3_active_for_height(activation_state_, activation_params_, msg.height)) {
+      if (blk->txs.empty() || blk->txs[0].inputs.empty()) return false;
+      const auto got = consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, nullptr);
+      if (!got.has_value()) return false;
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, msg.height);
+      auto expected = compute_post_state_roots_for_block(*blk, utxos_, validators_, msg.height,
+                                                         v4_active_for_height(msg.height), cv);
+      if (!expected.has_value()) return false;
+      if (got->utxo_root != expected->utxo_root || got->validators_root != expected->validators_root) return false;
+    }
 
     Hash32 bid = blk->header.block_id();
     if (candidate_blocks_.find(bid) == candidate_blocks_.end()) {
@@ -949,7 +1397,71 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     // once candidate block is available.
     (void)finalize_if_quorum(bid, msg.height, msg.round);
 
-    if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
+    if (cv >= 6 && v6_active_for_height(msg.height)) {
+      if (!validators_.is_active_for_height(local_key_.public_key, msg.height)) return true;
+      const auto local_info = validators_.get(local_key_.public_key);
+      if (!local_info.has_value()) return true;
+      std::uint64_t local_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(msg.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        local_weight = consensus::validator_effective_weight_units_v7(*local_info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, msg.height, v6_params_.weight, v7w);
+      } else {
+        local_weight = consensus::validator_weight_units_v6(*local_info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, msg.height, v6_params_.weight);
+      }
+      if (local_weight == 0 || total_weight == 0) return true;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, msg.height, msg.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::VOTER);
+      const Bytes transcript =
+          consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, msg.height, msg.round, role_seed,
+                                            cfg_.network.network_id);
+      auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);
+      if (!proof.has_value()) return false;
+      const std::size_t k_eff = consensus::voter_target_k_v6(validators_.active_sorted(msg.height).size(), msg.round, v6_params_);
+      const auto threshold = consensus::threshold_weighted_v6(total_weight, local_weight, static_cast<std::uint64_t>(k_eff), 1);
+      if (!consensus::eligible_weighted_v6(proof->output, threshold)) return true;
+      Bytes b_id(bid.begin(), bid.end());
+      auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
+      if (!sig.has_value()) return false;
+      maybe_vote = Vote{msg.height, msg.round, bid, local_key_.public_key, *sig};
+      maybe_vote_proof = proof->proof;
+      maybe_vote_output = proof->output;
+      maybe_vote_has_output = true;
+    } else if (cv >= 5 && v5_active_for_height(msg.height)) {
+      if (!validators_.is_active_for_height(local_key_.public_key, msg.height)) return true;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, msg.height, msg.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::VOTER);
+      const auto active = validators_.active_sorted(msg.height);
+      if (active.empty()) return true;
+      const std::size_t k_eff = consensus::voter_target_k_v5(active.size(), msg.round, v5_params_);
+      const Bytes transcript =
+          consensus::make_v5_vrf_transcript(consensus::V5Role::VOTER, msg.height, msg.round, role_seed,
+                                            cfg_.network.network_id);
+      auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);
+      if (!proof.has_value()) return false;
+      const bool eligible =
+          consensus::is_output_below_probability_threshold(proof->output, static_cast<std::uint64_t>(k_eff), active.size());
+      if (!eligible) return true;
+      Bytes b_id(bid.begin(), bid.end());
+      auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
+      if (!sig.has_value()) return false;
+      maybe_vote = Vote{msg.height, msg.round, bid, local_key_.public_key, *sig};
+      maybe_vote_proof = proof->proof;
+      maybe_vote_output = proof->output;
+      maybe_vote_has_output = true;
+    } else if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
       Bytes b_id(bid.begin(), bid.end());
       auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
       if (!sig.has_value()) return false;
@@ -958,24 +1470,73 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
   }
 
   if (maybe_vote.has_value()) {
-    if (from_network) {
-      broadcast_vote(*maybe_vote);
-    } else {
-      broadcast_vote(*maybe_vote);
-    }
-    return handle_vote(*maybe_vote, false);
+    broadcast_vote(*maybe_vote, maybe_vote_proof, maybe_vote_has_output ? &maybe_vote_output : nullptr);
+    return handle_vote(*maybe_vote, false, 0, maybe_vote_proof, maybe_vote_has_output ? &maybe_vote_output : nullptr);
   }
   return true;
 }
 
-bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id) {
+bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, const Bytes& vrf_proof,
+                       const Hash32* vrf_output) {
   if (from_network && !running_) return false;
   bool relay_vote = false;
   bool finalize_ok = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (vote.height != finalized_height_ + 1) return false;
-    if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, vote.height);
+    if (cv >= 6 && v6_active_for_height(vote.height)) {
+      if (!validators_.is_active_for_height(vote.validator_pubkey, vote.height)) return false;
+      if (vrf_proof.empty() || !vrf_output) return false;
+      const auto info = validators_.get(vote.validator_pubkey);
+      if (!info.has_value()) return false;
+      std::uint64_t validator_weight = 0;
+      std::uint64_t total_weight = 0;
+      if (cv >= 7 && v7_active_for_height(vote.height)) {
+        const consensus::ValidatorWeightParamsV7 v7w{.effective_units_cap = v7_effective_units_cap_};
+        validator_weight = consensus::validator_effective_weight_units_v7(*info, v6_params_.weight, v7w);
+        total_weight = consensus::total_active_effective_weight_units_v7(validators_, vote.height, v6_params_.weight, v7w);
+      } else {
+        validator_weight = consensus::validator_weight_units_v6(*info, v6_params_.weight);
+        total_weight = consensus::total_active_weight_units_v6(validators_, vote.height, v6_params_.weight);
+      }
+      if (validator_weight == 0 || total_weight == 0) return false;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, vote.height, vote.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::VOTER);
+      const std::size_t k_eff = consensus::voter_target_k_v6(validators_.active_sorted(vote.height).size(), vote.round, v6_params_);
+      crypto::VrfProof p{vrf_proof, *vrf_output};
+      if (!consensus::is_v5_eligible(vote.validator_pubkey, consensus::V5Role::VOTER, vote.height, vote.round, role_seed,
+                                     cfg_.network.network_id, 1, 1, p)) {
+        return false;
+      }
+      const auto threshold = consensus::threshold_weighted_v6(total_weight, validator_weight, static_cast<std::uint64_t>(k_eff), 1);
+      if (!consensus::eligible_weighted_v6(p.output, threshold)) return false;
+    } else if (cv >= 5 && v5_active_for_height(vote.height)) {
+      if (!validators_.is_active_for_height(vote.validator_pubkey, vote.height)) return false;
+      if (vrf_proof.empty() || !vrf_output) return false;
+      FinalityProof prev_fp{};
+      if (auto bb = db_.get_block(finalized_hash_); bb.has_value()) {
+        if (auto pblk = Block::parse(*bb); pblk.has_value()) prev_fp = pblk->finality_proof;
+      }
+      const auto prev_entropy = consensus::compute_finality_entropy_v2(finalized_hash_, prev_fp);
+      const auto seed = consensus::make_vrf_seed_v5(prev_entropy, vote.height, vote.round);
+      const auto role_seed = consensus::role_seed_v5(seed, consensus::V5Role::VOTER);
+      const auto active = validators_.active_sorted(vote.height);
+      if (active.empty()) return false;
+      const std::size_t k_eff = consensus::voter_target_k_v5(active.size(), vote.round, v5_params_);
+      crypto::VrfProof p{vrf_proof, *vrf_output};
+      if (!consensus::is_v5_eligible(vote.validator_pubkey, consensus::V5Role::VOTER, vote.height, vote.round, role_seed,
+                                     cfg_.network.network_id, static_cast<std::uint64_t>(k_eff), active.size(), p)) {
+        return false;
+      }
+    } else {
+      if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
+    }
 
     const auto nowm = now_ms();
     auto& verify_bucket = vote_verify_buckets_[from_peer_id];
@@ -1009,9 +1570,7 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id) {
     finalize_ok = finalize_if_quorum(vote.block_id, vote.height, vote.round);
   }
 
-  if (relay_vote) {
-    broadcast_vote(vote);
-  }
+  if (relay_vote) broadcast_vote(vote, vrf_proof, vrf_output);
   return finalize_ok;
 }
 
@@ -1025,17 +1584,23 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
     if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, tx.inputs.size())), now_ms())) {
       return false;
     }
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_ + 1);
     mempool_.set_validation_context(
-        SpecialValidationContext{&validators_, finalized_height_ + 1,
-                                 [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
-                                   return is_committee_member_for(pub, h, round);
-                                 }});
+        SpecialValidationContext{
+            .validators = &validators_,
+            .current_height = finalized_height_ + 1,
+            .consensus_version = cv,
+            .v7_min_bond_amount = v7_min_bond_amount_,
+            .v7_max_bond_amount = v7_max_bond_amount_,
+            .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+              return is_committee_member_for(pub, h, round);
+            }});
     std::string err;
     std::uint64_t fee = 0;
     if (!mempool_.accept_tx(tx, utxos_, &err, cfg_.min_relay_fee, &fee)) {
       return false;
     }
-    if (cfg_.testnet && fee < cfg_.min_relay_fee) return false;
+    if (fee < cfg_.min_relay_fee) return false;
     txid = tx.txid();
     log_line("mempool-accept txid=" + hex_encode32(txid) + " mempool_size=" + std::to_string(mempool_.size()));
   }
@@ -1049,16 +1614,34 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (blk_it == candidate_blocks_.end()) return false;
 
   auto sigs = votes_.signatures_for(height, round, block_id);
-  const auto committee = committee_for_height(height);
-  if (committee.empty()) return false;
-  const std::size_t quorum = consensus::quorum_threshold(committee.size());
-  std::set<PubKey32> committee_set(committee.begin(), committee.end());
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  std::set<PubKey32> committee_set;
+  std::size_t quorum = 0;
+  if (cv >= 6 && v6_active_for_height(height)) {
+    const auto active = validators_.active_sorted(height);
+    if (active.empty()) return false;
+    const std::size_t k_eff = std::max<std::size_t>(
+        2, std::min<std::size_t>(active.size(), consensus::voter_target_k_v6(active.size(), round, v6_params_)));
+    quorum = consensus::quorum_threshold(k_eff);
+  } else if (cv >= 5 && v5_active_for_height(height)) {
+    const auto active = validators_.active_sorted(height);
+    if (active.empty()) return false;
+    const std::size_t k_eff = std::max<std::size_t>(2, std::min<std::size_t>(
+                                                           active.size(),
+                                                           consensus::voter_target_k_v5(active.size(), round, v5_params_)));
+    quorum = consensus::quorum_threshold(k_eff);
+  } else {
+    const auto committee = committee_for_height_round(height, round);
+    if (committee.empty()) return false;
+    quorum = consensus::quorum_threshold(committee.size());
+    committee_set.insert(committee.begin(), committee.end());
+  }
   if (sigs.size() < quorum) return false;
 
   std::set<PubKey32> seen;
   std::vector<FinalitySig> filtered;
   for (const auto& s : sigs) {
-    if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+    if (!committee_set.empty() && committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
     if (!seen.insert(s.validator_pubkey).second) continue;
     Bytes bid(block_id.begin(), block_id.end());
     if (!crypto::ed25519_verify(bid, s.signature, s.validator_pubkey)) continue;
@@ -1068,6 +1651,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   Block b = blk_it->second;
   b.finality_proof.sigs = filtered;
+  if (!validate_v4_registration_rules(b, height)) return false;
 
   if (!persist_finalized_block(b)) return false;
 
@@ -1076,9 +1660,20 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   for (const auto& tx : b.txs) confirmed_txids.push_back(tx.txid());
   mempool_.remove_confirmed(confirmed_txids);
   UtxoSet pre_utxos = utxos_;
+  update_v4_liveness_from_finality(height, round, filtered);
   apply_validator_state_changes(b, pre_utxos, height);
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
+  apply_activation_signal(b, height);
+  if (v3_active_for_height(activation_state_, activation_params_, height)) {
+    if (b.txs.empty() || b.txs[0].inputs.empty()) return false;
+    consensus::MarkerError me = consensus::MarkerError::kNone;
+    const auto got = consensus::find_scr3_roots_marker(b.txs[0].inputs[0].script_sig, &me);
+    if (!got.has_value()) return false;
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+    const auto roots = persist_v3_state_roots(db_, height, utxos_, validators_, cv);
+    if (roots.utxo_root != got->utxo_root || roots.validators_root != got->validators_root) return false;
+  }
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
@@ -1124,7 +1719,13 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   in.prev_txid = zero_hash();
   in.prev_index = 0xFFFFFFFF;
   in.sequence = 0xFFFFFFFF;
-  in.script_sig = make_coinbase_script_sig(height, round);
+  std::optional<std::uint32_t> signal_version;
+  if (activation_params_.enabled) {
+    // Always advertise the highest supported version. Activation logic still advances
+    // one version at a time via finalized-window thresholds.
+    signal_version = activation_params_.max_version;
+  }
+  in.script_sig = consensus::make_coinbase_script_sig(height, round, signal_version);
   coinbase.inputs.push_back(in);
 
   std::vector<Tx> picked;
@@ -1133,17 +1734,23 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   }
 
   std::uint64_t total_fees = 0;
-  SpecialValidationContext vctx{&validators_, height, [this](const PubKey32& pub, std::uint64_t h,
-                                                             std::uint32_t round) {
-                                  return is_committee_member_for(pub, h, round);
-                                }};
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  SpecialValidationContext vctx{
+      .validators = &validators_,
+      .current_height = height,
+      .consensus_version = cv,
+      .v7_min_bond_amount = v7_min_bond_amount_,
+      .v7_max_bond_amount = v7_max_bond_amount_,
+      .is_committee_member = [this](const PubKey32& pub, std::uint64_t h, std::uint32_t round) {
+        return is_committee_member_for(pub, h, round);
+      }};
   for (const auto& tx : picked) {
     auto vr = validate_tx(tx, 1, utxos_, &vctx);
     if (vr.ok) total_fees += vr.fee;
   }
 
-  const auto committee = committee_for_height(height);
-  const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, committee);
+  const auto reward_signers = reward_signers_for_height_round(height, round);
+  const auto payout = consensus::compute_payout(height, total_fees, local_key_.public_key, reward_signers);
 
   {
     const auto pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
@@ -1163,6 +1770,14 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   b.txs.push_back(coinbase);
   b.txs.insert(b.txs.end(), picked.begin(), picked.end());
 
+  if (v3_active_for_height(activation_state_, activation_params_, height)) {
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+    auto roots = compute_post_state_roots_for_block(b, utxos_, validators_, height, v4_active_for_height(height), cv);
+    if (!roots.has_value()) return std::nullopt;
+    b.txs[0].inputs[0].script_sig =
+        consensus::append_v3_roots_to_coinbase_script(b.txs[0].inputs[0].script_sig, roots->utxo_root, roots->validators_root);
+  }
+
   std::vector<Bytes> tx_bytes;
   tx_bytes.reserve(b.txs.size());
   for (const auto& tx : b.txs) tx_bytes.push_back(tx.serialize());
@@ -1176,12 +1791,15 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   return b;
 }
 
-void Node::broadcast_propose(const Block& block) {
+void Node::broadcast_propose(const Block& block, const Bytes& vrf_proof, const Hash32* vrf_output) {
   p2p::ProposeMsg p;
   p.height = block.header.height;
   p.round = block.header.round;
   p.prev_finalized_hash = block.header.prev_finalized_hash;
   p.block_bytes = block.serialize();
+  p.vrf_proof = vrf_proof;
+  if (vrf_output) p.vrf_output = *vrf_output;
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, block.header.height);
   if (cfg_.disable_p2p) {
     if (!running_) return;
     std::vector<Node*> peers;
@@ -1194,11 +1812,16 @@ void Node::broadcast_propose(const Block& block) {
       spawn_local_bus_task([peer, p]() { peer->handle_propose(p, true); });
     }
   } else {
-    p2p_.broadcast(p2p::MsgType::PROPOSE, p2p::ser_propose(p));
+    p2p_.broadcast(p2p::MsgType::PROPOSE, p2p::ser_propose(p, cv));
   }
 }
 
-void Node::broadcast_vote(const Vote& vote) {
+void Node::broadcast_vote(const Vote& vote, const Bytes& vrf_proof, const Hash32* vrf_output) {
+  p2p::VoteMsg vm;
+  vm.vote = vote;
+  vm.vrf_proof = vrf_proof;
+  if (vrf_output) vm.vrf_output = *vrf_output;
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, vote.height);
   if (cfg_.disable_p2p) {
     if (!running_) return;
     std::vector<Node*> peers;
@@ -1208,10 +1831,12 @@ void Node::broadcast_vote(const Vote& vote) {
     }
     for (Node* peer : peers) {
       if (peer == this) continue;
-      spawn_local_bus_task([peer, vote]() { peer->handle_vote(vote, false, 0); });
+      spawn_local_bus_task([peer, vm]() {
+        (void)peer->handle_vote(vm.vote, false, 0, vm.vrf_proof, vm.vrf_proof.empty() ? nullptr : &vm.vrf_output);
+      });
     }
   } else {
-    p2p_.broadcast(p2p::MsgType::VOTE, p2p::ser_vote(p2p::VoteMsg{vote}));
+    p2p_.broadcast(p2p::MsgType::VOTE, p2p::ser_vote(vm, cv));
   }
 }
 
@@ -1370,10 +1995,44 @@ bool Node::init_mainnet_genesis() {
     vi.unbond_height = 0;
     if (!db_.put_validator(pub, vi)) return false;
   }
+  {
+    consensus::ValidatorRegistry vr;
+    for (const auto& pub : doc->initial_validators) {
+      consensus::ValidatorInfo vi;
+      vi.status = consensus::ValidatorStatus::ACTIVE;
+      vi.joined_height = 0;
+      vi.has_bond = true;
+      vi.bond_outpoint = OutPoint{zero_hash(), 0};
+      vi.unbond_height = 0;
+      vr.upsert(pub, vi);
+    }
+    const UtxoSet empty_utxos;
+    const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, 0);
+    (void)persist_v3_state_roots(db_, 0, empty_utxos, vr, cv);
+  }
+  {
+    codec::ByteWriter w0;
+    w0.u64le(0);
+    (void)db_.put(kV4JoinWindowStartKey, w0.take());
+    codec::ByteWriter w1;
+    w1.u32le(0);
+    (void)db_.put(kV4JoinWindowCountKey, w1.take());
+    codec::ByteWriter w2;
+    w2.u64le(0);
+    (void)db_.put(kV4LivenessEpochStartKey, w2.take());
+  }
   return db_.flush();
 }
 
 bool Node::load_state() {
+  activation_state_.current_version = activation_params_.initial_version;
+  activation_state_.pending_version = 0;
+  activation_state_.pending_activation_height = 0;
+  activation_state_.last_height = 0;
+  activation_state_.window_start_height = 0;
+  activation_state_.window_signal_count = 0;
+  activation_state_.window_total_count = 0;
+
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
     finalized_height_ = 0;
@@ -1389,6 +2048,42 @@ bool Node::load_state() {
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
 
+  if (auto act = db_.get_activation_state(); act.has_value()) {
+    activation_state_ = *act;
+  }
+  if (auto b = db_.get(kV4JoinWindowStartKey); b.has_value()) {
+    (void)codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto s = r.u64le();
+      if (!s) return false;
+      v4_join_window_start_height_ = *s;
+      return true;
+    });
+  }
+  if (auto b = db_.get(kV4JoinWindowCountKey); b.has_value()) {
+    (void)codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto c = r.u32le();
+      if (!c) return false;
+      v4_join_count_in_window_ = *c;
+      return true;
+    });
+  }
+  bool loaded_liveness_epoch = false;
+  if (auto b = db_.get(kV4LivenessEpochStartKey); b.has_value()) {
+    loaded_liveness_epoch = codec::parse_exact(*b, [&](codec::ByteReader& r) {
+      auto s = r.u64le();
+      if (!s) return false;
+      v4_liveness_epoch_start_height_ = *s;
+      return true;
+    });
+  }
+  if (!loaded_liveness_epoch) {
+    if (v4_liveness_window_blocks_ > 0) {
+      v4_liveness_epoch_start_height_ = (finalized_height_ / v4_liveness_window_blocks_) * v4_liveness_window_blocks_;
+    } else {
+      v4_liveness_epoch_start_height_ = 0;
+    }
+  }
+
   if (validators_.all().empty() && finalized_height_ > 0) {
     UtxoSet replay_utxos;
     for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
@@ -1403,94 +2098,291 @@ bool Node::load_state() {
     }
   }
 
+  if (activation_params_.enabled &&
+      (activation_state_.last_height == 0 || activation_state_.last_height < finalized_height_)) {
+    for (std::uint64_t h = activation_state_.last_height + 1; h <= finalized_height_; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) continue;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) continue;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value() || blk->txs.empty()) continue;
+      const auto sig = consensus::parse_coinbase_signal_version(blk->txs[0]);
+      consensus::apply_signal(&activation_state_, activation_params_, h, sig);
+    }
+    (void)db_.set_activation_state(activation_state_);
+  }
+
+  if (v3_active_for_height(activation_state_, activation_params_, finalized_height_)) {
+    const auto existing = db_.get(root_index_key("UTXO", finalized_height_));
+    if (!existing.has_value() || existing->size() != 32) {
+      const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, finalized_height_);
+      (void)persist_v3_state_roots(db_, finalized_height_, utxos_, validators_, cv);
+    }
+  }
+
   return true;
 }
 
 std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
+  return committee_for_height_round(height, 0);
+}
+
+std::vector<PubKey32> Node::reward_signers_for_height_round(std::uint64_t height, std::uint32_t round) const {
+  auto committee = committee_for_height_round(height, round);
+  if (!v4_active_for_height(height)) return committee;
+
+  std::vector<PubKey32> out;
+  out.reserve(committee.size());
+  for (const auto& pub : committee) {
+    auto it = validators_.all().find(pub);
+    if (it == validators_.all().end()) continue;
+    const auto& vi = it->second;
+    if (vi.status == consensus::ValidatorStatus::SUSPENDED) continue;
+    if (vi.eligible_count_window == 0 || vi.participated_count_window > 0) {
+      out.push_back(pub);
+    }
+  }
+  if (out.empty()) return committee;
+  return out;
+}
+
+std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std::uint32_t round) const {
   if (height == 0) return {};
-  if (height == finalized_height_ + 1) {
-    const auto active = validators_.active_sorted(height);
-    return consensus::select_committee(finalized_hash_, height, active, cfg_.max_committee);
-  }
-  if (height > finalized_height_) return {};
+  if (height > finalized_height_ + 1) return {};
 
-  consensus::ValidatorRegistry replay_validators;
-  UtxoSet replay_utxos;
-
-  if (cfg_.devnet || cfg_.testnet) {
-    const auto keys = devnet_keypairs();
-    const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
-    for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
-      consensus::ValidatorInfo vi;
-      vi.status = (idx < n_active) ? consensus::ValidatorStatus::ACTIVE : consensus::ValidatorStatus::BANNED;
-      vi.joined_height = 0;
-      vi.has_bond = (idx < n_active);
-      vi.bond_outpoint = OutPoint{zero_hash(), 0};
-      vi.unbond_height = 0;
-      replay_validators.upsert(keys[idx].public_key, vi);
-    }
-  }
-
-  auto apply_changes = [&](const Block& block, std::uint64_t h) {
-    for (size_t txi = 1; txi < block.txs.size(); ++txi) {
-      const auto& tx = block.txs[txi];
-      for (const auto& in : tx.inputs) {
-        OutPoint op{in.prev_txid, in.prev_index};
-        auto it = replay_utxos.find(op);
-        if (it == replay_utxos.end()) continue;
-        PubKey32 pub{};
-        if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
-
-        SlashEvidence evidence;
-        if (parse_slash_script_sig(in.script_sig, &evidence)) {
-          replay_validators.ban(pub);
-        } else {
-          replay_validators.request_unbond(pub, h);
-        }
-      }
-    }
-
-    for (const auto& tx : block.txs) {
-      const Hash32 txid = tx.txid();
-      for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
-        const auto& out = tx.outputs[out_i];
-        PubKey32 pub{};
-        if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-          replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
-        }
-      }
-    }
-    replay_validators.advance_height(h + 1);
-  };
-
-  for (std::uint64_t h = 1; h <= height - 1; ++h) {
-    auto bh = db_.get_height_hash(h);
-    if (!bh.has_value()) return {};
-    auto bb = db_.get_block(*bh);
-    if (!bb.has_value()) return {};
-    auto blk = Block::parse(*bb);
-    if (!blk.has_value()) return {};
-    apply_changes(*blk, h);
-    apply_block_to_utxo(*blk, replay_utxos);
-  }
-
+  std::vector<PubKey32> active;
   Hash32 prev_hash = zero_hash();
-  if (height > 1) {
-    auto prev = db_.get_height_hash(height - 1);
-    if (!prev.has_value()) return {};
-    prev_hash = *prev;
+  FinalityProof prev_fp{};
+
+  if (height == finalized_height_ + 1) {
+    active = validators_.active_sorted(height);
+    prev_hash = finalized_hash_;
+    if (auto bb = db_.get_block(prev_hash); bb.has_value()) {
+      if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+    }
+  } else {
+    consensus::ValidatorRegistry replay_validators;
+    replay_validators.set_rules(validators_.rules());
+    UtxoSet replay_utxos;
+    if (auto gj = db_.get("G:J"); gj.has_value()) {
+      const std::string js(gj->begin(), gj->end());
+      if (auto gd = genesis::parse_json(js); gd.has_value()) {
+        for (const auto& pub : gd->initial_validators) {
+          consensus::ValidatorInfo vi;
+          vi.status = consensus::ValidatorStatus::ACTIVE;
+          vi.joined_height = 0;
+          vi.has_bond = true;
+          vi.bond_outpoint = OutPoint{zero_hash(), 0};
+          vi.unbond_height = 0;
+          replay_validators.upsert(pub, vi);
+        }
+      }
+    }
+
+    auto apply_changes = [&](const Block& block, std::uint64_t h) {
+      for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+        const auto& tx = block.txs[txi];
+        for (const auto& in : tx.inputs) {
+          OutPoint op{in.prev_txid, in.prev_index};
+          auto it = replay_utxos.find(op);
+          if (it == replay_utxos.end()) continue;
+          PubKey32 pub{};
+          if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
+
+          SlashEvidence evidence;
+          if (parse_slash_script_sig(in.script_sig, &evidence)) {
+            replay_validators.ban(pub);
+          } else {
+            replay_validators.request_unbond(pub, h);
+          }
+        }
+      }
+
+      for (const auto& tx : block.txs) {
+        const Hash32 txid = tx.txid();
+        for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+          const auto& out = tx.outputs[out_i];
+          PubKey32 pub{};
+          if (is_validator_register_script(out.script_pubkey, &pub)) {
+            const std::uint32_t cvh = consensus::version_for_height(activation_state_, activation_params_, h);
+            if (activation_params_.enabled && cvh >= 4) {
+              std::string err;
+              (void)replay_validators.register_bond(pub, OutPoint{txid, out_i}, h, out.value, &err);
+            } else if (out.value == BOND_AMOUNT) {
+              replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+            }
+          }
+        }
+      }
+      replay_validators.advance_height(h + 1);
+    };
+
+    for (std::uint64_t h = 1; h <= height - 1; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) return {};
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) return {};
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) return {};
+      apply_changes(*blk, h);
+      apply_block_to_utxo(*blk, replay_utxos);
+    }
+
+    if (height > 1) {
+      auto prev = db_.get_height_hash(height - 1);
+      if (!prev.has_value()) return {};
+      prev_hash = *prev;
+      if (auto bb = db_.get_block(prev_hash); bb.has_value()) {
+        if (auto blk = Block::parse(*bb); blk.has_value()) prev_fp = blk->finality_proof;
+      }
+    }
+    active = replay_validators.active_sorted(height);
   }
-  const auto active = replay_validators.active_sorted(height);
+
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  if (activation_params_.enabled && cv >= 2) {
+    const Hash32 entropy = consensus::compute_finality_entropy_v2(prev_hash, prev_fp);
+    const Hash32 seed = consensus::make_sortition_seed_v2(entropy, height, round);
+    const std::size_t k = consensus::committee_size_for_round_v2(active.size(), cfg_.max_committee, round);
+    return consensus::select_committee_v2(active, seed, k);
+  }
+
   return consensus::select_committee(prev_hash, height, active, cfg_.max_committee);
 }
 
+std::optional<PubKey32> Node::leader_for_height_round(std::uint64_t height, std::uint32_t round) const {
+  if (height == 0 || height > finalized_height_ + 1) return std::nullopt;
+  const auto active = (height == finalized_height_ + 1) ? validators_.active_sorted(height) : std::vector<PubKey32>{};
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+  if (activation_params_.enabled && cv >= 2) {
+    const auto committee = committee_for_height_round(height, round);
+    return consensus::select_leader_v2(committee);
+  }
+  if (!active.empty()) return consensus::select_leader(finalized_hash_, height, round, active);
+
+  // Historical heights are only used in verification/test paths; derive via round-aware committee fallback.
+  const auto committee = committee_for_height_round(height, round);
+  if (committee.empty()) return std::nullopt;
+  return committee.front();
+}
+
 bool Node::is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const {
-  (void)round;
-  const auto committee = committee_for_height(height);
+  const auto committee = committee_for_height_round(height, round);
   return std::find(committee.begin(), committee.end(), pub) != committee.end();
 }
 
+bool Node::v4_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v4_active_for_height(activation_state_, activation_params_, height);
+}
+
+bool Node::v5_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v5_active_for_height(activation_state_, activation_params_, height);
+}
+
+bool Node::v6_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v6_active_for_height(activation_state_, activation_params_, height);
+}
+
+bool Node::v7_active_for_height(std::uint64_t height) const {
+  return ::selfcoin::node::v7_active_for_height(activation_state_, activation_params_, height);
+}
+
+bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t height) const {
+  if (!v4_active_for_height(height)) return true;
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, height);
+
+  std::uint64_t window_start = v4_join_window_start_height_;
+  std::uint32_t window_count = v4_join_count_in_window_;
+  consensus::v4_advance_join_window(height, v4_join_limit_window_blocks_, &window_start, &window_count);
+
+  auto registry = validators_;
+  std::size_t new_regs = 0;
+  for (std::size_t txi = 0; txi < block.txs.size(); ++txi) {
+    const auto& tx = block.txs[txi];
+    const Hash32 txid = tx.txid();
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
+      PubKey32 pub{};
+      if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
+      if (cv >= 7 && (out.value < v7_min_bond_amount_ || out.value > v7_max_bond_amount_)) return false;
+
+      std::string err;
+      if (!registry.can_register_bond(pub, height, out.value, &err)) return false;
+      if (v4_join_limit_window_blocks_ > 0 && v4_join_limit_max_new_ > 0 &&
+          window_count + static_cast<std::uint32_t>(new_regs + 1) > v4_join_limit_max_new_) {
+        return false;
+      }
+      if (!registry.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err)) return false;
+      ++new_regs;
+    }
+  }
+  return true;
+}
+
+void Node::update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
+                                            const std::vector<FinalitySig>& finality_sigs) {
+  if (!v4_active_for_height(height)) return;
+
+  std::vector<PubKey32> committee = committee_for_height_round(height, round);
+  if (v5_active_for_height(height)) {
+    committee.clear();
+    for (const auto& s : finality_sigs) committee.push_back(s.validator_pubkey);
+    std::sort(committee.begin(), committee.end());
+    committee.erase(std::unique(committee.begin(), committee.end()), committee.end());
+  }
+  if (committee.empty()) return;
+  const auto participants = consensus::committee_participants_from_finality(committee, finality_sigs);
+  std::set<PubKey32> participant_set(participants.begin(), participants.end());
+  last_participation_eligible_signers_ = participant_set.size();
+
+  auto& all = validators_.mutable_all();
+  for (const auto& pub : committee) {
+    auto it = all.find(pub);
+    if (it == all.end()) continue;
+    auto& info = it->second;
+    if (info.status != consensus::ValidatorStatus::ACTIVE && info.status != consensus::ValidatorStatus::SUSPENDED) continue;
+    info.liveness_window_start = v4_liveness_epoch_start_height_;
+    ++info.eligible_count_window;
+    if (participant_set.find(pub) != participant_set.end()) ++info.participated_count_window;
+  }
+
+  const bool evaluate =
+      consensus::v4_liveness_should_rollover(height, v4_liveness_epoch_start_height_, v4_liveness_window_blocks_);
+  if (!evaluate) return;
+
+  for (auto& [pub, info] : all) {
+    const std::uint64_t eligible = info.eligible_count_window;
+    const std::uint64_t participated = info.participated_count_window;
+    if (eligible >= 10) {
+      const std::uint64_t miss = (eligible >= participated) ? (eligible - participated) : 0;
+      const std::uint32_t miss_rate = static_cast<std::uint32_t>((miss * 100) / eligible);
+      if (miss_rate >= v4_miss_rate_exit_threshold_percent_) {
+        info.status = consensus::ValidatorStatus::EXITING;
+        info.last_exit_height = height;
+        info.unbond_height = height;
+        info.penalty_strikes += 1;
+      } else if (miss_rate >= v4_miss_rate_suspend_threshold_percent_) {
+        info.status = consensus::ValidatorStatus::SUSPENDED;
+        info.suspended_until_height = height + v4_suspend_duration_blocks_;
+        info.penalty_strikes += 1;
+      }
+    }
+    info.eligible_count_window = 0;
+    info.participated_count_window = 0;
+    info.liveness_window_start = height + 1;
+    (void)db_.put_validator(pub, info);
+  }
+  v4_liveness_epoch_start_height_ =
+      consensus::v4_liveness_next_epoch_start(height, v4_liveness_epoch_start_height_, v4_liveness_window_blocks_);
+}
+
 void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height) {
+  if (v4_active_for_height(height)) {
+    consensus::v4_advance_join_window(height, v4_join_limit_window_blocks_, &v4_join_window_start_height_,
+                                      &v4_join_count_in_window_);
+  }
+
   for (size_t txi = 1; txi < block.txs.size(); ++txi) {
     const auto& tx = block.txs[txi];
     for (const auto& in : tx.inputs) {
@@ -1515,16 +2407,41 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
-      if (out.value == BOND_AMOUNT && is_validator_register_script(out.script_pubkey, &pub)) {
-        validators_.register_bond(pub, OutPoint{txid, out_i}, height);
+      if (is_validator_register_script(out.script_pubkey, &pub)) {
+        std::string err;
+        if (validators_.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err)) {
+          if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
+            ++v4_join_count_in_window_;
+          }
+        } else if (!v4_active_for_height(height) && out.value == BOND_AMOUNT) {
+          // Preserve pre-v4 behavior.
+          validators_.register_bond_legacy(pub, OutPoint{txid, out_i}, height);
+        }
       }
     }
   }
 
   validators_.advance_height(height + 1);
+  codec::ByteWriter w_start;
+  w_start.u64le(v4_join_window_start_height_);
+  (void)db_.put(kV4JoinWindowStartKey, w_start.take());
+  codec::ByteWriter w_count;
+  w_count.u32le(v4_join_count_in_window_);
+  (void)db_.put(kV4JoinWindowCountKey, w_count.take());
+  codec::ByteWriter w_epoch;
+  w_epoch.u64le(v4_liveness_epoch_start_height_);
+  (void)db_.put(kV4LivenessEpochStartKey, w_epoch.take());
   for (const auto& [pub, info] : validators_.all()) {
     db_.put_validator(pub, info);
   }
+}
+
+void Node::apply_activation_signal(const Block& block, std::uint64_t height) {
+  if (block.txs.empty()) return;
+  std::optional<std::uint32_t> signaled;
+  if (activation_params_.enabled) signaled = consensus::parse_coinbase_signal_version(block.txs[0]);
+  consensus::apply_signal(&activation_state_, activation_params_, height, signaled);
+  (void)db_.set_activation_state(activation_state_);
 }
 
 std::uint64_t Node::now_unix() const {
@@ -1738,7 +2655,6 @@ std::string Node::peer_ip_for(int peer_id) const {
 
 std::optional<p2p::NetAddress> Node::addrman_address_for_peer(const p2p::PeerInfo& info) const {
   if (info.ip.empty()) return std::nullopt;
-  if (cfg_.mainnet) return p2p::NetAddress{info.ip, cfg_.network.p2p_default_port};
   if (!info.inbound) {
     auto parsed = p2p::parse_endpoint(info.endpoint);
     if (parsed.has_value()) return *parsed;
@@ -1788,6 +2704,13 @@ void Node::prune_caches_locked(std::uint64_t height, std::uint32_t round) {
       ++it;
     }
   }
+  for (auto it = received_proposers_v5_.begin(); it != received_proposers_v5_.end();) {
+    if (it->first.first < height || (it->first.first == height && it->first.second + kProposalRoundWindow < round)) {
+      it = received_proposers_v5_.erase(it);
+    } else {
+      ++it;
+    }
+  }
   for (auto it = logged_committee_rounds_.begin(); it != logged_committee_rounds_.end();) {
     if (it->first < height || (it->first == height && it->second + kProposalRoundWindow < round)) {
       it = logged_committee_rounds_.erase(it);
@@ -1826,7 +2749,7 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
 std::optional<NodeConfig> parse_args(int argc, char** argv) {
   NodeConfig cfg;
   cfg.listen = false;  // safe CLI default: outbound-only unless --listen is set
-  cfg.network = devnet_network();
+  cfg.network = mainnet_network();
   cfg.p2p_port = cfg.network.p2p_default_port;
   cfg.max_committee = cfg.network.max_committee;
   cfg.db_path = default_db_dir_for_network(cfg.network.name);
@@ -1846,30 +2769,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       return std::string(argv[++i]);
     };
 
-    if (a == "--devnet") {
-      cfg.devnet = true;
-      cfg.testnet = false;
-      cfg.mainnet = false;
-      cfg.dns_seeds = false;
-      cfg.network = devnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--testnet") {
-      cfg.testnet = true;
-      cfg.devnet = false;
-      cfg.mainnet = false;
+    if (a == "--mainnet") {
+      std::cerr << "--mainnet is not needed in mainnet-only build; remove this flag\n";
+      return std::nullopt;
       cfg.dns_seeds = true;
-      cfg.network = testnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
-    } else if (a == "--mainnet") {
-      cfg.mainnet = true;
-      cfg.devnet = false;
-      cfg.testnet = false;
-      cfg.dns_seeds = true;
-      cfg.network = mainnet_network();
-      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
-      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1939,10 +2842,6 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
     } else if (a == "--public") {
       cfg.public_mode = true;
       cfg.listen = true;
-    } else if (a == "--devnet-initial-active") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.devnet_initial_active_validators = std::stoi(*v);
     } else if (a == "--max-committee") {
       auto v = next(a);
       if (!v) return std::nullopt;
@@ -1990,14 +2889,128 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-enabled") {
+      cfg.activation_enabled_override = true;
+    } else if (a == "--activation-max-version") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_max_version_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--activation-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--activation-delay-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.activation_delay_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-min-bond") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_min_bond_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-warmup-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_warmup_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-cooldown-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_cooldown_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-join-limit-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_join_limit_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--validator-join-limit-max-new") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.validator_join_limit_max_new_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--liveness-window-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.liveness_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--miss-rate-suspend-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.miss_rate_suspend_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--miss-rate-exit-threshold-percent") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.miss_rate_exit_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--suspend-duration-blocks") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.suspend_duration_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v5-proposer-expected-num") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v5_proposer_expected_num_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v5-proposer-expected-den") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v5_proposer_expected_den_override = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--v5-voter-target-k") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v5_voter_target_k_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--v5-round-expand-cap") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v5_round_expand_cap_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--v5-round-expand-factor") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v5_round_expand_factor_override = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--v6-bond-unit") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_bond_unit_override = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--v6-units-max") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_units_max_override = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--v6-proposer-expected-num") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_proposer_expected_num_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v6-proposer-expected-den") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_proposer_expected_den_override = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--v6-voter-target-k") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_voter_target_k_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--v6-round-expand-cap") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_round_expand_cap_override = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--v6-round-expand-factor") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v6_round_expand_factor_override = std::max<std::uint32_t>(2, static_cast<std::uint32_t>(std::stoul(*v)));
+    } else if (a == "--v7-min-bond-amount") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_min_bond_amount_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v7-max-bond-amount") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_max_bond_amount_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--v7-effective-units-cap") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.v7_effective_units_cap_override = std::max<std::uint64_t>(1, std::stoull(*v));
     } else {
       std::cerr << "unknown arg: " << a << "\n";
       return std::nullopt;
     }
   }
 
-  if (cfg.mainnet && !cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
-    std::cerr << "--genesis override on --mainnet requires --allow-unsafe-genesis-override\n";
+  if (!cfg.genesis_path.empty() && !cfg.allow_unsafe_genesis_override) {
+    std::cerr << "--genesis override on mainnet requires --allow-unsafe-genesis-override\n";
     return std::nullopt;
   }
   if (cfg.validator_passphrase.empty() && !validator_passphrase_env.empty()) {

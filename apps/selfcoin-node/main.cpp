@@ -14,14 +14,26 @@ void on_sigint(int) { g_stop = 1; }
 int main(int argc, char** argv) {
   auto cfg = selfcoin::node::parse_args(argc, argv);
   if (!cfg.has_value()) {
-    std::cerr << "usage: selfcoin-node [--devnet|--testnet|--mainnet] --node-id <id> [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
+    std::cerr << "usage: selfcoin-node [--node-id <id>] [--db <dir>] [--genesis <path>] [--allow-unsafe-genesis-override] [--port <p>] "
                  "[--validator-key-file <path>] [--validator-passphrase <pass>] [--validator-passphrase-env <ENV>] "
                  "[--public] [--listen] [--bind <ip>] [--outbound-target <n>] [--dns-seeds|--no-dns-seeds] "
                  "[--peers host:port,...] [--seeds host:port,...] [--disable-p2p] [--log-json] "
                  "[--handshake-timeout-ms <ms>] [--frame-timeout-ms <ms>] [--idle-timeout-ms <ms>] "
                  "[--peer-queue-max-bytes <n>] [--peer-queue-max-msgs <n>] [--max-inbound <n>] [--ban-seconds <s>] "
                  "[--invalid-frame-ban-threshold <n>] [--invalid-frame-window-seconds <s>] "
-                 "[--min-relay-fee <sats>]\n";
+                 "[--min-relay-fee <sats>] [--activation-enabled] [--activation-max-version <n>] "
+                 "[--activation-window-blocks <n>] [--activation-threshold-percent <n>] "
+                 "[--activation-delay-blocks <n>] "
+                 "[--validator-min-bond <u64>] [--validator-warmup-blocks <n>] [--validator-cooldown-blocks <n>] "
+                 "[--validator-join-limit-window-blocks <n>] [--validator-join-limit-max-new <n>] "
+                 "[--liveness-window-blocks <n>] [--miss-rate-suspend-threshold-percent <n>] "
+                 "[--miss-rate-exit-threshold-percent <n>] [--suspend-duration-blocks <n>] "
+                 "[--v5-proposer-expected-num <n>] [--v5-proposer-expected-den <n>] "
+                 "[--v5-voter-target-k <n>] [--v5-round-expand-cap <n>] [--v5-round-expand-factor <n>] "
+                 "[--v6-bond-unit <n>] [--v6-units-max <n>] "
+                 "[--v6-proposer-expected-num <n>] [--v6-proposer-expected-den <n>] "
+                 "[--v6-voter-target-k <n>] [--v6-round-expand-cap <n>] [--v6-round-expand-factor <n>] "
+                 "[--v7-min-bond-amount <n>] [--v7-max-bond-amount <n>] [--v7-effective-units-cap <n>]\n";
     return 1;
   }
 

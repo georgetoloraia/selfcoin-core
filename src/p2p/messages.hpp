@@ -44,10 +44,14 @@ struct ProposeMsg {
   std::uint32_t round{0};
   Hash32 prev_finalized_hash{};
   Bytes block_bytes;
+  Bytes vrf_proof;
+  Hash32 vrf_output{};
 };
 
 struct VoteMsg {
   Vote vote;
+  Bytes vrf_proof;
+  Hash32 vrf_output{};
 };
 
 struct GetBlockMsg {
@@ -79,9 +83,9 @@ Bytes ser_version(const VersionMsg& m);
 std::optional<VersionMsg> de_version(const Bytes& b);
 Bytes ser_finalized_tip(const FinalizedTipMsg& m);
 std::optional<FinalizedTipMsg> de_finalized_tip(const Bytes& b);
-Bytes ser_propose(const ProposeMsg& m);
+Bytes ser_propose(const ProposeMsg& m, std::uint32_t consensus_version = 1);
 std::optional<ProposeMsg> de_propose(const Bytes& b);
-Bytes ser_vote(const VoteMsg& m);
+Bytes ser_vote(const VoteMsg& m, std::uint32_t consensus_version = 1);
 std::optional<VoteMsg> de_vote(const Bytes& b);
 Bytes ser_get_block(const GetBlockMsg& m);
 std::optional<GetBlockMsg> de_get_block(const Bytes& b);

@@ -9,6 +9,9 @@
 #include <string>
 #include <thread>
 
+#include "consensus/activation.hpp"
+#include "consensus/sortition_v5.hpp"
+#include "consensus/sortition_v6.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -25,10 +28,7 @@
 namespace selfcoin::node {
 
 struct NodeConfig {
-  bool devnet{true};
-  bool testnet{false};
-  bool mainnet{false};
-  NetworkConfig network{devnet_network()};
+  NetworkConfig network{mainnet_network()};
   bool allow_unsafe_genesis_override{false};
   std::string validator_key_file;
   std::string validator_passphrase;
@@ -36,7 +36,7 @@ struct NodeConfig {
   std::string bind_ip{"127.0.0.1"};
   bool listen{true};
   bool public_mode{false};
-  bool dns_seeds{false};
+  bool dns_seeds{true};
   std::size_t outbound_target{8};
   std::size_t max_inbound{64};
   std::uint16_t p2p_port{18444};
@@ -46,7 +46,6 @@ struct NodeConfig {
   std::string genesis_path;
   bool disable_p2p{false};
   bool log_json{false};
-  int devnet_initial_active_validators{4};
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};
   std::uint32_t frame_timeout_ms{3'000};
@@ -57,6 +56,35 @@ struct NodeConfig {
   int invalid_frame_ban_threshold{3};
   std::uint64_t invalid_frame_window_seconds{60};
   std::uint64_t min_relay_fee{0};
+  std::optional<bool> activation_enabled_override;
+  std::optional<std::uint32_t> activation_max_version_override;
+  std::optional<std::uint64_t> activation_window_blocks_override;
+  std::optional<std::uint32_t> activation_threshold_percent_override;
+  std::optional<std::uint64_t> activation_delay_blocks_override;
+  std::optional<std::uint64_t> validator_min_bond_override;
+  std::optional<std::uint64_t> validator_warmup_blocks_override;
+  std::optional<std::uint64_t> validator_cooldown_blocks_override;
+  std::optional<std::uint64_t> validator_join_limit_window_blocks_override;
+  std::optional<std::uint32_t> validator_join_limit_max_new_override;
+  std::optional<std::uint64_t> liveness_window_blocks_override;
+  std::optional<std::uint32_t> miss_rate_suspend_threshold_percent_override;
+  std::optional<std::uint32_t> miss_rate_exit_threshold_percent_override;
+  std::optional<std::uint64_t> suspend_duration_blocks_override;
+  std::optional<std::uint64_t> v5_proposer_expected_num_override;
+  std::optional<std::uint64_t> v5_proposer_expected_den_override;
+  std::optional<std::uint32_t> v5_voter_target_k_override;
+  std::optional<std::uint32_t> v5_round_expand_cap_override;
+  std::optional<std::uint32_t> v5_round_expand_factor_override;
+  std::optional<std::uint64_t> v6_bond_unit_override;
+  std::optional<std::uint64_t> v6_units_max_override;
+  std::optional<std::uint64_t> v6_proposer_expected_num_override;
+  std::optional<std::uint64_t> v6_proposer_expected_den_override;
+  std::optional<std::uint32_t> v6_voter_target_k_override;
+  std::optional<std::uint32_t> v6_round_expand_cap_override;
+  std::optional<std::uint32_t> v6_round_expand_factor_override;
+  std::optional<std::uint64_t> v7_min_bond_amount_override;
+  std::optional<std::uint64_t> v7_max_bond_amount_override;
+  std::optional<std::uint64_t> v7_effective_units_cap_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -99,6 +127,10 @@ struct NodeStatus {
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
   std::uint64_t rejected_pre_handshake{0};
+  std::uint32_t consensus_version{1};
+  std::uint32_t pending_consensus_version{0};
+  std::uint64_t pending_activation_height{0};
+  std::uint64_t participation_eligible_signers{0};
 };
 
 class Node {
@@ -114,6 +146,7 @@ class Node {
 
   // Test hooks.
   bool inject_vote_for_test(const Vote& vote);
+  bool inject_propose_for_test(const Block& block);
   bool inject_tx_for_test(const Tx& tx, bool relay);
   bool pause_proposals_for_test(bool pause);
   std::size_t mempool_size_for_test() const;
@@ -127,8 +160,11 @@ class Node {
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   std::uint16_t p2p_port_for_test() const;
+  std::optional<Block> build_proposal_for_test(std::uint64_t height, std::uint32_t round);
+  std::pair<std::uint64_t, std::uint32_t> v4_join_window_state_for_test() const;
+  std::uint64_t v4_liveness_epoch_start_for_test() const;
 
-  static std::vector<crypto::KeyPair> devnet_keypairs();
+  static std::vector<crypto::KeyPair> deterministic_test_keypairs();
 
  private:
   void event_loop();
@@ -138,13 +174,14 @@ class Node {
   void maybe_send_verack(int peer_id);
 
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
-  bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0);
+  bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0, const Bytes& vrf_proof = {},
+                   const Hash32* vrf_output = nullptr);
   bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
 
   std::optional<Block> build_proposal_block(std::uint64_t height, std::uint32_t round);
-  void broadcast_propose(const Block& block);
-  void broadcast_vote(const Vote& vote);
+  void broadcast_propose(const Block& block, const Bytes& vrf_proof = {}, const Hash32* vrf_output = nullptr);
+  void broadcast_vote(const Vote& vote, const Bytes& vrf_proof = {}, const Hash32* vrf_output = nullptr);
   void broadcast_finalized_block(const Block& block);
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
@@ -154,6 +191,9 @@ class Node {
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
   bool is_committee_member_for(const PubKey32& pub, std::uint64_t height, std::uint32_t round) const;
   std::vector<PubKey32> committee_for_height(std::uint64_t height) const;
+  std::vector<PubKey32> committee_for_height_round(std::uint64_t height, std::uint32_t round) const;
+  std::vector<PubKey32> reward_signers_for_height_round(std::uint64_t height, std::uint32_t round) const;
+  std::optional<PubKey32> leader_for_height_round(std::uint64_t height, std::uint32_t round) const;
   void load_persisted_peers();
   void persist_peers() const;
   void load_addrman();
@@ -171,6 +211,14 @@ class Node {
   bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
+  void apply_activation_signal(const Block& block, std::uint64_t height);
+  bool validate_v4_registration_rules(const Block& block, std::uint64_t height) const;
+  void update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
+                                        const std::vector<FinalitySig>& finality_sigs);
+  bool v4_active_for_height(std::uint64_t height) const;
+  bool v5_active_for_height(std::uint64_t height) const;
+  bool v6_active_for_height(std::uint64_t height) const;
+  bool v7_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -203,9 +251,30 @@ class Node {
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};
+  consensus::ActivationState activation_state_{};
+  consensus::ActivationParams activation_params_{};
+  std::uint64_t v4_min_bond_{BOND_AMOUNT};
+  std::uint64_t v7_min_bond_amount_{BOND_AMOUNT};
+  std::uint64_t v7_max_bond_amount_{BOND_AMOUNT};
+  std::uint64_t v7_effective_units_cap_{10'000};
+  std::uint64_t v4_warmup_blocks_{WARMUP_BLOCKS};
+  std::uint64_t v4_cooldown_blocks_{0};
+  std::uint64_t v4_join_limit_window_blocks_{0};
+  std::uint32_t v4_join_limit_max_new_{0};
+  std::uint64_t v4_join_window_start_height_{0};
+  std::uint32_t v4_join_count_in_window_{0};
+  std::uint64_t v4_liveness_window_blocks_{10'000};
+  std::uint64_t v4_liveness_epoch_start_height_{0};
+  std::uint32_t v4_miss_rate_suspend_threshold_percent_{30};
+  std::uint32_t v4_miss_rate_exit_threshold_percent_{60};
+  std::uint64_t v4_suspend_duration_blocks_{1'000};
+  std::size_t last_participation_eligible_signers_{0};
+  consensus::V5Params v5_params_{};
+  consensus::V6Params v6_params_{};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
+  std::map<std::pair<std::uint64_t, std::uint32_t>, std::set<PubKey32>> received_proposers_v5_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
 
   crypto::KeyPair local_key_;
@@ -228,7 +297,7 @@ class Node {
   p2p::AddrMan addrman_{10'000};
   ChainId chain_id_{};
   std::optional<Hash32> expected_genesis_hash_;
-  std::string genesis_source_hint_{"devnet"};
+  std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;
   std::string last_bootstrap_source_{"none"};
   bool restart_debug_{false};

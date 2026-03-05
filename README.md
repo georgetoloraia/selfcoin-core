@@ -22,18 +22,18 @@ cmake --build build -j
 
 ## Run Mainnet Node
 ```bash
-./build/selfcoin-node --mainnet
+./build/selfcoin-node
 ```
 
 optional encrypted keystore:
 ```bash
 export SELFCOIN_VALIDATOR_PASS="change-me"
-./build/selfcoin-node --mainnet --validator-passphrase-env SELFCOIN_VALIDATOR_PASS
+./build/selfcoin-node --validator-passphrase-env SELFCOIN_VALIDATOR_PASS
 ```
 
 Public node (operator mode):
 ```bash
-./build/selfcoin-node --mainnet --public
+./build/selfcoin-node --public
 ```
 
 Default mainnet data dir:
@@ -44,7 +44,7 @@ Default mainnet data dir:
 ## Run Lightserver
 Local-only (same machine):
 ```bash
-./build/selfcoin-lightserver --mainnet --db ~/.selfcoin/mainnet --bind 127.0.0.1 --port 19444 --relay-host 127.0.0.1 --relay-port 19440
+./build/selfcoin-lightserver --db ~/.selfcoin/mainnet --bind 127.0.0.1 --port 19444 --relay-host 127.0.0.1 --relay-port 19440
 ```
 
 RPC endpoint:
@@ -54,7 +54,7 @@ http://127.0.0.1:19444/rpc
 
 Public/global (external clients can connect):
 ```bash
-./build/selfcoin-lightserver --mainnet --db ~/.selfcoin/mainnet --bind 0.0.0.0 --port 19444 --relay-host 127.0.0.1 --relay-port 19440
+./build/selfcoin-lightserver --db ~/.selfcoin/mainnet --bind 0.0.0.0 --port 19444 --relay-host 127.0.0.1 --relay-port 19440
 ```
 
 If using public mode, open firewall port `19444/tcp`.

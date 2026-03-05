@@ -39,6 +39,11 @@ struct NetworkConfig {
   std::uint32_t miss_rate_suspend_threshold_percent{30};
   std::uint32_t miss_rate_exit_threshold_percent{60};
   std::uint64_t suspend_duration_blocks{1'000};
+  std::uint64_t v5_proposer_expected_num{1};
+  std::uint64_t v5_proposer_expected_den{1};
+  std::uint32_t v5_voter_target_k{100};
+  std::uint32_t v5_round_expand_cap{8};
+  std::uint32_t v5_round_expand_factor{2};
   std::vector<std::string> default_seeds;
 };
 

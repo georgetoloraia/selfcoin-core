@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "consensus/activation.hpp"
+#include "consensus/sortition_v5.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -68,6 +69,11 @@ struct NodeConfig {
   std::optional<std::uint32_t> miss_rate_suspend_threshold_percent_override;
   std::optional<std::uint32_t> miss_rate_exit_threshold_percent_override;
   std::optional<std::uint64_t> suspend_duration_blocks_override;
+  std::optional<std::uint64_t> v5_proposer_expected_num_override;
+  std::optional<std::uint64_t> v5_proposer_expected_den_override;
+  std::optional<std::uint32_t> v5_voter_target_k_override;
+  std::optional<std::uint32_t> v5_round_expand_cap_override;
+  std::optional<std::uint32_t> v5_round_expand_factor_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -157,13 +163,14 @@ class Node {
   void maybe_send_verack(int peer_id);
 
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
-  bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0);
+  bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0, const Bytes& vrf_proof = {},
+                   const Hash32* vrf_output = nullptr);
   bool handle_tx(const Tx& tx, bool from_network, int from_peer_id = 0);
   bool finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std::uint32_t round);
 
   std::optional<Block> build_proposal_block(std::uint64_t height, std::uint32_t round);
-  void broadcast_propose(const Block& block);
-  void broadcast_vote(const Vote& vote);
+  void broadcast_propose(const Block& block, const Bytes& vrf_proof = {}, const Hash32* vrf_output = nullptr);
+  void broadcast_vote(const Vote& vote, const Bytes& vrf_proof = {}, const Hash32* vrf_output = nullptr);
   void broadcast_finalized_block(const Block& block);
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
@@ -198,6 +205,7 @@ class Node {
   void update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
                                         const std::vector<FinalitySig>& finality_sigs);
   bool v4_active_for_height(std::uint64_t height) const;
+  bool v5_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -245,9 +253,11 @@ class Node {
   std::uint32_t v4_miss_rate_exit_threshold_percent_{60};
   std::uint64_t v4_suspend_duration_blocks_{1'000};
   std::size_t last_participation_eligible_signers_{0};
+  consensus::V5Params v5_params_{};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
+  std::map<std::pair<std::uint64_t, std::uint32_t>, std::set<PubKey32>> received_proposers_v5_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
 
   crypto::KeyPair local_key_;

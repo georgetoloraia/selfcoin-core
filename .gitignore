@@ -50,4 +50,3 @@ compile_commands.json
 CTestTestfile.cmake
 sdk/selfcoin-wallet-js/node_modules/
 sdk/selfcoin-wallet-js/dist/
-docs/

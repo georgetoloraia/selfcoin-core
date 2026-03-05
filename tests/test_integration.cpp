@@ -725,6 +725,45 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
   }, std::chrono::seconds(120)));
 }
 
+TEST(test_v5_rejects_propose_without_vrf_proof) {
+  const std::string base = "/tmp/selfcoin_it_v5_missing_proof";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
+
+  node::NodeConfig cfg;
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.network.initial_consensus_version = 5;
+  cfg.network.max_consensus_version = 5;
+  cfg.activation_enabled_override = true;
+  cfg.activation_max_version_override = 5;
+  cfg.activation_window_blocks_override = 1;
+  cfg.activation_threshold_percent_override = 100;
+  cfg.activation_delay_blocks_override = 0;
+  cfg.v5_proposer_expected_num_override = 10;
+  cfg.v5_proposer_expected_den_override = 1;
+  cfg.v5_voter_target_k_override = 4;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  keystore::ValidatorKey out_key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &out_key, &kerr));
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  auto b = n.build_proposal_for_test(1, 0);
+  ASSERT_TRUE(b.has_value());
+  // inject_propose_for_test uses legacy propose payload fields and therefore has no v5 VRF proof.
+  ASSERT_TRUE(!n.inject_propose_for_test(*b));
+}
+
 TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
   const auto keys = node::Node::deterministic_test_keypairs();
   auto cluster = make_cluster("/tmp/selfcoin_it_slash", 1);

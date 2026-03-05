@@ -27,7 +27,9 @@ int main(int argc, char** argv) {
                  "[--validator-min-bond <u64>] [--validator-warmup-blocks <n>] [--validator-cooldown-blocks <n>] "
                  "[--validator-join-limit-window-blocks <n>] [--validator-join-limit-max-new <n>] "
                  "[--liveness-window-blocks <n>] [--miss-rate-suspend-threshold-percent <n>] "
-                 "[--miss-rate-exit-threshold-percent <n>] [--suspend-duration-blocks <n>]\n";
+                 "[--miss-rate-exit-threshold-percent <n>] [--suspend-duration-blocks <n>] "
+                 "[--v5-proposer-expected-num <n>] [--v5-proposer-expected-den <n>] "
+                 "[--v5-voter-target-k <n>] [--v5-round-expand-cap <n>] [--v5-round-expand-factor <n>]\n";
     return 1;
   }
 

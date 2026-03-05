@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <netdb.h>
@@ -269,7 +270,9 @@ bool Node::init() {
   const auto parent = dbp.parent_path();
   if (!parent.empty()) (void)ensure_private_dir(parent.string());
   (void)ensure_private_dir(cfg_.db_path);
+  mining_log_path_ = (dbp / "MiningLOG").string();
   std::cout << "[node " << cfg_.node_id << "] db-dir=" << cfg_.db_path << "\n";
+  std::cout << "[node " << cfg_.node_id << "] mining-log=" << mining_log_path_ << "\n";
   if (cfg_.public_mode) {
     std::cout << "[node " << cfg_.node_id
               << "] warning: public mode enabled (listening for inbound peers on " << cfg_.bind_ip << ":"
@@ -1700,6 +1703,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
     oss << " included_txid=" << hex_encode32(b.txs[1].txid());
   }
   log_line(oss.str());
+  append_mining_log(b, round, filtered.size(), quorum);
 
   return true;
 }
@@ -2463,6 +2467,48 @@ void Node::log_line(const std::string& s) const {
   std::cout << "[node " << cfg_.node_id << "] " << s << "\n";
 }
 
+void Node::append_mining_log(const Block& block, std::uint32_t round, std::size_t votes, std::size_t quorum) {
+  if (mining_log_path_.empty()) return;
+  if (block.txs.empty()) return;
+
+  const std::uint32_t cv = consensus::version_for_height(activation_state_, activation_params_, block.header.height);
+  std::size_t committee_size = 0;
+  if (cv >= 6 && v6_active_for_height(block.header.height)) {
+    const auto active = validators_.active_sorted(block.header.height);
+    committee_size = std::max<std::size_t>(
+        2, std::min<std::size_t>(active.size(), consensus::voter_target_k_v6(active.size(), round, v6_params_)));
+  } else if (cv >= 5 && v5_active_for_height(block.header.height)) {
+    const auto active = validators_.active_sorted(block.header.height);
+    committee_size = std::max<std::size_t>(
+        2, std::min<std::size_t>(active.size(), consensus::voter_target_k_v5(active.size(), round, v5_params_)));
+  } else {
+    committee_size = committee_for_height_round(block.header.height, round).size();
+  }
+
+  std::uint64_t coinbase_total = 0;
+  for (const auto& out : block.txs[0].outputs) coinbase_total += out.value;
+  const std::uint64_t generated_coin = consensus::reward_units(block.header.height);
+  const std::uint64_t fees = (coinbase_total > generated_coin) ? (coinbase_total - generated_coin) : 0;
+  const std::size_t active_validators = validators_.active_sorted(block.header.height + 1).size();
+
+  std::time_t ts = static_cast<std::time_t>(block.header.timestamp);
+  std::tm tm_utc{};
+#if defined(_WIN32)
+  gmtime_s(&tm_utc, &ts);
+#else
+  gmtime_r(&ts, &tm_utc);
+#endif
+  std::ostringstream iso;
+  iso << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
+
+  std::ofstream out(mining_log_path_, std::ios::app);
+  if (!out.good()) return;
+  out << block.header.timestamp << " | " << iso.str() << " | h=" << block.header.height << " | round=" << round
+      << " | generated_coin=" << generated_coin << " | fees=" << fees << " | coinbase_total=" << coinbase_total
+      << " | active_validators=" << active_validators << " | committee=" << committee_size << " | votes=" << votes
+      << "/" << quorum << " | block_hash=" << hex_encode32(block.header.block_id()) << "\n";
+}
+
 void Node::spawn_local_bus_task(std::function<void()> fn) {
   std::lock_guard<std::mutex> lk(local_bus_tasks_mu_);
   local_bus_tasks_.emplace_back([f = std::move(fn)]() { f(); });
@@ -2889,24 +2935,10 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
-    } else if (a == "--activation-enabled") {
-      cfg.activation_enabled_override = true;
-    } else if (a == "--activation-max-version") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_max_version_override = static_cast<std::uint32_t>(std::stoul(*v));
-    } else if (a == "--activation-window-blocks") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_window_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
-    } else if (a == "--activation-threshold-percent") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_threshold_percent_override = static_cast<std::uint32_t>(std::stoul(*v));
-    } else if (a == "--activation-delay-blocks") {
-      auto v = next(a);
-      if (!v) return std::nullopt;
-      cfg.activation_delay_blocks_override = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--activation-enabled" || a == "--activation-max-version" || a == "--activation-window-blocks" ||
+               a == "--activation-threshold-percent" || a == "--activation-delay-blocks") {
+      std::cerr << "activation flags are not supported in fixed-cv7 mode\n";
+      return std::nullopt;
     } else if (a == "--validator-min-bond") {
       auto v = next(a);
       if (!v) return std::nullopt;

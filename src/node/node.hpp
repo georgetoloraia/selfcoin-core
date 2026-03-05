@@ -223,6 +223,7 @@ class Node {
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
   void log_line(const std::string& s) const;
+  void append_mining_log(const Block& block, std::uint32_t round, std::size_t votes, std::size_t quorum);
   void spawn_local_bus_task(std::function<void()> fn);
   void join_local_bus_tasks();
 
@@ -300,6 +301,7 @@ class Node {
   std::string genesis_source_hint_{"embedded"};
   std::set<int> getaddr_requested_peers_;
   std::string last_bootstrap_source_{"none"};
+  std::string mining_log_path_;
   bool restart_debug_{false};
 };
 

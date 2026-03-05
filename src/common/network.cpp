@@ -30,7 +30,7 @@ const NetworkConfig kMainnet{
     .warmup_blocks = WARMUP_BLOCKS,
     .unbond_delay_blocks = UNBOND_DELAY_BLOCKS,
     .activation_enabled = false,
-    .initial_consensus_version = 1,
+    .initial_consensus_version = 7,
     .max_consensus_version = 7,
     .activation_window_blocks = 0,
     .activation_threshold_percent = 0,

@@ -548,7 +548,17 @@ std::optional<Config> parse_args(int argc, char** argv) {
       cfg.mainnet = true;
       cfg.devnet = false;
       cfg.testnet = false;
+      cfg.nextnet = false;
       cfg.network = mainnet_network();
+      if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
+      if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--nextnet") {
+      cfg.nextnet = true;
+      cfg.mainnet = false;
+      cfg.devnet = false;
+      cfg.testnet = false;
+      cfg.network = nextnet_network();
       if (!port_explicit) cfg.port = cfg.network.lightserver_default_port;
       if (!relay_port_explicit) cfg.tx_relay_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;

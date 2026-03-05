@@ -44,6 +44,7 @@ add_library(selfcoin_core
   src/utxo/signing.cpp
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
+  src/consensus/activation.cpp
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
@@ -108,6 +109,7 @@ add_executable(selfcoin-tests
   tests/test_p2p.cpp
   tests/test_addrman.cpp
   tests/test_monetary.cpp
+  tests/test_activation.cpp
   tests/test_bonding.cpp
   tests/test_mempool.cpp
   tests/test_hardening.cpp

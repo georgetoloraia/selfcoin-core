@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "consensus/activation.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -28,6 +29,7 @@ struct NodeConfig {
   bool devnet{true};
   bool testnet{false};
   bool mainnet{false};
+  bool nextnet{false};
   NetworkConfig network{devnet_network()};
   bool allow_unsafe_genesis_override{false};
   std::string validator_key_file;
@@ -99,6 +101,9 @@ struct NodeStatus {
   std::uint64_t rejected_network_id{0};
   std::uint64_t rejected_protocol_version{0};
   std::uint64_t rejected_pre_handshake{0};
+  std::uint32_t consensus_version{1};
+  std::uint32_t pending_consensus_version{0};
+  std::uint64_t pending_activation_height{0};
 };
 
 class Node {
@@ -171,6 +176,7 @@ class Node {
   bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
+  void apply_activation_signal(const Block& block, std::uint64_t height);
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -203,6 +209,8 @@ class Node {
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};
+  consensus::ActivationState activation_state_{};
+  consensus::ActivationParams activation_params_{};
 
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;

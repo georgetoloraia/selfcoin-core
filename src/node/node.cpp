@@ -16,6 +16,7 @@
 
 #include "address/address.hpp"
 #include "codec/bytes.hpp"
+#include "consensus/activation.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/monetary.hpp"
 #include "common/paths.hpp"
@@ -43,11 +44,6 @@ std::string short_pub_hex(const PubKey32& pub) {
 std::string short_hash_hex(const Hash32& h) {
   Bytes b(h.begin(), h.begin() + 4);
   return hex_encode(b);
-}
-
-Bytes make_coinbase_script_sig(std::uint64_t h, std::uint32_t r) {
-  std::string msg = "cb:" + std::to_string(h) + ":" + std::to_string(r);
-  return Bytes(msg.begin(), msg.end());
 }
 
 bool restart_debug_enabled() {
@@ -101,6 +97,8 @@ bool Node::init() {
     genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   } else if (cfg_.devnet) {
     genesis_source_hint_ = "devnet";
+  } else if (cfg_.nextnet) {
+    genesis_source_hint_ = "nextnet";
   } else {
     genesis_source_hint_ = "file";
   }
@@ -117,6 +115,13 @@ bool Node::init() {
   }
   discipline_ = p2p::PeerDiscipline(30, 100, cfg_.ban_seconds, cfg_.invalid_frame_ban_threshold,
                                     cfg_.invalid_frame_window_seconds);
+  activation_params_.enabled = cfg_.network.activation_enabled;
+  activation_params_.initial_version = cfg_.network.initial_consensus_version;
+  activation_params_.max_version = cfg_.network.max_consensus_version;
+  activation_params_.window_blocks = cfg_.network.activation_window_blocks;
+  activation_params_.threshold_percent = cfg_.network.activation_threshold_percent;
+  activation_params_.activation_delay_blocks = cfg_.network.activation_delay_blocks;
+  activation_state_.current_version = activation_params_.initial_version;
   p2p::AddrPolicy addr_policy;
   if (cfg_.mainnet) {
     addr_policy.required_port = cfg_.network.p2p_default_port;
@@ -164,7 +169,7 @@ bool Node::init() {
 
   {
     bool key_loaded = false;
-    if (cfg_.mainnet || !cfg_.validator_key_file.empty()) {
+    if (cfg_.mainnet || cfg_.nextnet || !cfg_.validator_key_file.empty()) {
       const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
                                                         ? keystore::default_validator_keystore_path(cfg_.db_path)
                                                         : cfg_.validator_key_file);
@@ -200,7 +205,7 @@ bool Node::init() {
       local_key_ = keys[static_cast<std::size_t>(safe_node_id) % keys.size()];
     }
 
-    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet)) {
+    if (validators_.all().empty() && (cfg_.devnet || cfg_.testnet || cfg_.nextnet)) {
       const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
       for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
         const auto& kp = keys[idx];
@@ -224,10 +229,10 @@ bool Node::init() {
   load_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
-  if ((cfg_.testnet || cfg_.mainnet) && cfg_.seeds.empty()) {
+  if ((cfg_.testnet || cfg_.mainnet || cfg_.nextnet) && cfg_.seeds.empty()) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
   }
-  if ((cfg_.mainnet || cfg_.testnet) && cfg_.dns_seeds) {
+  if ((cfg_.mainnet || cfg_.testnet || cfg_.nextnet) && cfg_.dns_seeds) {
     dns_seed_peers_ = resolve_dns_seeds_once();
     for (const auto& d : dns_seed_peers_) bootstrap_peers_.push_back(d);
   }
@@ -379,6 +384,9 @@ NodeStatus Node::status() const {
   s.rejected_network_id = rejected_network_id_;
   s.rejected_protocol_version = rejected_protocol_version_;
   s.rejected_pre_handshake = rejected_pre_handshake_;
+  s.consensus_version = activation_state_.current_version;
+  s.pending_consensus_version = activation_state_.pending_version;
+  s.pending_activation_height = activation_state_.pending_activation_height;
   return s;
 }
 
@@ -523,6 +531,8 @@ void Node::event_loop() {
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
             << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
             << ",\"committee_size\":" << committee.size() << ",\"addrman_size\":" << addrman_.size()
+            << ",\"consensus_version\":" << activation_state_.current_version
+            << ",\"pending_consensus_version\":" << activation_state_.pending_version
             << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\""
             << ",\"genesis_source\":\"" << chain_id_.genesis_source << "\""
             << ",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false")
@@ -554,14 +564,17 @@ void Node::event_loop() {
             << ",\"outbound_target\":" << cfg_.outbound_target << ",\"addrman_size\":" << addrman_.size()
             << ",\"bootstrap_source_last\":\"" << last_bootstrap_source_ << "\",\"committee_size\":" << committee.size()
             << ",\"quorum_threshold\":" << q << ",\"observed_signers\":" << observed
-            << ",\"consensus_state\":\"" << state << "\"}";
+            << ",\"consensus_state\":\"" << state << "\",\"consensus_version\":" << activation_state_.current_version
+            << ",\"pending_consensus_version\":" << activation_state_.pending_version
+            << ",\"pending_activation_height\":" << activation_state_.pending_activation_height << "}";
           std::cout << j.str() << "\n";
         } else {
           std::cout << cfg_.network.name << " h=" << finalized_height_ << " tip=" << short_hash_hex(finalized_hash_)
                     << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8)
                     << " peers=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
                     << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
-                    << " addrman=" << addrman_.size() << " state=" << state << "\n";
+                    << " addrman=" << addrman_.size() << " cv=" << activation_state_.current_version << " state=" << state
+                    << "\n";
         }
         last_summary_log_ms_ = now_ms;
       }
@@ -777,6 +790,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             apply_validator_state_changes(*blk, pre_utxos, blk->header.height);
             apply_block_to_utxo(*blk, utxos_);
             mempool_.prune_against_utxo(utxos_);
+            apply_activation_signal(*blk, blk->header.height);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             last_finalized_progress_ms_ = now_unix() * 1000;
@@ -1079,6 +1093,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   apply_validator_state_changes(b, pre_utxos, height);
   apply_block_to_utxo(b, utxos_);
   mempool_.prune_against_utxo(utxos_);
+  apply_activation_signal(b, height);
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
@@ -1124,7 +1139,14 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   in.prev_txid = zero_hash();
   in.prev_index = 0xFFFFFFFF;
   in.sequence = 0xFFFFFFFF;
-  in.script_sig = make_coinbase_script_sig(height, round);
+  std::optional<std::uint32_t> signal_version;
+  if (activation_params_.enabled) {
+    signal_version = activation_state_.current_version;
+    if (activation_state_.pending_version > 0 && height >= activation_state_.pending_activation_height) {
+      signal_version = activation_state_.pending_version;
+    }
+  }
+  in.script_sig = consensus::make_coinbase_script_sig(height, round, signal_version);
   coinbase.inputs.push_back(in);
 
   std::vector<Tx> picked;
@@ -1374,6 +1396,14 @@ bool Node::init_mainnet_genesis() {
 }
 
 bool Node::load_state() {
+  activation_state_.current_version = activation_params_.initial_version;
+  activation_state_.pending_version = 0;
+  activation_state_.pending_activation_height = 0;
+  activation_state_.last_height = 0;
+  activation_state_.window_start_height = 0;
+  activation_state_.window_signal_count = 0;
+  activation_state_.window_total_count = 0;
+
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
     finalized_height_ = 0;
@@ -1389,6 +1419,10 @@ bool Node::load_state() {
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
 
+  if (auto act = db_.get_activation_state(); act.has_value()) {
+    activation_state_ = *act;
+  }
+
   if (validators_.all().empty() && finalized_height_ > 0) {
     UtxoSet replay_utxos;
     for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
@@ -1401,6 +1435,21 @@ bool Node::load_state() {
       apply_validator_state_changes(*blk, replay_utxos, h);
       apply_block_to_utxo(*blk, replay_utxos);
     }
+  }
+
+  if (activation_params_.enabled &&
+      (activation_state_.last_height == 0 || activation_state_.last_height < finalized_height_)) {
+    for (std::uint64_t h = activation_state_.last_height + 1; h <= finalized_height_; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) continue;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) continue;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value() || blk->txs.empty()) continue;
+      const auto sig = consensus::parse_coinbase_signal_version(blk->txs[0]);
+      consensus::apply_signal(&activation_state_, activation_params_, h, sig);
+    }
+    (void)db_.set_activation_state(activation_state_);
   }
 
   return true;
@@ -1417,7 +1466,7 @@ std::vector<PubKey32> Node::committee_for_height(std::uint64_t height) const {
   consensus::ValidatorRegistry replay_validators;
   UtxoSet replay_utxos;
 
-  if (cfg_.devnet || cfg_.testnet) {
+  if (cfg_.devnet || cfg_.testnet || cfg_.nextnet) {
     const auto keys = devnet_keypairs();
     const int n_active = std::max(1, std::min(static_cast<int>(keys.size()), cfg_.devnet_initial_active_validators));
     for (int idx = 0; idx < static_cast<int>(keys.size()); ++idx) {
@@ -1525,6 +1574,14 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   for (const auto& [pub, info] : validators_.all()) {
     db_.put_validator(pub, info);
   }
+}
+
+void Node::apply_activation_signal(const Block& block, std::uint64_t height) {
+  if (block.txs.empty()) return;
+  std::optional<std::uint32_t> signaled;
+  if (activation_params_.enabled) signaled = consensus::parse_coinbase_signal_version(block.txs[0]);
+  consensus::apply_signal(&activation_state_, activation_params_, height, signaled);
+  (void)db_.set_activation_state(activation_state_);
 }
 
 std::uint64_t Node::now_unix() const {
@@ -1850,6 +1907,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.devnet = true;
       cfg.testnet = false;
       cfg.mainnet = false;
+      cfg.nextnet = false;
       cfg.dns_seeds = false;
       cfg.network = devnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
@@ -1858,6 +1916,7 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.testnet = true;
       cfg.devnet = false;
       cfg.mainnet = false;
+      cfg.nextnet = false;
       cfg.dns_seeds = true;
       cfg.network = testnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
@@ -1866,8 +1925,18 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       cfg.mainnet = true;
       cfg.devnet = false;
       cfg.testnet = false;
+      cfg.nextnet = false;
       cfg.dns_seeds = true;
       cfg.network = mainnet_network();
+      if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
+      if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
+    } else if (a == "--nextnet") {
+      cfg.nextnet = true;
+      cfg.mainnet = false;
+      cfg.devnet = false;
+      cfg.testnet = false;
+      cfg.dns_seeds = true;
+      cfg.network = nextnet_network();
       if (!port_explicit) cfg.p2p_port = cfg.network.p2p_default_port;
       if (!committee_explicit) cfg.max_committee = cfg.network.max_committee;
     } else if (a == "--node-id") {

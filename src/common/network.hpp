@@ -24,12 +24,19 @@ struct NetworkConfig {
   std::uint64_t bond_amount{BOND_AMOUNT};
   std::uint64_t warmup_blocks{WARMUP_BLOCKS};
   std::uint64_t unbond_delay_blocks{UNBOND_DELAY_BLOCKS};
+  bool activation_enabled{false};
+  std::uint32_t initial_consensus_version{1};
+  std::uint32_t max_consensus_version{1};
+  std::uint64_t activation_window_blocks{0};
+  std::uint32_t activation_threshold_percent{0};
+  std::uint64_t activation_delay_blocks{0};
   std::vector<std::string> default_seeds;
 };
 
 const NetworkConfig& devnet_network();
 const NetworkConfig& testnet_network();
 const NetworkConfig& mainnet_network();
+const NetworkConfig& nextnet_network();
 const NetworkConfig& network_by_name(const std::string& name);
 
 }  // namespace selfcoin

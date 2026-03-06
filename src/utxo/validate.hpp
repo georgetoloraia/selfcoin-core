@@ -18,9 +18,9 @@ struct TxValidationResult {
 struct SpecialValidationContext {
   const consensus::ValidatorRegistry* validators{nullptr};
   std::uint64_t current_height{0};
-  std::uint32_t consensus_version{1};
-  std::uint64_t v7_min_bond_amount{BOND_AMOUNT};
-  std::uint64_t v7_max_bond_amount{BOND_AMOUNT};
+  bool enforce_variable_bond_range{false};
+  std::uint64_t min_bond_amount{BOND_AMOUNT};
+  std::uint64_t max_bond_amount{BOND_AMOUNT};
   std::function<bool(const PubKey32&, std::uint64_t, std::uint32_t)> is_committee_member;
 };
 

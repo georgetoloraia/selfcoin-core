@@ -242,7 +242,7 @@ struct HttpStubServer {
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE, bool v3_active = false) {
+                     std::size_t max_committee = MAX_COMMITTEE) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
@@ -262,11 +262,6 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
-    if (v3_active) {
-      cfg.network.initial_consensus_version = 3;
-      cfg.activation_enabled_override = true;
-      cfg.activation_max_version_override = 3;
-    }
     cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
     cfg.validator_passphrase = "test-pass";
     for (int j = 0; j < i; ++j) {
@@ -723,45 +718,6 @@ TEST(test_permissionless_join_pending_to_active_after_warmup) {
     }
     return true;
   }, std::chrono::seconds(120)));
-}
-
-TEST(test_v5_rejects_propose_without_vrf_proof) {
-  const std::string base = "/tmp/selfcoin_it_v5_missing_proof";
-  std::filesystem::remove_all(base);
-  std::filesystem::create_directories(base);
-  const std::string gpath = base + "/genesis.json";
-  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 4));
-
-  node::NodeConfig cfg;
-  cfg.disable_p2p = true;
-  cfg.node_id = 0;
-  cfg.db_path = base + "/node0";
-  cfg.genesis_path = gpath;
-  cfg.allow_unsafe_genesis_override = true;
-  cfg.network.initial_consensus_version = 5;
-  cfg.network.max_consensus_version = 5;
-  cfg.activation_enabled_override = true;
-  cfg.activation_max_version_override = 5;
-  cfg.activation_window_blocks_override = 1;
-  cfg.activation_threshold_percent_override = 100;
-  cfg.activation_delay_blocks_override = 0;
-  cfg.v5_proposer_expected_num_override = 10;
-  cfg.v5_proposer_expected_den_override = 1;
-  cfg.v5_voter_target_k_override = 4;
-  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
-  cfg.validator_passphrase = "test-pass";
-
-  keystore::ValidatorKey out_key;
-  std::string kerr;
-  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
-                                                  deterministic_seed_for_node_id(0), &out_key, &kerr));
-
-  node::Node n(cfg);
-  ASSERT_TRUE(n.init());
-  auto b = n.build_proposal_for_test(1, 0);
-  ASSERT_TRUE(b.has_value());
-  // inject_propose_for_test uses legacy propose payload fields and therefore has no v5 VRF proof.
-  ASSERT_TRUE(!n.inject_propose_for_test(*b));
 }
 
 TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
@@ -1360,8 +1316,8 @@ TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   n.stop();
 }
 
-TEST(test_v3_active_marker_missing_rejected) {
-  auto cluster = make_cluster("/tmp/selfcoin_it_v3_marker_missing", 4, 1, 4, true);
+TEST(test_fixed_runtime_proposal_omits_scr3_marker) {
+  auto cluster = make_cluster("/tmp/selfcoin_it_no_v3_marker", 4, 1, 4);
   auto& n = *cluster.nodes[0];
   n.pause_proposals_for_test(true);
 
@@ -1373,30 +1329,7 @@ TEST(test_v3_active_marker_missing_rejected) {
   ASSERT_TRUE(!blk->txs.empty());
   ASSERT_TRUE(!blk->txs[0].inputs.empty());
 
-  auto& script = blk->txs[0].inputs[0].script_sig;
-  constexpr std::size_t kMarkerLen = 4 + 32 + 32;
-  bool removed = false;
-  if (script.size() >= kMarkerLen) {
-    for (std::size_t i = 0; i + kMarkerLen <= script.size(); ++i) {
-      if (std::equal(consensus::kSCR3Prefix.begin(), consensus::kSCR3Prefix.end(),
-                     script.begin() + static_cast<std::ptrdiff_t>(i))) {
-        script.erase(script.begin() + static_cast<std::ptrdiff_t>(i),
-                     script.begin() + static_cast<std::ptrdiff_t>(i + kMarkerLen));
-        removed = true;
-        break;
-      }
-    }
-  }
-  ASSERT_TRUE(removed);
-
-  std::vector<Bytes> tx_bytes;
-  tx_bytes.reserve(blk->txs.size());
-  for (const auto& tx : blk->txs) tx_bytes.push_back(tx.serialize());
-  auto m = merkle::compute_merkle_root_from_txs(tx_bytes);
-  ASSERT_TRUE(m.has_value());
-  blk->header.merkle_root = *m;
-
-  ASSERT_TRUE(!n.inject_propose_for_test(*blk));
+  ASSERT_TRUE(consensus::find_scr3_roots_marker(blk->txs[0].inputs[0].script_sig, nullptr) == std::nullopt);
 }
 
 void register_integration_tests() {}

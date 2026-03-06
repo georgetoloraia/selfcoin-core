@@ -8,6 +8,14 @@ It includes:
 - `selfcoin-cli` (utility CLI)
 - TypeScript wallet SDK in `sdk/selfcoin-wallet-js`
 
+The shipped runtime uses one fixed consensus interpretation:
+- deterministic proposer selection
+- deterministic committee selection
+- committee-membership voting with quorum from committee size
+- current validator/bond validation semantics in transaction and block validation
+
+Historical activation/version-routing code is not part of the active mainnet runtime. See `docs/runtime-consensus.md` and `docs/consensus-history.md`.
+
 ## Build (Full)
 ### 1) Auto-bootstrap build (recommended)
 ```bash

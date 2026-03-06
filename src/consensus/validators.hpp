@@ -41,15 +41,6 @@ struct ValidatorRules {
   std::uint64_t cooldown_blocks{0};
 };
 
-struct ValidatorWeightParamsV6 {
-  std::uint64_t bond_unit{BOND_AMOUNT};
-  std::uint64_t units_max{1'000'000};
-};
-
-struct ValidatorWeightParamsV7 {
-  std::uint64_t effective_units_cap{10'000};
-};
-
 class ValidatorRegistry {
  public:
   void set_rules(ValidatorRules rules) { rules_ = rules; }
@@ -103,13 +94,5 @@ std::uint64_t v4_liveness_next_epoch_start(std::uint64_t height, std::uint64_t e
                                            std::uint64_t window_blocks);
 void v4_advance_join_window(std::uint64_t height, std::uint64_t window_blocks, std::uint64_t* window_start_height,
                             std::uint32_t* window_count);
-std::uint64_t validator_weight_units_v6(const ValidatorInfo& info, const ValidatorWeightParamsV6& params);
-std::uint64_t validator_effective_weight_units_v7(const ValidatorInfo& info, const ValidatorWeightParamsV6& v6_params,
-                                                  const ValidatorWeightParamsV7& v7_params);
-std::uint64_t total_active_weight_units_v6(const ValidatorRegistry& registry, std::uint64_t height,
-                                           const ValidatorWeightParamsV6& params);
-std::uint64_t total_active_effective_weight_units_v7(const ValidatorRegistry& registry, std::uint64_t height,
-                                                     const ValidatorWeightParamsV6& v6_params,
-                                                     const ValidatorWeightParamsV7& v7_params);
 
 }  // namespace selfcoin::consensus

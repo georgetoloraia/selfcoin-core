@@ -19,8 +19,8 @@
   },
   "monetary_params_ref": "README.md#monetary-policy-7m-hard-cap",
   "seeds": [
-    "seed1.mainnet.selfcoin.example:19440",
-    "seed2.mainnet.selfcoin.example:19440"
+    "167.172.97.180:19440",
+    "138.197.113.69:19440"
   ],
   "note": "mainnet genesis with two initial validators"
 }

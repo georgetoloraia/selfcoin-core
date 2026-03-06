@@ -39,7 +39,7 @@ TEST(test_prefix_classification) {
   ASSERT_EQ(p2p::classify_prefix(Bytes{0x01, 0x02, 0x03}), p2p::PrefixKind::UNKNOWN);
 }
 
-TEST(test_propose_v5_codec_roundtrip) {
+TEST(test_propose_codec_roundtrip_with_vrf_extensions) {
   p2p::ProposeMsg p;
   p.height = 10;
   p.round = 3;
@@ -48,7 +48,7 @@ TEST(test_propose_v5_codec_roundtrip) {
   p.vrf_proof = Bytes{1, 2, 3, 4};
   p.vrf_output.fill(0x22);
 
-  const Bytes b = p2p::ser_propose(p, 5);
+  const Bytes b = p2p::ser_propose(p, true);
   auto d = p2p::de_propose(b);
   ASSERT_TRUE(d.has_value());
   ASSERT_EQ(d->height, p.height);
@@ -59,7 +59,7 @@ TEST(test_propose_v5_codec_roundtrip) {
   ASSERT_EQ(d->vrf_output, p.vrf_output);
 }
 
-TEST(test_vote_v5_codec_roundtrip) {
+TEST(test_vote_codec_roundtrip_with_vrf_extensions) {
   p2p::VoteMsg m;
   m.vote.height = 7;
   m.vote.round = 2;
@@ -69,7 +69,7 @@ TEST(test_vote_v5_codec_roundtrip) {
   m.vrf_proof = Bytes{9, 8, 7};
   m.vrf_output.fill(0x61);
 
-  const Bytes b = p2p::ser_vote(m, 5);
+  const Bytes b = p2p::ser_vote(m, true);
   auto d = p2p::de_vote(b);
   ASSERT_TRUE(d.has_value());
   ASSERT_EQ(d->vote.height, m.vote.height);

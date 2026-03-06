@@ -88,13 +88,13 @@ std::optional<FinalizedTipMsg> de_finalized_tip(const Bytes& b) {
   return m;
 }
 
-Bytes ser_propose(const ProposeMsg& m, std::uint32_t consensus_version) {
+Bytes ser_propose(const ProposeMsg& m, bool include_vrf_extensions) {
   codec::ByteWriter w;
   w.u64le(m.height);
   w.u32le(m.round);
   w.bytes_fixed(m.prev_finalized_hash);
   w.varbytes(m.block_bytes);
-  if (consensus_version >= 5) {
+  if (include_vrf_extensions) {
     w.varbytes(m.vrf_proof);
     w.bytes_fixed(m.vrf_output);
   }
@@ -126,14 +126,14 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
   return m;
 }
 
-Bytes ser_vote(const VoteMsg& m, std::uint32_t consensus_version) {
+Bytes ser_vote(const VoteMsg& m, bool include_vrf_extensions) {
   codec::ByteWriter w;
   w.u64le(m.vote.height);
   w.u32le(m.vote.round);
   w.bytes_fixed(m.vote.block_id);
   w.bytes_fixed(m.vote.validator_pubkey);
   w.bytes_fixed(m.vote.signature);
-  if (consensus_version >= 5) {
+  if (include_vrf_extensions) {
     w.varbytes(m.vrf_proof);
     w.bytes_fixed(m.vrf_output);
   }

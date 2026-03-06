@@ -38,43 +38,6 @@ std::optional<TipState> parse_tip(const Bytes& b) {
   return t;
 }
 
-Bytes serialize_activation_state(const consensus::ActivationState& s) {
-  codec::ByteWriter w;
-  w.u32le(s.current_version);
-  w.u32le(s.pending_version);
-  w.u64le(s.pending_activation_height);
-  w.u64le(s.last_height);
-  w.u64le(s.window_start_height);
-  w.u64le(s.window_signal_count);
-  w.u64le(s.window_total_count);
-  return w.take();
-}
-
-std::optional<consensus::ActivationState> parse_activation_state(const Bytes& b) {
-  consensus::ActivationState s;
-  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
-        auto current = r.u32le();
-        auto pending = r.u32le();
-        auto pending_h = r.u64le();
-        auto last_h = r.u64le();
-        auto win_start = r.u64le();
-        auto win_sig = r.u64le();
-        auto win_total = r.u64le();
-        if (!current || !pending || !pending_h || !last_h || !win_start || !win_sig || !win_total) return false;
-        s.current_version = *current;
-        s.pending_version = *pending;
-        s.pending_activation_height = *pending_h;
-        s.last_height = *last_h;
-        s.window_start_height = *win_start;
-        s.window_signal_count = *win_sig;
-        s.window_total_count = *win_total;
-        return true;
-      })) {
-    return std::nullopt;
-  }
-  return s;
-}
-
 Bytes serialize_outpoint(const OutPoint& op) {
   codec::ByteWriter w;
   w.bytes_fixed(op.txid);
@@ -514,16 +477,6 @@ std::vector<DB::ScriptHistoryEntry> DB::get_script_history(const Hash32& scripth
     return a.txid < b.txid;
   });
   return out;
-}
-
-bool DB::set_activation_state(const consensus::ActivationState& state) {
-  return put("AV:", serialize_activation_state(state));
-}
-
-std::optional<consensus::ActivationState> DB::get_activation_state() const {
-  auto b = get("AV:");
-  if (!b.has_value()) return std::nullopt;
-  return parse_activation_state(*b);
 }
 
 #ifndef SC_HAS_ROCKSDB

@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 
-#include "consensus/activation.hpp"
 #include "consensus/validators.hpp"
 #include "utxo/tx.hpp"
 
@@ -76,8 +75,6 @@ class DB {
   };
   bool add_script_history(const Hash32& scripthash, std::uint64_t height, const Hash32& txid);
   std::vector<ScriptHistoryEntry> get_script_history(const Hash32& scripthash) const;
-  bool set_activation_state(const consensus::ActivationState& state);
-  std::optional<consensus::ActivationState> get_activation_state() const;
 
  private:
   std::string path_;

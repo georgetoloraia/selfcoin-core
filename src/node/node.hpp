@@ -9,9 +9,6 @@
 #include <string>
 #include <thread>
 
-#include "consensus/activation.hpp"
-#include "consensus/sortition_v5.hpp"
-#include "consensus/sortition_v6.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -56,12 +53,9 @@ struct NodeConfig {
   int invalid_frame_ban_threshold{3};
   std::uint64_t invalid_frame_window_seconds{60};
   std::uint64_t min_relay_fee{0};
-  std::optional<bool> activation_enabled_override;
-  std::optional<std::uint32_t> activation_max_version_override;
-  std::optional<std::uint64_t> activation_window_blocks_override;
-  std::optional<std::uint32_t> activation_threshold_percent_override;
-  std::optional<std::uint64_t> activation_delay_blocks_override;
   std::optional<std::uint64_t> validator_min_bond_override;
+  std::optional<std::uint64_t> validator_bond_min_amount_override;
+  std::optional<std::uint64_t> validator_bond_max_amount_override;
   std::optional<std::uint64_t> validator_warmup_blocks_override;
   std::optional<std::uint64_t> validator_cooldown_blocks_override;
   std::optional<std::uint64_t> validator_join_limit_window_blocks_override;
@@ -70,21 +64,6 @@ struct NodeConfig {
   std::optional<std::uint32_t> miss_rate_suspend_threshold_percent_override;
   std::optional<std::uint32_t> miss_rate_exit_threshold_percent_override;
   std::optional<std::uint64_t> suspend_duration_blocks_override;
-  std::optional<std::uint64_t> v5_proposer_expected_num_override;
-  std::optional<std::uint64_t> v5_proposer_expected_den_override;
-  std::optional<std::uint32_t> v5_voter_target_k_override;
-  std::optional<std::uint32_t> v5_round_expand_cap_override;
-  std::optional<std::uint32_t> v5_round_expand_factor_override;
-  std::optional<std::uint64_t> v6_bond_unit_override;
-  std::optional<std::uint64_t> v6_units_max_override;
-  std::optional<std::uint64_t> v6_proposer_expected_num_override;
-  std::optional<std::uint64_t> v6_proposer_expected_den_override;
-  std::optional<std::uint32_t> v6_voter_target_k_override;
-  std::optional<std::uint32_t> v6_round_expand_cap_override;
-  std::optional<std::uint32_t> v6_round_expand_factor_override;
-  std::optional<std::uint64_t> v7_min_bond_amount_override;
-  std::optional<std::uint64_t> v7_max_bond_amount_override;
-  std::optional<std::uint64_t> v7_effective_units_cap_override;
   double tx_rate_capacity{200.0};
   double tx_rate_refill{100.0};
   double propose_rate_capacity{20.0};
@@ -128,8 +107,6 @@ struct NodeStatus {
   std::uint64_t rejected_protocol_version{0};
   std::uint64_t rejected_pre_handshake{0};
   std::uint32_t consensus_version{1};
-  std::uint32_t pending_consensus_version{0};
-  std::uint64_t pending_activation_height{0};
   std::uint64_t participation_eligible_signers{0};
 };
 
@@ -156,6 +133,10 @@ class Node {
   std::vector<std::pair<OutPoint, TxOut>> find_utxos_by_pubkey_hash_for_test(
       const std::array<std::uint8_t, 20>& pkh) const;
   bool has_utxo_for_test(const OutPoint& op, TxOut* out = nullptr) const;
+  std::string proposer_path_for_next_height_for_test() const;
+  std::string committee_path_for_next_height_for_test() const;
+  std::string vote_path_for_next_height_for_test() const;
+  std::size_t quorum_threshold_for_next_height_for_test() const;
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
   std::vector<PubKey32> committee_for_next_height_for_test() const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
@@ -211,14 +192,10 @@ class Node {
   bool check_rate_limit_locked(int peer_id, std::uint16_t msg_type);
   std::string consensus_state_locked(std::uint64_t now_ms, std::size_t* observed_signers = nullptr,
                                      std::size_t* quorum_threshold = nullptr) const;
-  void apply_activation_signal(const Block& block, std::uint64_t height);
   bool validate_v4_registration_rules(const Block& block, std::uint64_t height) const;
   void update_v4_liveness_from_finality(std::uint64_t height, std::uint32_t round,
                                         const std::vector<FinalitySig>& finality_sigs);
   bool v4_active_for_height(std::uint64_t height) const;
-  bool v5_active_for_height(std::uint64_t height) const;
-  bool v6_active_for_height(std::uint64_t height) const;
-  bool v7_active_for_height(std::uint64_t height) const;
 
   std::uint64_t now_unix() const;
   std::uint64_t now_ms() const;
@@ -252,12 +229,9 @@ class Node {
   std::uint64_t rejected_network_id_{0};
   std::uint64_t rejected_protocol_version_{0};
   std::uint64_t rejected_pre_handshake_{0};
-  consensus::ActivationState activation_state_{};
-  consensus::ActivationParams activation_params_{};
   std::uint64_t v4_min_bond_{BOND_AMOUNT};
-  std::uint64_t v7_min_bond_amount_{BOND_AMOUNT};
-  std::uint64_t v7_max_bond_amount_{BOND_AMOUNT};
-  std::uint64_t v7_effective_units_cap_{10'000};
+  std::uint64_t validator_bond_min_amount_{BOND_AMOUNT};
+  std::uint64_t validator_bond_max_amount_{BOND_AMOUNT};
   std::uint64_t v4_warmup_blocks_{WARMUP_BLOCKS};
   std::uint64_t v4_cooldown_blocks_{0};
   std::uint64_t v4_join_limit_window_blocks_{0};
@@ -270,12 +244,8 @@ class Node {
   std::uint32_t v4_miss_rate_exit_threshold_percent_{60};
   std::uint64_t v4_suspend_duration_blocks_{1'000};
   std::size_t last_participation_eligible_signers_{0};
-  consensus::V5Params v5_params_{};
-  consensus::V6Params v6_params_{};
-
   std::map<Hash32, Block> candidate_blocks_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
-  std::map<std::pair<std::uint64_t, std::uint32_t>, std::set<PubKey32>> received_proposers_v5_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
 
   crypto::KeyPair local_key_;

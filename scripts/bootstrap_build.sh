@@ -18,6 +18,7 @@ LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-2}"
 NODE_PUBLIC="${NODE_PUBLIC:-1}"
 NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
+USE_SEEDS_JSON="${USE_SEEDS_JSON:-0}"
 
 log() { printf '[bootstrap] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -200,12 +201,14 @@ build_execstart_args() {
     args+=("--public")
   fi
 
-  mapfile -t seeds < <(read_seed_list || true)
-  if (( ${#seeds[@]} > 0 )); then
-    args+=("--no-dns-seeds")
-    for s in "${seeds[@]}"; do
-      args+=("--seeds" "${s}")
-    done
+  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
+    mapfile -t seeds < <(read_seed_list || true)
+    if (( ${#seeds[@]} > 0 )); then
+      args+=("--no-dns-seeds")
+      for s in "${seeds[@]}"; do
+        args+=("--seeds" "${s}")
+      done
+    fi
   fi
 
   args+=("--validator-key-file" "${key_file}")

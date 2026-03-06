@@ -60,8 +60,6 @@ const NetworkConfig kMainnet{
     .v7_max_bond_amount = BOND_AMOUNT * 100,
     .v7_effective_units_cap = 10'000,
     .default_seeds = {
-        "212.58.103.170:19440",
-        "seed1.gotdns.ch:19440",
         "167.172.97.180:19440",
         "138.197.113.69:19440",
     },

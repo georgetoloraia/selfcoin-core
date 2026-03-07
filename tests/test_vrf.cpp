@@ -30,7 +30,7 @@ Bytes transcript_for(std::uint8_t domain, std::uint64_t height, std::uint32_t ro
 
 }  // namespace
 
-TEST(test_vrf_prove_verify_roundtrip) {
+TEST(test_research_vrf_prove_verify_roundtrip) {
   auto kp = key_from_byte(7);
   Hash32 seed{};
   seed.fill(0xA1);
@@ -40,7 +40,7 @@ TEST(test_vrf_prove_verify_roundtrip) {
   ASSERT_TRUE(crypto::vrf_verify(kp.public_key, transcript, *p));
 }
 
-TEST(test_vrf_wrong_seed_fails) {
+TEST(test_research_vrf_wrong_seed_fails) {
   auto kp = key_from_byte(8);
   Hash32 s1{};
   s1.fill(0x0B);
@@ -53,7 +53,7 @@ TEST(test_vrf_wrong_seed_fails) {
   ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, t2, *p));
 }
 
-TEST(test_vrf_wrong_pubkey_fails) {
+TEST(test_research_vrf_wrong_pubkey_fails) {
   auto kp1 = key_from_byte(9);
   auto kp2 = key_from_byte(10);
   Hash32 seed{};
@@ -64,7 +64,7 @@ TEST(test_vrf_wrong_pubkey_fails) {
   ASSERT_TRUE(!crypto::vrf_verify(kp2.public_key, transcript, *p));
 }
 
-TEST(test_vrf_replay_across_domain_fails) {
+TEST(test_research_vrf_replay_across_domain_fails) {
   auto kp = key_from_byte(11);
   Hash32 seed{};
   seed.fill(0x44);
@@ -76,7 +76,7 @@ TEST(test_vrf_replay_across_domain_fails) {
   ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, voter, *p));
 }
 
-TEST(test_vrf_replay_across_round_fails) {
+TEST(test_research_vrf_replay_across_round_fails) {
   auto kp = key_from_byte(12);
   Hash32 seed{};
   seed.fill(0x55);
@@ -87,7 +87,7 @@ TEST(test_vrf_replay_across_round_fails) {
   ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, round8, *p));
 }
 
-TEST(test_vrf_output_mismatch_fails) {
+TEST(test_research_vrf_output_mismatch_fails) {
   auto kp = key_from_byte(13);
   Hash32 seed{};
   seed.fill(0x66);
@@ -99,4 +99,4 @@ TEST(test_vrf_output_mismatch_fails) {
   ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, transcript, tampered));
 }
 
-void register_vrf_tests() {}
+void register_research_vrf_tests() {}

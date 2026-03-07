@@ -4,6 +4,9 @@ Proof RPCs:
 - `get_utxo_proof`
 - `get_validator_proof`
 
+Related root RPC:
+- `get_roots`
+
 Both return:
 - `proof_format`: `"smt_v0"`
 - `height`: finalized height used for proof
@@ -15,5 +18,10 @@ Both return:
 Compatibility aliases are still present:
 - `utxo_root` / `validators_root`
 - `siblings`
+
+Current runtime limits:
+- proof requests are supported for the current finalized tip
+- historical proof requests are rejected in the current fixed runtime
+- `get_roots` may report unavailable if the requested finalized height does not have persisted root records
 
 Cryptographic semantics are unchanged from PR3.

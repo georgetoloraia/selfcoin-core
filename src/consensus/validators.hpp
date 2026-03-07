@@ -78,6 +78,9 @@ std::optional<PubKey32> select_leader(const Hash32& prev_finalized_hash, std::ui
 std::vector<PubKey32> select_committee(const Hash32& prev_finalized_hash, std::uint64_t height,
                                        const std::vector<PubKey32>& active_sorted,
                                        std::size_t max_committee = MAX_COMMITTEE);
+
+// Research-only helpers retained outside the active deterministic runtime.
+// The shipped runtime uses select_leader/select_committee above, not these v2 experiments.
 Hash32 compute_finality_entropy_v2(const Hash32& prev_block_id, const FinalityProof& prev_finality_proof);
 Hash32 make_sortition_seed_v2(const Hash32& prev_entropy, std::uint64_t height, std::uint32_t round);
 std::size_t committee_size_v2(std::size_t active_count, std::size_t configured_max_committee = 128);

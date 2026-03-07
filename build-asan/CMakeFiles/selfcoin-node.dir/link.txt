@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined "CMakeFiles/selfcoin-node.dir/apps/selfcoin-node/main.cpp.o" -o selfcoin-node  libselfcoin_core.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libsodium.so /usr/lib/x86_64-linux-gnu/librocksdb.so 

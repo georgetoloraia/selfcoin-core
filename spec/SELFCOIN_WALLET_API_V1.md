@@ -9,6 +9,11 @@ Goals:
 - no server-side user state
 - deterministic, reproducible results from finalized DB state
 
+This document describes the wallet-facing subset of the current lightserver RPC surface.
+The implementation also exposes additional certificate and proof-oriented methods such as
+`get_finality_certificate`, `get_roots`, `get_utxo_proof`, and `get_validator_proof`, but
+those are not required parts of the minimal wallet API contract.
+
 Transport:
 - HTTP `POST /rpc`
 - JSON-RPC 2.0 request/response
@@ -66,9 +71,14 @@ Request:
 Response:
 ```json
 {
-  "network_name":"devnet|testnet",
+  "network_name":"mainnet|devnet|testnet",
   "protocol_version":1,
   "feature_flags":1,
+  "network_id":"<hex16>",
+  "magic":1396919630,
+  "genesis_hash":"<hex32>",
+  "genesis_source":"embedded|db|file",
+  "chain_id_ok":true,
   "tip":{"height":123,"hash":"<hex32>"},
   "peers":null,
   "mempool_size":null,

@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined CMakeFiles/fuzz_tx_parse.dir/fuzz/fuzz_tx_parse.cpp.o -o fuzz_tx_parse  libselfcoin_core.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libsodium.so /usr/lib/x86_64-linux-gnu/librocksdb.so 

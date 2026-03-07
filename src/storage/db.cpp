@@ -165,6 +165,14 @@ Bytes u64be_bytes(std::uint64_t v) {
 }  // namespace
 
 std::string key_block(const Hash32& hash) { return "B:" + hex_encode(Bytes(hash.begin(), hash.end())); }
+std::string key_finality_certificate_height(std::uint64_t height) {
+  codec::ByteWriter w;
+  w.u64le(height);
+  return "FC:H:" + hex_encode(w.data());
+}
+std::string key_finality_certificate_block(const Hash32& hash) {
+  return "FC:B:" + hex_encode(Bytes(hash.begin(), hash.end()));
+}
 std::string key_height(std::uint64_t height) {
   codec::ByteWriter w;
   w.u64le(height);
@@ -291,6 +299,24 @@ std::optional<TipState> DB::get_tip() const {
 
 bool DB::put_block(const Hash32& hash, const Bytes& block_bytes) { return put(key_block(hash), block_bytes); }
 std::optional<Bytes> DB::get_block(const Hash32& hash) const { return get(key_block(hash)); }
+
+bool DB::put_finality_certificate(const FinalityCertificate& cert) {
+  const Bytes bytes = cert.serialize();
+  return put(key_finality_certificate_height(cert.height), bytes) &&
+         put(key_finality_certificate_block(cert.block_id), bytes);
+}
+
+std::optional<FinalityCertificate> DB::get_finality_certificate_by_height(std::uint64_t height) const {
+  auto b = get(key_finality_certificate_height(height));
+  if (!b.has_value()) return std::nullopt;
+  return FinalityCertificate::parse(*b);
+}
+
+std::optional<FinalityCertificate> DB::get_finality_certificate_by_block(const Hash32& hash) const {
+  auto b = get(key_finality_certificate_block(hash));
+  if (!b.has_value()) return std::nullopt;
+  return FinalityCertificate::parse(*b);
+}
 
 bool DB::set_height_hash(std::uint64_t height, const Hash32& hash) {
   return put(key_height(height), Bytes(hash.begin(), hash.end()));

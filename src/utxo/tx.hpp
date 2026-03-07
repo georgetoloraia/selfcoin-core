@@ -57,6 +57,23 @@ struct FinalityProof {
   static std::optional<FinalityProof> parse(const Bytes& b);
 };
 
+struct FinalityCertificate {
+  std::uint64_t height{0};
+  std::uint32_t round{0};
+  Hash32 block_id{};
+  std::uint32_t quorum_threshold{0};
+  // The conservative certificate slice stores explicit committee members rather
+  // than a separate committee commitment so readers can reconstruct the finalized
+  // quorum context without introducing new protocol assumptions.
+  std::vector<PubKey32> committee_members;
+  // Raw signatures are preserved as-is. Aggregated signatures are intentionally
+  // deferred and not implied by this object.
+  std::vector<FinalitySig> signatures;
+
+  Bytes serialize() const;
+  static std::optional<FinalityCertificate> parse(const Bytes& b);
+};
+
 struct Block {
   BlockHeader header;
   std::vector<Tx> txs;

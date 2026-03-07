@@ -50,6 +50,7 @@ add_library(selfcoin_core
   src/consensus/validators.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
+  src/storage/snapshot.cpp
   src/p2p/framing.cpp
   src/p2p/addrman.cpp
   src/p2p/hardening.cpp
@@ -116,9 +117,12 @@ add_executable(selfcoin-tests
   tests/test_state_commitment.cpp
   tests/test_smt.cpp
   tests/test_bonding.cpp
+  tests/test_finality_certificate.cpp
+  tests/test_snapshot.cpp
   tests/test_validator_v4.cpp
   tests/test_mempool.cpp
   tests/test_hardening.cpp
+  tests/test_protocol_scope.cpp
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp

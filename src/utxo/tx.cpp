@@ -160,6 +160,59 @@ std::optional<FinalityProof> FinalityProof::parse(const Bytes& b) {
   return p;
 }
 
+Bytes FinalityCertificate::serialize() const {
+  codec::ByteWriter w;
+  w.u64le(height);
+  w.u32le(round);
+  w.bytes_fixed(block_id);
+  w.u32le(quorum_threshold);
+  w.varint(committee_members.size());
+  for (const auto& member : committee_members) w.bytes_fixed(member);
+  w.varint(signatures.size());
+  for (const auto& s : signatures) {
+    w.bytes_fixed(s.validator_pubkey);
+    w.bytes_fixed(s.signature);
+  }
+  return w.take();
+}
+
+std::optional<FinalityCertificate> FinalityCertificate::parse(const Bytes& b) {
+  FinalityCertificate cert;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto h = r.u64le();
+        auto round = r.u32le();
+        auto block = r.bytes_fixed<32>();
+        auto quorum = r.u32le();
+        auto committee_count = r.varint();
+        if (!h || !round || !block || !quorum || !committee_count) return false;
+        cert.height = *h;
+        cert.round = *round;
+        cert.block_id = *block;
+        cert.quorum_threshold = *quorum;
+        cert.committee_members.clear();
+        cert.committee_members.reserve(*committee_count);
+        for (std::uint64_t i = 0; i < *committee_count; ++i) {
+          auto member = r.bytes_fixed<32>();
+          if (!member) return false;
+          cert.committee_members.push_back(*member);
+        }
+        auto sig_count = r.varint();
+        if (!sig_count) return false;
+        cert.signatures.clear();
+        cert.signatures.reserve(*sig_count);
+        for (std::uint64_t i = 0; i < *sig_count; ++i) {
+          auto pub = r.bytes_fixed<32>();
+          auto sig = r.bytes_fixed<64>();
+          if (!pub || !sig) return false;
+          cert.signatures.push_back(FinalitySig{*pub, *sig});
+        }
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return cert;
+}
+
 Bytes Block::serialize() const {
   codec::ByteWriter w;
   const Bytes h = header.serialize();

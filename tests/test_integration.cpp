@@ -834,10 +834,11 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   }, std::chrono::seconds(30)));
   for (auto& n : nodes) n->pause_proposals_for_test(true);
 
-  const auto c0 = nodes[0]->committee_for_next_height_for_test();
+  const auto target_height = nodes[0]->status().height + 1;
+  const auto c0 = nodes[0]->committee_for_height_round_for_test(target_height, 0);
   ASSERT_EQ(c0.size(), 5u);
   for (size_t i = 1; i < nodes.size(); ++i) {
-    ASSERT_EQ(nodes[i]->committee_for_next_height_for_test(), c0);
+    ASSERT_EQ(nodes[i]->committee_for_height_round_for_test(target_height, 0), c0);
   }
 
   PubKey32 non_member{};
@@ -854,7 +855,7 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
   ASSERT_TRUE(non_member_id >= 0);
 
   Vote bad_vote;
-  bad_vote.height = nodes[0]->status().height + 1;
+  bad_vote.height = target_height;
   bad_vote.round = 0;
   bad_vote.block_id.fill(0xA5);
   bad_vote.validator_pubkey = non_member;

@@ -1,0 +1,10 @@
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/selfcoin_core.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/selfcoin-node.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/selfcoin-cli.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/selfcoin-lightserver.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/selfcoin-tests.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/fuzz_p2p_frame.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/fuzz_tx_parse.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/test.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/edit_cache.dir
+/home/greendragon/Desktop/selfcoin-core/build-asan/CMakeFiles/rebuild_cache.dir

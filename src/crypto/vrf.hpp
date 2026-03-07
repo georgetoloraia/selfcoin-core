@@ -9,6 +9,9 @@ struct VrfProof {
   Hash32 output{};
 };
 
+// Research-only helper retained outside the active deterministic runtime.
+// The shipped consensus path does not use VRF proposer or voter routing.
+//
 // Signature-based VRF-like primitive:
 // proof = Ed25519Sign(sk, transcript)
 // output = sha256d("SC-VRF-OUT-V5" || pubkey || proof)

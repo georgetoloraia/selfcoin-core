@@ -70,6 +70,43 @@ std::string root_index_key(const std::string& kind, std::uint64_t height) {
   return "ROOT:" + kind + ":" + hex_encode(w.data());
 }
 
+std::string finality_certificate_json(const FinalityCertificate& cert) {
+  std::ostringstream oss;
+  oss << "{\"height\":" << cert.height << ",\"round\":" << cert.round << ",\"block_hash\":\"" << hex_encode32(cert.block_id)
+      << "\",\"quorum_threshold\":" << cert.quorum_threshold << ",\"committee\":[";
+  for (size_t i = 0; i < cert.committee_members.size(); ++i) {
+    if (i) oss << ",";
+    oss << "\"" << hex_encode(Bytes(cert.committee_members[i].begin(), cert.committee_members[i].end())) << "\"";
+  }
+  oss << "],\"signatures\":[";
+  for (size_t i = 0; i < cert.signatures.size(); ++i) {
+    if (i) oss << ",";
+    const auto& s = cert.signatures[i];
+    oss << "{\"pubkey_hex\":\"" << hex_encode(Bytes(s.validator_pubkey.begin(), s.validator_pubkey.end()))
+        << "\",\"sig_hex\":\"" << hex_encode(Bytes(s.signature.begin(), s.signature.end())) << "\"}";
+  }
+  oss << "]}";
+  return oss.str();
+}
+
+std::optional<FinalityCertificate> certificate_from_block_fallback(storage::DB& db, const Block& blk) {
+  // Prefer the separately persisted certificate. Falling back to the embedded
+  // block proof preserves compatibility for older finalized data but does not
+  // synthesize stronger certificate semantics than the runtime actually stores.
+  const Hash32 block_id = blk.header.block_id();
+  if (auto cert = db.get_finality_certificate_by_block(block_id); cert.has_value()) return cert;
+
+  auto bh = db.get_height_hash(blk.header.height);
+  if (!bh.has_value() || *bh != block_id) return std::nullopt;
+
+  FinalityCertificate cert;
+  cert.height = blk.header.height;
+  cert.round = blk.header.round;
+  cert.block_id = block_id;
+  cert.signatures = blk.finality_proof.sigs;
+  return cert;
+}
+
 std::optional<std::uint64_t> find_u64(const std::string& body, const std::string& key) {
   std::regex re("\"" + key + "\"\\s*:\\s*([0-9]+)");
   std::smatch m;
@@ -482,6 +519,63 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto bb = db_.get_block(*h);
     if (!bb.has_value()) return make_error(id, -32001, "not found");
     return make_result(id, std::string("{\"block_hex\":\"") + hex_encode(*bb) + "\"}");
+  }
+
+  if (*method == "get_finality_certificate") {
+    std::optional<FinalityCertificate> cert;
+    if (auto height = find_u64(body, "height"); height.has_value()) {
+      cert = db_.get_finality_certificate_by_height(*height);
+      if (!cert.has_value()) {
+        auto bh = db_.get_height_hash(*height);
+        if (bh.has_value()) {
+          auto bb = db_.get_block(*bh);
+          if (bb.has_value()) {
+            if (auto blk = Block::parse(*bb); blk.has_value()) cert = certificate_from_block_fallback(db_, *blk);
+          }
+        }
+      }
+      if (cert.has_value() && cert->committee_members.empty()) {
+        if (auto committee = committee_for_height(cert->height); committee.has_value()) {
+          cert->committee_members = *committee;
+          cert->quorum_threshold = static_cast<std::uint32_t>(consensus::quorum_threshold(committee->size()));
+        }
+      }
+    } else if (auto hash_hex = find_string(body, "hash"); hash_hex.has_value()) {
+      auto h = parse_hex32(*hash_hex);
+      if (!h) return make_error(id, -32602, "bad hash");
+      cert = db_.get_finality_certificate_by_block(*h);
+      if (!cert.has_value()) {
+        auto bb = db_.get_block(*h);
+        if (bb.has_value()) {
+          if (auto blk = Block::parse(*bb); blk.has_value()) cert = certificate_from_block_fallback(db_, *blk);
+        }
+      }
+      if (cert.has_value() && cert->committee_members.empty()) {
+        if (auto committee = committee_for_height(cert->height); committee.has_value()) {
+          cert->committee_members = *committee;
+          cert->quorum_threshold = static_cast<std::uint32_t>(consensus::quorum_threshold(committee->size()));
+        }
+      }
+    } else {
+      auto tip = db_.get_tip();
+      if (!tip.has_value()) return make_error(id, -32602, "tip unavailable");
+      cert = db_.get_finality_certificate_by_height(tip->height);
+      if (!cert.has_value()) {
+        auto bb = db_.get_block(tip->hash);
+        if (bb.has_value()) {
+          if (auto blk = Block::parse(*bb); blk.has_value()) cert = certificate_from_block_fallback(db_, *blk);
+        }
+      }
+      if (cert.has_value() && cert->committee_members.empty()) {
+        if (auto committee = committee_for_height(cert->height); committee.has_value()) {
+          cert->committee_members = *committee;
+          cert->quorum_threshold = static_cast<std::uint32_t>(consensus::quorum_threshold(committee->size()));
+        }
+      }
+    }
+
+    if (!cert.has_value()) return make_error(id, -32001, "not found");
+    return make_result(id, finality_certificate_json(*cert));
   }
 
   if (*method == "get_tx") {

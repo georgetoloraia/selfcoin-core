@@ -36,6 +36,7 @@ std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input
 std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);
+bool is_supported_base_layer_output_script(const Bytes& script_pubkey);
 bool parse_slash_script_sig(const Bytes& script_sig, SlashEvidence* out);
 
 struct BlockValidationResult {

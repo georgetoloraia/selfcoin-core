@@ -10,9 +10,11 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <set>
 #include <thread>
 
 #include "address/address.hpp"
+#include "consensus/validators.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
@@ -20,6 +22,7 @@
 #include "node/node.hpp"
 #include "p2p/framing.hpp"
 #include "storage/db.hpp"
+#include "storage/snapshot.hpp"
 #include "crypto/smt.hpp"
 #include "utxo/signing.hpp"
 
@@ -227,6 +230,36 @@ TEST(test_lightserver_indexing_after_finalization) {
 
 }
 
+TEST(test_finality_certificate_persisted_separately) {
+  const std::string base = "/tmp/selfcoin_light_cert_db";
+  auto cluster = make_cluster(base);
+  auto& node = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, std::chrono::seconds(30)));
+
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly(base + "/node0"));
+  auto tip = db.get_tip();
+  ASSERT_TRUE(tip.has_value());
+
+  auto cert = db.get_finality_certificate_by_height(tip->height);
+  ASSERT_TRUE(cert.has_value());
+  ASSERT_EQ(cert->height, tip->height);
+  ASSERT_EQ(cert->block_id, tip->hash);
+  ASSERT_EQ(cert->quorum_threshold, consensus::quorum_threshold(cert->committee_members.size()));
+  ASSERT_TRUE(cert->signatures.size() >= cert->quorum_threshold);
+
+  auto bb = db.get_block(tip->hash);
+  ASSERT_TRUE(bb.has_value());
+  auto blk = Block::parse(*bb);
+  ASSERT_TRUE(blk.has_value());
+  ASSERT_EQ(blk->finality_proof.sigs.size(), cert->signatures.size());
+
+  std::set<PubKey32> committee(cert->committee_members.begin(), cert->committee_members.end());
+  for (const auto& sig : cert->signatures) {
+    ASSERT_TRUE(committee.find(sig.validator_pubkey) != committee.end());
+  }
+}
+
 TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   const std::string base = "/tmp/selfcoin_light_rpc";
   auto cluster = make_cluster(base);
@@ -303,6 +336,94 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
                             hex_encode32(blk_hash) + R"("}})";
   auto bresp = ls->handle_rpc_for_test(blk_q);
   ASSERT_TRUE(bresp.find("block_hex") != std::string::npos);
+}
+
+TEST(test_lightserver_exposes_finality_certificate_endpoint) {
+  const std::string base = "/tmp/selfcoin_light_cert_rpc";
+  auto cluster = make_cluster(base);
+  auto& node = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, std::chrono::seconds(30)));
+
+  const auto tip = node.status();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base + "/node0";
+  auto ls = std::make_unique<lightserver::Server>(lcfg);
+  ASSERT_TRUE(ls->init());
+
+  const std::string by_height_q =
+      std::string(R"({"jsonrpc":"2.0","id":31,"method":"get_finality_certificate","params":{"height":)") +
+      std::to_string(tip.height) + "}}";
+  const auto by_height = ls->handle_rpc_for_test(by_height_q);
+  ASSERT_TRUE(by_height.find("\"height\":" + std::to_string(tip.height)) != std::string::npos);
+  ASSERT_TRUE(by_height.find("\"block_hash\":\"" + hex_encode32(tip.tip_hash) + "\"") != std::string::npos);
+  ASSERT_TRUE(by_height.find("\"quorum_threshold\":") != std::string::npos);
+  ASSERT_TRUE(by_height.find("\"committee\":[") != std::string::npos);
+  ASSERT_TRUE(by_height.find("\"signatures\":[") != std::string::npos);
+
+  const std::string by_hash_q =
+      std::string(R"({"jsonrpc":"2.0","id":32,"method":"get_finality_certificate","params":{"hash":")") +
+      hex_encode32(tip.tip_hash) + R"("}})";
+  const auto by_hash = ls->handle_rpc_for_test(by_hash_q);
+  ASSERT_TRUE(by_hash.find("\"block_hash\":\"" + hex_encode32(tip.tip_hash) + "\"") != std::string::npos);
+  ASSERT_TRUE(by_hash.find("\"signatures\":[") != std::string::npos);
+
+  const auto by_tip_default =
+      ls->handle_rpc_for_test(R"({"jsonrpc":"2.0","id":33,"method":"get_finality_certificate","params":{}})");
+  ASSERT_TRUE(by_tip_default.find("\"block_hash\":\"" + hex_encode32(tip.tip_hash) + "\"") != std::string::npos);
+}
+
+TEST(test_snapshot_export_import_bootstraps_imported_db) {
+  const std::string base = "/tmp/selfcoin_light_snapshot";
+  auto cluster = make_cluster(base);
+  auto& node = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, std::chrono::seconds(30)));
+
+  for (auto& n : cluster.nodes) {
+    if (n) n->stop();
+  }
+
+  const std::string snapshot_path = base + "/finalized.snapshot";
+  const std::string imported_db_path = base + "/imported-node";
+
+  storage::SnapshotManifest exported;
+  std::string err;
+  storage::SnapshotManifest imported;
+  {
+    storage::DB src;
+    ASSERT_TRUE(src.open_readonly(base + "/node0") || src.open(base + "/node0"));
+    ASSERT_TRUE(storage::export_snapshot_bundle(src, snapshot_path, &exported, &err));
+  }
+  {
+    storage::DB dst;
+    ASSERT_TRUE(dst.open(imported_db_path));
+    ASSERT_TRUE(storage::import_snapshot_bundle(dst, snapshot_path, &imported, &err));
+  }
+  ASSERT_EQ(imported.finalized_height, exported.finalized_height);
+  ASSERT_EQ(imported.finalized_hash, exported.finalized_hash);
+  ASSERT_EQ(imported.utxo_root, exported.utxo_root);
+  ASSERT_EQ(imported.validators_root, exported.validators_root);
+
+  node::NodeConfig cfg;
+  cfg.node_id = 9;
+  cfg.disable_p2p = true;
+  cfg.db_path = imported_db_path;
+  cfg.max_committee = 4;
+  cfg.genesis_path = base + "/genesis.json";
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.validator_key_file = imported_db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+  keystore::ValidatorKey created_key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(cfg.node_id), &created_key, &kerr));
+
+  node::Node imported_node(cfg);
+  ASSERT_TRUE(imported_node.init());
+  const auto status = imported_node.status();
+  ASSERT_EQ(status.height, exported.finalized_height);
+  ASSERT_EQ(status.tip_hash, exported.finalized_hash);
+  imported_node.stop();
 }
 
 TEST(test_lightserver_rejects_oversized_header_batches) {

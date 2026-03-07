@@ -51,6 +51,11 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
   return true;
 }
 
+bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
+  return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
+         is_validator_unbond_script(script_pubkey, nullptr) || is_burn_script(script_pubkey, nullptr);
+}
+
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index) {
   if (input_index >= tx.inputs.size()) return std::nullopt;
   Tx signing = tx;
@@ -137,6 +142,9 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
   }
 
   for (const auto& out : tx.outputs) {
+    if (!is_supported_base_layer_output_script(out.script_pubkey)) {
+      return {false, "unsupported script_pubkey", 0};
+    }
     PubKey32 pub{};
     if (is_validator_register_script(out.script_pubkey, &pub)) {
       (void)pub;

@@ -26,6 +26,7 @@
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "storage/db.hpp"
+#include "storage/snapshot.hpp"
 #include "utxo/signing.hpp"
 
 namespace {
@@ -211,6 +212,8 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage:\n"
               << "  selfcoin-cli tip --db <dir>\n"
+              << "  selfcoin-cli snapshot_export --db <dir> --out <snapshot.bin>   # stopped/quiescent db expected\n"
+              << "  selfcoin-cli snapshot_import --db <dir> --in <snapshot.bin>    # empty db only\n"
               << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
               << "  selfcoin-cli wallet_create --out <path> [--pass <pass>] [--network mainnet] [--seed-hex <32b-hex>]\n"
               << "  selfcoin-cli wallet_address --file <path> [--pass <pass>]\n"
@@ -250,6 +253,68 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::cout << "height=" << tip->height << " hash=" << selfcoin::hex_encode32(tip->hash) << "\n";
+    return 0;
+  }
+
+  if (cmd == "snapshot_export") {
+    std::string db_path = "./data/node";
+    std::string out_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
+    }
+    if (out_path.empty()) {
+      std::cerr << "snapshot_export requires --out\n";
+      return 1;
+    }
+    selfcoin::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    selfcoin::storage::SnapshotManifest manifest;
+    std::string err;
+    if (!selfcoin::storage::export_snapshot_bundle(db, out_path, &manifest, &err)) {
+      std::cerr << "snapshot_export failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "snapshot=" << out_path << "\n";
+    std::cout << "finalized_height=" << manifest.finalized_height << "\n";
+    std::cout << "finalized_hash=" << selfcoin::hex_encode32(manifest.finalized_hash) << "\n";
+    std::cout << "utxo_root=" << selfcoin::hex_encode32(manifest.utxo_root) << "\n";
+    std::cout << "validators_root=" << selfcoin::hex_encode32(manifest.validators_root) << "\n";
+    std::cout << "entry_count=" << manifest.entry_count << "\n";
+    return 0;
+  }
+
+  if (cmd == "snapshot_import") {
+    std::string db_path = "./data/node";
+    std::string in_path;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--in" && i + 1 < argc) in_path = argv[++i];
+    }
+    if (in_path.empty()) {
+      std::cerr << "snapshot_import requires --in\n";
+      return 1;
+    }
+    selfcoin::storage::DB db;
+    if (!db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    selfcoin::storage::SnapshotManifest manifest;
+    std::string err;
+    if (!selfcoin::storage::import_snapshot_bundle(db, in_path, &manifest, &err)) {
+      std::cerr << "snapshot_import failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "db=" << db_path << "\n";
+    std::cout << "finalized_height=" << manifest.finalized_height << "\n";
+    std::cout << "finalized_hash=" << selfcoin::hex_encode32(manifest.finalized_hash) << "\n";
+    std::cout << "entry_count=" << manifest.entry_count << "\n";
     return 0;
   }
 

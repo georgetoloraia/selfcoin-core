@@ -19,6 +19,7 @@ OUTBOUND_TARGET="${OUTBOUND_TARGET:-2}"
 NODE_PUBLIC="${NODE_PUBLIC:-1}"
 NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-0}"
+GENESIS_BIN="${GENESIS_BIN:-}"
 
 log() { printf '[bootstrap] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -195,10 +196,19 @@ PY
 build_execstart_args() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/selfcoin-node"
   local key_file="${DB_DIR}/keystore/validator.json"
+  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
+  local genesis_bin="${GENESIS_BIN}"
   local -a args
   args=("${node_bin}" "--db" "${DB_DIR}" "--outbound-target" "${OUTBOUND_TARGET}")
   if [[ "${NODE_PUBLIC}" == "1" ]]; then
     args+=("--public")
+  fi
+
+  if [[ -z "${genesis_bin}" && -f "${default_genesis_bin}" ]]; then
+    genesis_bin="${default_genesis_bin}"
+  fi
+  if [[ -n "${genesis_bin}" ]]; then
+    args+=("--genesis" "${genesis_bin}" "--allow-unsafe-genesis-override")
   fi
 
   if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
@@ -319,6 +329,11 @@ post_build_setup() {
   log "Post-build setup summary:"
   log "  DB_DIR=${DB_DIR}"
   log "  P2P_PORT=${P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
+  if [[ -n "${GENESIS_BIN}" ]]; then
+    log "  GENESIS_BIN=${GENESIS_BIN}"
+  elif [[ -f "${ROOT_DIR}/mainnet/genesis.bin" ]]; then
+    log "  GENESIS_BIN=${ROOT_DIR}/mainnet/genesis.bin (auto-detected)"
+  fi
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"
     ${s} systemctl status "${SERVICE_NAME}" --no-pager || true

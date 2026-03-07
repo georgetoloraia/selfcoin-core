@@ -326,7 +326,7 @@ bool validate_document(const Document& doc, const NetworkConfig& cfg, std::strin
     if (err) *err = "invalid max_committee";
     return false;
   }
-  if (doc.initial_committee_params.min_committee == 0 ||
+  if (doc.initial_committee_params.min_committee < 1 ||
       doc.initial_committee_params.min_committee > doc.initial_committee_params.max_committee) {
     if (err) *err = "invalid min_committee";
     return false;

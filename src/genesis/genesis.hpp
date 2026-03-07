@@ -43,7 +43,7 @@ Hash32 hash_doc(const Document& doc);
 Hash32 block_id(const Document& doc);
 
 bool validate_document(const Document& doc, const NetworkConfig& cfg, std::string* err = nullptr,
-                       std::size_t min_validators = 4);
+                       std::size_t min_validators = 1);
 
 std::optional<Document> load_from_path(const std::string& path, std::string* err = nullptr);
 std::optional<Bytes> load_bin_from_path(const std::string& path, std::string* err = nullptr);

@@ -336,7 +336,7 @@ int main(int argc, char** argv) {
       std::cerr << "failed to load genesis json: " << err << "\n";
       return 1;
     }
-    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 2)) {
+    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 1)) {
       std::cerr << "genesis validation failed: " << err << "\n";
       return 1;
     }
@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
       std::cerr << "failed to load genesis json: " << err << "\n";
       return 1;
     }
-    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 2)) {
+    if (!selfcoin::genesis::validate_document(*doc, selfcoin::mainnet_network(), &err, 1)) {
       std::cerr << "genesis validation failed: " << err << "\n";
       return 1;
     }

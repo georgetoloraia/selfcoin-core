@@ -28,6 +28,10 @@
 namespace selfcoin::lightserver {
 namespace {
 
+constexpr std::size_t kMaxHttpHeaderBytes = 16 * 1024;
+constexpr std::size_t kMaxRpcBodyBytes = 256 * 1024;
+constexpr std::uint64_t kMaxHeaderBatchCount = 2048;
+
 std::string json_escape(const std::string& in) {
   std::string out;
   out.reserve(in.size() + 8);
@@ -96,7 +100,7 @@ bool read_http_request(int fd, std::string* out_req) {
     ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
     if (n <= 0) return false;
     req.append(buf.data(), static_cast<size_t>(n));
-    if (req.size() > 2 * 1024 * 1024) return false;
+    if (req.size() > kMaxHttpHeaderBytes) return false;
   }
 
   const auto hdr_end = req.find("\r\n\r\n");
@@ -107,6 +111,7 @@ bool read_http_request(int fd, std::string* out_req) {
   if (std::regex_search(headers, m, cl_re)) {
     content_len = static_cast<size_t>(std::stoull(m[1].str()));
   }
+  if (content_len > kMaxRpcBodyBytes) return false;
   while (req.size() < hdr_end + 4 + content_len) {
     ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
     if (n <= 0) return false;
@@ -352,6 +357,7 @@ bool Server::relay_tx_to_peer(const Bytes& tx_bytes, std::string* err) {
 }
 
 std::string Server::handle_rpc_body(const std::string& body) {
+  if (body.size() > kMaxRpcBodyBytes) return make_error("null", -32600, "request too large");
   const std::string id = find_id_token(body);
   auto method = find_string(body, "method");
   if (!method.has_value()) return make_error(id, -32600, "missing method");
@@ -384,6 +390,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto from = find_u64(body, "from_height");
     auto count = find_u64(body, "count");
     if (!from || !count) return make_error(id, -32602, "missing from_height/count");
+    if (*count > kMaxHeaderBatchCount) return make_error(id, -32602, "count too large");
     std::ostringstream arr;
     arr << "[";
     bool first = true;
@@ -427,6 +434,7 @@ std::string Server::handle_rpc_body(const std::string& body) {
     auto start = find_u64(body, "start_height");
     auto end = find_u64(body, "end_height");
     if (!start || !end || *end < *start) return make_error(id, -32602, "missing/invalid start_height,end_height");
+    if ((*end - *start) + 1 > kMaxHeaderBatchCount) return make_error(id, -32602, "range too large");
     std::ostringstream arr;
     arr << "[";
     bool first = true;

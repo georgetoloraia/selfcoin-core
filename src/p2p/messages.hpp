@@ -79,6 +79,8 @@ struct AddrMsg {
   std::vector<AddrEntryMsg> entries;
 };
 
+bool is_known_message_type(std::uint16_t msg_type);
+
 Bytes ser_version(const VersionMsg& m);
 std::optional<VersionMsg> de_version(const Bytes& b);
 Bytes ser_finalized_tip(const FinalizedTipMsg& m);

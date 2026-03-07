@@ -150,4 +150,24 @@ void VoteVerifyCache::clear_height(std::uint64_t height) {
   }
 }
 
+RecentHashCache::RecentHashCache(std::size_t capacity) : capacity_(capacity ? capacity : 1) {}
+
+bool RecentHashCache::contains(const Hash32& key) const { return seen_.find(key) != seen_.end(); }
+
+void RecentHashCache::insert(const Hash32& key) {
+  if (seen_.find(key) != seen_.end()) return;
+  seen_[key] = true;
+  order_.push_back(key);
+  while (order_.size() > capacity_) {
+    const Hash32& oldest = order_.front();
+    seen_.erase(oldest);
+    order_.pop_front();
+  }
+}
+
+void RecentHashCache::clear() {
+  seen_.clear();
+  order_.clear();
+}
+
 }  // namespace selfcoin::p2p

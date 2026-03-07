@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined CMakeFiles/fuzz_p2p_frame.dir/fuzz/fuzz_p2p_frame.cpp.o -o fuzz_p2p_frame  libselfcoin_core.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libsodium.so /usr/lib/x86_64-linux-gnu/librocksdb.so 

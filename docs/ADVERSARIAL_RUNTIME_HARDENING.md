@@ -46,6 +46,12 @@ None of the hardening changes alter:
 - P2P processing still happens inline on the node thread; caches and budgets reduce amplification, but a fuller staged work scheduler would be a larger change.
 - State-commitment proof paths remain intentionally unchanged because they affect externally visible proof/root behavior.
 
+## Test And Runtime Stability Note
+
+- A recurring late-run full-suite crash was traced to local-bus teardown in test/runtime plumbing, where queued vote delivery could outlive node shutdown and reach DB-backed code after close.
+- The conservative fix aligned local-bus vote delivery with the same shutdown guard used for peer-originated traffic and tightened teardown ordering.
+- This was a stability/lifetime issue, not a change in deterministic consensus behavior.
+
 ## Future Work
 
 - global per-tick validation budgets across peers

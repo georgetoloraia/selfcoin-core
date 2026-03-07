@@ -117,6 +117,19 @@ struct StateRoots {
   Hash32 validators_root{};
 };
 
+FinalityCertificate make_finality_certificate(std::uint64_t height, std::uint32_t round, const Hash32& block_id,
+                                              std::size_t quorum_threshold, const std::vector<PubKey32>& committee,
+                                              const std::vector<FinalitySig>& signatures) {
+  FinalityCertificate cert;
+  cert.height = height;
+  cert.round = round;
+  cert.block_id = block_id;
+  cert.quorum_threshold = static_cast<std::uint32_t>(quorum_threshold);
+  cert.committee_members = committee;
+  cert.signatures = signatures;
+  return cert;
+}
+
 StateRoots compute_roots_for_state(const UtxoSet& utxos, const consensus::ValidatorRegistry& validators,
                                    std::uint32_t validation_rules_version) {
   std::vector<std::pair<Hash32, Bytes>> utxo_leaves;
@@ -452,6 +465,10 @@ void Node::stop() {
     db_.close();
     return;
   }
+  if (cfg_.disable_p2p) {
+    std::lock_guard<std::mutex> lk(g_local_bus_mu);
+    g_local_bus_nodes.erase(std::remove(g_local_bus_nodes.begin(), g_local_bus_nodes.end(), this), g_local_bus_nodes.end());
+  }
   if (loop_thread_.joinable()) loop_thread_.join();
   if (restart_debug_) log_line("restart-debug event-loop-joined");
   if (restart_debug_) log_line("restart-debug round-timer-cancelled");
@@ -462,14 +479,13 @@ void Node::stop() {
   if (restart_debug_) log_line("restart-debug peers-persisted");
   p2p_.stop();
   if (restart_debug_) log_line("restart-debug p2p-stopped");
-  if (cfg_.disable_p2p) {
-    std::lock_guard<std::mutex> lk(g_local_bus_mu);
-    g_local_bus_nodes.erase(std::remove(g_local_bus_nodes.begin(), g_local_bus_nodes.end(), this), g_local_bus_nodes.end());
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    (void)db_.flush();
+    if (restart_debug_) log_line("restart-debug db-flushed");
+    db_.close();
+    if (restart_debug_) log_line("restart-debug db-closed");
   }
-  (void)db_.flush();
-  if (restart_debug_) log_line("restart-debug db-flushed");
-  db_.close();
-  if (restart_debug_) log_line("restart-debug db-closed");
 }
 
 NodeStatus Node::status() const {
@@ -625,6 +641,10 @@ std::vector<PubKey32> Node::active_validators_for_next_height_for_test() const {
 std::vector<PubKey32> Node::committee_for_next_height_for_test() const {
   std::lock_guard<std::mutex> lk(mu_);
   return committee_for_height_round(finalized_height_ + 1, current_round_);
+}
+std::vector<PubKey32> Node::committee_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return committee_for_height_round(height, round);
 }
 std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubKey32& pub) const {
   std::lock_guard<std::mutex> lk(mu_);
@@ -988,7 +1008,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         }
         if (valid_sigs >= quorum) {
           if (!validate_v4_registration_rules(*blk, blk->header.height)) return;
-          if (persist_finalized_block(*blk)) {
+          const FinalityCertificate certificate =
+              make_finality_certificate(blk->header.height, blk->header.round, bid, quorum, committee, filtered_sigs);
+          if (persist_finalized_block(*blk, certificate)) {
             accepted_block_payloads_.insert(payload_id);
             std::vector<Hash32> confirmed_txids;
             confirmed_txids.reserve(blk->txs.size());
@@ -1001,6 +1023,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             mempool_.prune_against_utxo(utxos_);
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
+            (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
             last_finalized_progress_ms_ = now_unix() * 1000;
             current_round_ = 0;
             round_started_ms_ = now_unix() * 1000;
@@ -1164,6 +1187,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
   bool maybe_vote_has_output = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (from_network && !running_) return false;
     if (msg.height != finalized_height_ + 1) return false;
     if (msg.prev_finalized_hash != finalized_hash_) return false;
 
@@ -1229,6 +1253,7 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, co
   bool finalize_ok = false;
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (from_network && !running_) return false;
     if (vote.height != finalized_height_ + 1) return false;
     if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
 
@@ -1277,6 +1302,7 @@ bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
   Hash32 txid{};
   {
     std::lock_guard<std::mutex> lk(mu_);
+    if (from_network && !running_) return false;
     auto& verify_bucket = tx_verify_buckets_[from_peer_id];
     verify_bucket.configure(cfg_.tx_verify_capacity, cfg_.tx_verify_refill);
     if (from_network && !verify_bucket.consume(static_cast<double>(std::max<std::size_t>(1, tx.inputs.size())), now_ms())) {
@@ -1333,7 +1359,8 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   b.finality_proof.sigs = filtered;
   if (!validate_v4_registration_rules(b, height)) return false;
 
-  if (!persist_finalized_block(b)) return false;
+  const FinalityCertificate certificate = make_finality_certificate(height, round, block_id, quorum, committee, filtered);
+  if (!persist_finalized_block(b, certificate)) return false;
 
   std::vector<Hash32> confirmed_txids;
   confirmed_txids.reserve(b.txs.size());
@@ -1347,6 +1374,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
 
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
+  (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
   last_finalized_progress_ms_ = now_unix() * 1000;
   current_round_ = 0;
   round_started_ms_ = now_unix() * 1000;
@@ -1487,7 +1515,7 @@ void Node::broadcast_vote(const Vote& vote, const Bytes& vrf_proof, const Hash32
     for (Node* peer : peers) {
       if (peer == this) continue;
       spawn_local_bus_task([peer, vm]() {
-        (void)peer->handle_vote(vm.vote, false, 0, vm.vrf_proof, vm.vrf_proof.empty() ? nullptr : &vm.vrf_output);
+        (void)peer->handle_vote(vm.vote, true, 0, vm.vrf_proof, vm.vrf_proof.empty() ? nullptr : &vm.vrf_output);
       });
     }
   } else {
@@ -1536,9 +1564,10 @@ void Node::broadcast_tx(const Tx& tx, int skip_peer_id) {
   }
 }
 
-bool Node::persist_finalized_block(const Block& block) {
+bool Node::persist_finalized_block(const Block& block, const FinalityCertificate& certificate) {
   const Hash32 h = block.header.block_id();
   if (!db_.put_block(h, block.serialize())) return false;
+  if (!db_.put_finality_certificate(certificate)) return false;
   if (!db_.set_height_hash(block.header.height, h)) return false;
   if (!db_.set_tip(storage::TipState{block.header.height, h})) return false;
 

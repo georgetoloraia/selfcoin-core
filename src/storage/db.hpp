@@ -40,6 +40,12 @@ class DB {
 
   bool put_block(const Hash32& hash, const Bytes& block_bytes);
   std::optional<Bytes> get_block(const Hash32& hash) const;
+  // Certificates are indexed both by finalized height and finalized block hash.
+  // This keeps the new first-class certificate surface separate from the legacy
+  // embedded Block.finality_proof compatibility path.
+  bool put_finality_certificate(const FinalityCertificate& cert);
+  std::optional<FinalityCertificate> get_finality_certificate_by_height(std::uint64_t height) const;
+  std::optional<FinalityCertificate> get_finality_certificate_by_block(const Hash32& hash) const;
 
   bool set_height_hash(std::uint64_t height, const Hash32& hash);
   std::optional<Hash32> get_height_hash(std::uint64_t height) const;

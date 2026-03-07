@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined "CMakeFiles/selfcoin-cli.dir/apps/selfcoin-cli/main.cpp.o" -o selfcoin-cli  libselfcoin_core.a /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so /usr/lib/x86_64-linux-gnu/libsodium.so /usr/lib/x86_64-linux-gnu/librocksdb.so 

@@ -139,6 +139,7 @@ class Node {
   std::size_t quorum_threshold_for_next_height_for_test() const;
   std::vector<PubKey32> active_validators_for_next_height_for_test() const;
   std::vector<PubKey32> committee_for_next_height_for_test() const;
+  std::vector<PubKey32> committee_for_height_round_for_test(std::uint64_t height, std::uint32_t round) const;
   std::optional<consensus::ValidatorInfo> validator_info_for_test(const PubKey32& pub) const;
   std::uint16_t p2p_port_for_test() const;
   std::optional<Block> build_proposal_for_test(std::uint64_t height, std::uint32_t round);
@@ -166,7 +167,7 @@ class Node {
   void broadcast_finalized_block(const Block& block);
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
-  bool persist_finalized_block(const Block& block);
+  bool persist_finalized_block(const Block& block, const FinalityCertificate& certificate);
   bool init_mainnet_genesis();
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);

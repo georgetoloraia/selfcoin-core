@@ -1,13 +1,14 @@
 # SelfCoin Core: Current Behavior (Repository-Grounded)
 
 ## Executive Summary
-`selfcoin-core` is a C++20 finalized-chain-first blockchain prototype where blocks become valid only when a deterministic committee reaches BFT quorum (`floor(2N/3)+1`). The running node process is `selfcoin-node` (`apps/selfcoin-node/main.cpp`, `src/node/node.cpp`).
+`selfcoin-core` is a C++20 deterministic settlement-chain implementation where blocks become valid only when a deterministic committee reaches BFT quorum (`floor(2N/3)+1`). The running node process is `selfcoin-node` (`apps/selfcoin-node/main.cpp`, `src/node/node.cpp`).
 
 Coin ownership is UTXO-based and key-based: spendability is enforced by Ed25519 signatures over domain-separated sighashes (`src/utxo/validate.cpp::validate_tx`, `src/utxo/validate.cpp::signing_message_for_input`). There are no admin keys in consensus code paths; spending requires valid signatures or explicit validator-bond special rules.
 
 Consensus uses deterministic leader selection and deterministic committee selection from finalized chain state only (`src/consensus/validators.cpp::select_leader`, `src/consensus/validators.cpp::select_committee`). Node progression is finalized-tip-only: proposals/votes are accepted only for `finalized_height + 1` (`src/node/node.cpp::handle_propose`, `src/node/node.cpp::handle_vote`).
 
 Validator lifecycle is implemented on-chain via special scripts: bond registration (`SCVALREG`), unbond request (`SCVALUNB`) and slash/burn (`SCSLASH` evidence + `SCBURN`) with warmup/unbond-delay/banning rules (`src/utxo/tx.cpp`, `src/utxo/validate.cpp`, `src/consensus/validators.cpp`).
+The intended live protocol scope is settlement-only: no VM, no general-purpose smart contracts, and no application-layer execution beyond the fixed UTXO and validator/bond forms.
 
 Networking is TCP with strict framed messages, version/network identity checks, and hardening (timeouts, queue caps, token buckets, scoring, bans) (`src/p2p/framing.cpp`, `src/p2p/peer_manager.cpp`, `src/p2p/hardening.cpp`).
 
@@ -71,6 +72,7 @@ The system is operationally deterministic and reproducible from finalized state,
 ### Locking model
 - Standard spendable outputs are P2PKH scriptPubKey bytes: `76 a9 14 <20-byte-hash> 88 ac` (`src/utxo/validate.cpp::is_p2pkh_script_pubkey`, `src/address/address.cpp::p2pkh_script_pubkey`).
 - Address encoding/decoding is custom base32 with `sha256d` 4-byte checksum over `hrp + 0x00 + payload`, HRP `sc`/`tsc` (`src/address/address.cpp`).
+- Base-layer output script scope is intentionally narrow: P2PKH plus the existing validator register, validator unbond, and slash-burn forms.
 
 ### Unlocking model
 - ScriptSig shape is strict: `0x40 <64-byte-sig> 0x20 <32-byte-pubkey>` (`src/utxo/validate.cpp::is_p2pkh_script_sig`).
@@ -86,6 +88,7 @@ The system is operationally deterministic and reproducible from finalized state,
 ### Finalized-chain-first operational meaning
 - Node only accepts propose/vote for `height == finalized_height + 1` (`src/node/node.cpp::handle_propose`, `handle_vote`).
 - Node does not build/track arbitrary unfinalized forks; candidate blocks are bounded cache keyed by `block_id` (`candidate_blocks_`).
+- Research-only VRF and `sortition_v2` helpers remain in the repository but are not part of this active runtime path.
 
 ### Leader selection
 - Deterministic from finalized hash + height + round + sorted active set (`src/consensus/validators.cpp::select_leader`).
@@ -207,19 +210,28 @@ The system is operationally deterministic and reproducible from finalized state,
 
 ## 10) Lightserver and Wallet API Integration
 ### Implemented RPC methods
-- `get_tip`, `get_status`, `get_headers`, `get_block`, `get_tx`, `get_utxos`, `get_committee`, `broadcast_tx` (`src/lightserver/server.cpp::handle_rpc_body`).
+- `get_tip`, `get_status`, `get_headers`, `get_header_range`, `get_block`, `get_finality_certificate`, `get_tx`, `get_utxos`, `get_committee`, `get_roots`, `get_utxo_proof`, `get_validator_proof`, `broadcast_tx` (`src/lightserver/server.cpp::handle_rpc_body`).
 - `get_status` includes chain identity fields (`network_name`, `protocol_version`, `feature_flags`, `network_id`, `magic`, `genesis_hash`, `genesis_source`, `chain_id_ok`) and tip/uptime.
 
 ### Finalized-only semantics
 - Reads tip/blocks/tx/UTXO from DB finalized indexes only.
 - `broadcast_tx` validates against current DB UTXO snapshot and relays via P2P TX to configured node (`Server::relay_tx_to_peer`), does not maintain mempool itself.
+- `get_header_range` is implemented alongside `get_headers` and is bounded by the same request-size caps.
+- `get_finality_certificate` accepts lookup by finalized height, finalized block hash, or current finalized tip when no selector is provided.
+- `get_roots` / `get_utxo_proof` / `get_validator_proof` are read surfaces over locally stored finalized roots/SMT state. In the current fixed runtime, proofs are tip-only and historical proof requests are rejected.
+
+### Finality certificate surface
+- Finalized blocks still expose embedded `finality_proof` data in block/header-oriented responses.
+- Lightserver also exposes a separate `get_finality_certificate` RPC that returns the persisted raw-signature finality certificate for a finalized block by height, by block hash, or by current finalized tip.
+- The current certificate object carries explicit committee members and raw signatures derived from the finalized quorum result already used by the runtime.
+- This is a durability/readability improvement, not a new consensus object with header commitment or aggregated signatures.
 
 ### Scripthash definition
 - `scripthash = sha256(script_pubkey)` (single SHA256), used for index keys (`Node::persist_finalized_block` computes with `crypto::sha256`).
 
 ### Wallet API v1 contract
 - Documented in `spec/SELFCOIN_WALLET_API_V1.md`; methods match current lightserver method names.
-- Note: spec examples for `get_status` are older/minimal; implementation currently returns additional chain-identity fields.
+- Note: `spec/SELFCOIN_WALLET_API_V1.md` documents the wallet-facing subset. The lightserver also exposes certificate and proof-oriented methods beyond that subset.
 
 ## 11) TypeScript SDK Behavior
 ### Non-custodial key/signing
@@ -238,6 +250,18 @@ The system is operationally deterministic and reproducible from finalized state,
 
 ### Multi-server trust mitigation
 - Optional quorum tip cross-check mode in RPC client (`LightServerClient.getTip`, `quorumMode='cross-check-tip'`).
+
+## 11.5) Snapshot Export / Import (Implementation-First)
+- `selfcoin-cli snapshot_export --db <dir> --out <snapshot>` exports a deterministic bundle of the finalized-state DB namespaces needed for restart/recovery/import.
+- `selfcoin-cli snapshot_import --db <empty-dir> --in <snapshot>` imports that bundle into an empty DB using the ordinary runtime keyspace.
+- The snapshot bundle carries finalized metadata, height/block indexes, certificates, UTXO/validator state, script indexes, root records, SMT state, and validator/liveness metadata.
+- In this first slice, snapshot export is an offline/quiescent-DB tool. It is not yet positioned as a live hot-backup mechanism.
+- This is not trust-minimized protocol fast sync. The active finalized block/header path does not currently commit the state roots/checkpoints strongly enough to make that claim.
+
+## 11.6) Recent Stability Note
+- The recurring late full-suite test crash was traced to local-bus teardown in test/runtime plumbing, not to deterministic settlement rules.
+- The conservative fix aligned local-bus vote delivery with the same shutdown guards used for other peer-delivered traffic and tightened teardown ordering around DB close.
+- A follow-on timing-sensitive committee test was also narrowed to compare an explicit fixed `(height, round)` pair instead of a moving per-node round helper.
 
 ## 12) Genesis, Bootstrap Trust, and “No Owner/Admin” Analysis
 ### Genesis/mainnet loading
@@ -288,4 +312,3 @@ The system is operationally deterministic and reproducible from finalized state,
 - `validate_block_txs` takes `block_reward` parameter but uses height-based `reward_units` and explicitly ignores `block_reward` (`(void)block_reward`), which is harmless but confusing (`src/utxo/validate.cpp::validate_block_txs`).
 - Lightserver `get_status` returns nested `tip` object; CLI `rpc_status` parser currently expects top-level `height/hash` fields in its parser helper (`apps/selfcoin-cli/main.cpp::parse_get_status_result`). This should be verified in runtime behavior.
 - Mainnet seed list currently includes concrete IP/host values in code (`src/common/network.cpp`). Operational trust/bootstrap quality depends on whether those endpoints are maintained and diverse.
-

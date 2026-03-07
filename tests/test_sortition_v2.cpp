@@ -39,7 +39,7 @@ std::string committee_key(const std::vector<PubKey32>& c) {
 
 }  // namespace
 
-TEST(test_v2_committee_size_small_active) {
+TEST(test_research_v2_committee_size_small_active) {
   ASSERT_EQ(consensus::committee_size_v2(0, 100), 0u);
   ASSERT_EQ(consensus::committee_size_v2(1, 100), 1u);
   ASSERT_EQ(consensus::committee_size_v2(2, 100), 2u);
@@ -48,7 +48,7 @@ TEST(test_v2_committee_size_small_active) {
   ASSERT_TRUE(k3 <= 3u);
 }
 
-TEST(test_v2_committee_size_round_expansion_progression) {
+TEST(test_research_v2_committee_size_round_expansion_progression) {
   ASSERT_EQ(consensus::committee_size_for_round_v2(2, 100, 0), 2u);
   ASSERT_EQ(consensus::committee_size_for_round_v2(4, 100, 0), 4u);
   ASSERT_EQ(consensus::committee_size_for_round_v2(8, 2, 0), 2u);
@@ -60,7 +60,7 @@ TEST(test_v2_committee_size_round_expansion_progression) {
   ASSERT_EQ(consensus::committee_size_for_round_v2(32, 3, 4), 32u);
 }
 
-TEST(test_v2_committee_size_reaches_active_count_when_round_sufficient) {
+TEST(test_research_v2_committee_size_reaches_active_count_when_round_sufficient) {
   constexpr std::size_t active_count = 1'000'000;
   constexpr std::size_t configured_max = 2;
   ASSERT_EQ(consensus::committee_size_for_round_v2(active_count, configured_max, 0), 2u);
@@ -77,7 +77,7 @@ TEST(test_v2_committee_size_reaches_active_count_when_round_sufficient) {
   ASSERT_EQ(consensus::committee_size_for_round_v2(active_count, configured_max, needed + 5), active_count);
 }
 
-TEST(test_v2_committee_size_monotonic_non_decreasing_with_round) {
+TEST(test_research_v2_committee_size_monotonic_non_decreasing_with_round) {
   const std::size_t active_count = 4096;
   const std::size_t configured_max = 3;
   std::size_t prev = consensus::committee_size_for_round_v2(active_count, configured_max, 0);
@@ -89,7 +89,7 @@ TEST(test_v2_committee_size_monotonic_non_decreasing_with_round) {
   ASSERT_EQ(prev, active_count);
 }
 
-TEST(test_v2_selection_deterministic) {
+TEST(test_research_v2_selection_deterministic) {
   const auto active = make_active_set(12);
   Hash32 entropy{};
   entropy.fill(0x42);
@@ -100,7 +100,7 @@ TEST(test_v2_selection_deterministic) {
   ASSERT_EQ(consensus::select_leader_v2(c1), consensus::select_leader_v2(c2));
 }
 
-TEST(test_v2_round_changes_selection) {
+TEST(test_research_v2_round_changes_selection) {
   const auto active = make_active_set(16);
   Hash32 entropy{};
   entropy.fill(0x55);
@@ -113,7 +113,7 @@ TEST(test_v2_round_changes_selection) {
   ASSERT_TRUE(committees.size() >= 2u);
 }
 
-TEST(test_v2_entropy_order_independent) {
+TEST(test_research_v2_entropy_order_independent) {
   FinalityProof fp_a;
   FinalityProof fp_b;
   for (int i = 0; i < 5; ++i) {
@@ -132,7 +132,7 @@ TEST(test_v2_entropy_order_independent) {
   ASSERT_EQ(e1, e2);
 }
 
-TEST(test_v2_entropy_replay_stable_and_pubkey_sensitive) {
+TEST(test_research_v2_entropy_replay_stable_and_pubkey_sensitive) {
   FinalityProof fp_a;
   for (int i = 0; i < 4; ++i) {
     FinalitySig fs;
@@ -157,7 +157,7 @@ TEST(test_v2_entropy_replay_stable_and_pubkey_sensitive) {
   ASSERT_TRUE(r_changed != r1);
 }
 
-TEST(test_v2_entropy_dedups_duplicate_pubkey) {
+TEST(test_research_v2_entropy_dedups_duplicate_pubkey) {
   Hash32 prev{};
   prev.fill(0x5A);
 
@@ -180,7 +180,7 @@ TEST(test_v2_entropy_dedups_duplicate_pubkey) {
   ASSERT_EQ(e_with_dups, e_deduped);
 }
 
-TEST(test_v2_fairness_sanity) {
+TEST(test_research_v2_fairness_sanity) {
   const std::size_t n = 20;
   const auto active = make_active_set(n);
   Hash32 entropy{};
@@ -204,4 +204,4 @@ TEST(test_v2_fairness_sanity) {
   ASSERT_TRUE(unique_leaders.size() >= 5u);
 }
 
-void register_sortition_v2_tests() {}
+void register_research_sortition_v2_tests() {}

@@ -219,6 +219,11 @@ class Node {
   consensus::VoteTracker votes_;
   p2p::PeerDiscipline discipline_{30, 100, 600};
   p2p::VoteVerifyCache vote_verify_cache_{20'000};
+  p2p::VoteVerifyCache invalid_vote_verify_cache_{20'000};
+  p2p::RecentHashCache invalid_message_payloads_{16'384};
+  p2p::RecentHashCache accepted_propose_payloads_{4'096};
+  p2p::RecentHashCache accepted_block_payloads_{4'096};
+  p2p::RecentHashCache accepted_tx_payloads_{16'384};
   std::map<int, std::map<std::uint16_t, p2p::TokenBucket>> msg_rate_buckets_;
   std::map<int, p2p::TokenBucket> vote_verify_buckets_;
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;

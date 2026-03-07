@@ -15,6 +15,7 @@ The shipped runtime uses one fixed consensus interpretation:
 - current validator/bond validation semantics in transaction and block validation
 
 Historical activation/version-routing code is not part of the active mainnet runtime. See `docs/runtime-consensus.md` and `docs/consensus-history.md`.
+Operational hardening notes for hostile network traffic live in `docs/ADVERSARIAL_RUNTIME_HARDENING.md`.
 
 ## Build (Full)
 ### 1) Auto-bootstrap build (recommended)

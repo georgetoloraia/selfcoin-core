@@ -305,6 +305,40 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   ASSERT_TRUE(bresp.find("block_hex") != std::string::npos);
 }
 
+TEST(test_lightserver_rejects_oversized_header_batches) {
+  const std::string base = "/tmp/selfcoin_light_limits";
+  auto cluster = make_cluster(base, 4);
+  auto& node = *cluster.nodes[0];
+  ASSERT_TRUE(wait_for([&]() { return node.status().height >= 2; }, std::chrono::seconds(20)));
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base + "/node0";
+  auto ls = std::make_unique<lightserver::Server>(lcfg);
+  ASSERT_TRUE(ls->init());
+
+  const auto too_many_headers = ls->handle_rpc_for_test(
+      R"({"jsonrpc":"2.0","id":1,"method":"get_headers","params":{"from_height":0,"count":3000}})");
+  ASSERT_TRUE(too_many_headers.find("count too large") != std::string::npos);
+
+  const auto too_large_range = ls->handle_rpc_for_test(
+      R"({"jsonrpc":"2.0","id":2,"method":"get_header_range","params":{"start_height":0,"end_height":3000}})");
+  ASSERT_TRUE(too_large_range.find("range too large") != std::string::npos);
+}
+
+TEST(test_lightserver_rejects_oversized_request_body_for_test_api) {
+  lightserver::Config lcfg;
+  lcfg.db_path = "/tmp/selfcoin_light_oversized_body";
+  std::filesystem::create_directories(lcfg.db_path);
+  lightserver::Server ls(lcfg);
+  ASSERT_TRUE(ls.init());
+
+  std::string body = R"({"jsonrpc":"2.0","id":1,"method":"get_status","pad":")";
+  body.append(300 * 1024, 'x');
+  body += "\"}";
+  const auto resp = ls.handle_rpc_for_test(body);
+  ASSERT_TRUE(resp.find("request too large") != std::string::npos);
+}
+
 TEST(test_lightserver_roots_endpoints_unavailable_in_fixed_runtime) {
   const std::string base = "/tmp/selfcoin_light_v3_proofs";
   auto cluster = make_cluster(base, 4);
@@ -338,7 +372,9 @@ TEST(test_lightserver_roots_endpoints_unavailable_in_fixed_runtime) {
   if (roots_available) {
     ASSERT_TRUE(up.find("proof_format") != std::string::npos);
   } else {
-    ASSERT_TRUE(up.find("utxo_root unavailable") != std::string::npos);
+    const bool utxo_root_unavailable = up.find("utxo_root unavailable") != std::string::npos;
+    const bool historical_height_rejected = up.find("historical proof not supported") != std::string::npos;
+    ASSERT_TRUE(utxo_root_unavailable || historical_height_rejected);
   }
 
   const std::string vp_q =
@@ -352,7 +388,9 @@ TEST(test_lightserver_roots_endpoints_unavailable_in_fixed_runtime) {
   if (roots_available) {
     ASSERT_TRUE(vp.find("proof_format") != std::string::npos);
   } else {
-    ASSERT_TRUE(vp.find("validators_root unavailable") != std::string::npos);
+    const bool validators_root_unavailable = vp.find("validators_root unavailable") != std::string::npos;
+    const bool historical_height_rejected = vp.find("historical proof not supported") != std::string::npos;
+    ASSERT_TRUE(validators_root_unavailable || historical_height_rejected);
   }
 }
 

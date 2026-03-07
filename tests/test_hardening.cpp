@@ -30,4 +30,23 @@ TEST(test_peer_discipline_soft_mute_and_ban) {
   ASSERT_TRUE(!d.is_banned(ip, 1000));
 }
 
+TEST(test_recent_hash_cache_bounded_and_deduplicated) {
+  p2p::RecentHashCache c(2);
+  Hash32 a{};
+  Hash32 b{};
+  Hash32 d{};
+  a[0] = 1;
+  b[0] = 2;
+  d[0] = 3;
+  c.insert(a);
+  c.insert(a);
+  c.insert(b);
+  ASSERT_TRUE(c.contains(a));
+  ASSERT_TRUE(c.contains(b));
+  c.insert(d);
+  ASSERT_TRUE(!c.contains(a));
+  ASSERT_TRUE(c.contains(b));
+  ASSERT_TRUE(c.contains(d));
+}
+
 void register_hardening_tests() {}

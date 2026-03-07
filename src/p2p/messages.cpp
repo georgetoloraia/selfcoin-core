@@ -3,6 +3,35 @@
 #include "codec/bytes.hpp"
 
 namespace selfcoin::p2p {
+namespace {
+
+constexpr std::size_t kMaxSoftwareVersionBytes = 256;
+constexpr std::size_t kMaxProposalBlockBytes = 2 * 1024 * 1024;
+constexpr std::size_t kMaxVoteProofBytes = 256;
+constexpr std::size_t kMaxBlockMessageBytes = 2 * 1024 * 1024;
+constexpr std::size_t kMaxTxMessageBytes = 256 * 1024;
+constexpr std::uint64_t kMaxAddrEntries = 256;
+
+}  // namespace
+
+bool is_known_message_type(std::uint16_t msg_type) {
+  switch (msg_type) {
+    case MsgType::VERSION:
+    case MsgType::VERACK:
+    case MsgType::GET_FINALIZED_TIP:
+    case MsgType::FINALIZED_TIP:
+    case MsgType::PROPOSE:
+    case MsgType::VOTE:
+    case MsgType::GET_BLOCK:
+    case MsgType::BLOCK:
+    case MsgType::TX:
+    case MsgType::GETADDR:
+    case MsgType::ADDR:
+      return true;
+    default:
+      return false;
+  }
+}
 
 Bytes ser_version(const VersionMsg& m) {
   codec::ByteWriter w;
@@ -32,6 +61,7 @@ std::optional<VersionMsg> de_version(const Bytes& b) {
         auto h = r.u64le();
         auto hash = r.bytes_fixed<32>();
         if (!pv || !nid || !ff || !s || !ts || !n || !sw || !h || !hash) return false;
+        if (sw->size() > kMaxSoftwareVersionBytes) return false;
         m.proto_version = *pv;
         m.network_id = *nid;
         m.feature_flags = *ff;
@@ -54,6 +84,7 @@ std::optional<VersionMsg> de_version(const Bytes& b) {
         auto h = r.u64le();
         auto hash = r.bytes_fixed<32>();
         if (!pv16 || !s || !ts || !n || !ua || !h || !hash) return false;
+        if (ua->size() > kMaxSoftwareVersionBytes) return false;
         m.proto_version = *pv16;
         m.network_id.fill(0);
         m.feature_flags = 0;
@@ -109,6 +140,7 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
         auto prev = r.bytes_fixed<32>();
         auto blk = r.varbytes();
         if (!h || !round || !prev || !blk) return false;
+        if (blk->size() > kMaxProposalBlockBytes) return false;
         m.height = *h;
         m.round = *round;
         m.prev_finalized_hash = *prev;
@@ -117,6 +149,7 @@ std::optional<ProposeMsg> de_propose(const Bytes& b) {
           auto proof = r.varbytes();
           auto out = r.bytes_fixed<32>();
           if (!proof || !out) return false;
+          if (proof->size() > kMaxVoteProofBytes) return false;
           m.vrf_proof = *proof;
           m.vrf_output = *out;
         }
@@ -158,6 +191,7 @@ std::optional<VoteMsg> de_vote(const Bytes& b) {
           auto proof = r.varbytes();
           auto out = r.bytes_fixed<32>();
           if (!proof || !out) return false;
+          if (proof->size() > kMaxVoteProofBytes) return false;
           m.vrf_proof = *proof;
           m.vrf_output = *out;
         }
@@ -190,6 +224,7 @@ std::optional<BlockMsg> de_block(const Bytes& b) {
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto blk = r.varbytes();
         if (!blk) return false;
+        if (blk->size() > kMaxBlockMessageBytes) return false;
         m.block_bytes = *blk;
         return true;
       })) return std::nullopt;
@@ -207,6 +242,7 @@ std::optional<TxMsg> de_tx(const Bytes& b) {
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto tx = r.varbytes();
         if (!tx) return false;
+        if (tx->size() > kMaxTxMessageBytes) return false;
         m.tx_bytes = *tx;
         return true;
       })) return std::nullopt;
@@ -241,7 +277,7 @@ std::optional<AddrMsg> de_addr(const Bytes& b) {
   AddrMsg m;
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
         auto n = r.varint();
-        if (!n || *n > 2000) return false;
+        if (!n || *n > kMaxAddrEntries) return false;
         m.entries.clear();
         m.entries.reserve(*n);
         for (std::uint64_t i = 0; i < *n; ++i) {

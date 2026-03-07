@@ -91,4 +91,18 @@ class VoteVerifyCache {
   std::deque<Key> order_;
 };
 
+class RecentHashCache {
+ public:
+  explicit RecentHashCache(std::size_t capacity = 4096);
+
+  bool contains(const Hash32& key) const;
+  void insert(const Hash32& key);
+  void clear();
+
+ private:
+  std::size_t capacity_{4096};
+  std::map<Hash32, bool> seen_;
+  std::deque<Hash32> order_;
+};
+
 }  // namespace selfcoin::p2p

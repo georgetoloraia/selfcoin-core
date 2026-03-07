@@ -1,6 +1,7 @@
 #include "test_framework.hpp"
 
 #include "common/network.hpp"
+#include "codec/bytes.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 
@@ -79,6 +80,29 @@ TEST(test_vote_codec_roundtrip_with_vrf_extensions) {
   ASSERT_EQ(d->vote.signature, m.vote.signature);
   ASSERT_EQ(d->vrf_proof, m.vrf_proof);
   ASSERT_EQ(d->vrf_output, m.vrf_output);
+}
+
+TEST(test_version_message_rejects_oversized_software_string) {
+  codec::ByteWriter w;
+  w.u32le(PROTOCOL_VERSION);
+  w.bytes_fixed(mainnet_network().network_id);
+  w.u64le(0);
+  w.u64le(0);
+  w.u64le(0);
+  w.u32le(0);
+  Bytes sw(300, 'x');
+  w.varbytes(sw);
+  w.u64le(0);
+  Hash32 zero{};
+  w.bytes_fixed(zero);
+  ASSERT_TRUE(!p2p::de_version(w.take()).has_value());
+}
+
+TEST(test_tx_message_rejects_oversized_payload) {
+  codec::ByteWriter w;
+  Bytes tx_bytes(300 * 1024, 0xAA);
+  w.varbytes(tx_bytes);
+  ASSERT_TRUE(!p2p::de_tx(w.take()).has_value());
 }
 
 void register_p2p_tests() {}

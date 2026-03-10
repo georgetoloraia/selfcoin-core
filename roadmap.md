@@ -48,6 +48,7 @@ Repo-grounded observations from the current codebase:
   - on first start only, a custom genesis with `initial_validators = []` is bound to that local validator as the sole active validator
   - later fresh nodes started from the same template adopt the running network's bootstrap validator and sync to the same chain identity
   - the bootstrap validator can sponsor later peer validator keys with real on-chain `SCVALREG` bond transactions once enough mined rewards exist, so later nodes can become validators after the normal warmup
+  - bootstrap-template mode now ignores stale `peers.dat` / `addrman` state until a bootstrap validator is known, uses explicit seeds first, and waits longer before self-bootstrapping when public bootstrap sources exist
   - embedded built-in mainnet genesis remains unchanged
 
 ## Target Protocol Identity
@@ -354,6 +355,32 @@ Goal:
   - diagnosed the recurring late full-suite segfault as a local-bus vote-delivery teardown bug
   - fixed by routing disable-P2P peer vote delivery through the guarded network-originated path
   - full plain test suite now completes with `EXIT:0`
+- Deployment/bootstrap hardening pass:
+  - bootstrap-template startup now exposes bootstrap diagnostics through `NodeStatus` and summary logging:
+    - established peer count
+    - whether template-bootstrap mode is active
+    - adopted bootstrap validator pubkey
+    - pending sponsored bootstrap join count
+  - bootstrap outbound connection preference now preserves source priority:
+    - explicit peers/seeds first
+    - DNS seeds second
+    - addrman candidates last
+  - README now documents the supported public bootstrap shape for the current template-based mainnet flow:
+    - same `genesis.bin` on every node
+    - live bootstrap endpoints in `mainnet/SEEDS.json`
+    - fresh DB on first join
+- Follow-on aggregate-suite stability pass:
+  - the remaining late-run failures were not new protocol bugs; they were test/runtime coordination issues
+  - root causes:
+    - `test_committee_selection_and_non_member_votes_ignored` tried to align 12 live nodes on the exact same height before pausing proposals, which is timing-sensitive under normal forward progress
+    - `tests/test_lightserver.cpp` manually stopped cluster nodes and then allowed the cluster destructor to stop them again, creating a late teardown hazard
+    - the bootstrap sync integration tests were listener-dependent and need to tolerate late-suite socket exhaustion the same way other network tests in the repo already do
+  - conservative fixes:
+    - freeze proposal production before waiting for a stable shared tip in the committee-selection test
+    - clear lightserver test clusters after manual stop so nodes are not stopped twice
+    - make the bootstrap sync integration tests skip cleanly if the late-suite environment cannot reserve/bind a listener port
+  - result:
+    - full suite now completes with `EXIT:0`
 
 - Current branch stage:
   - post-cleanup

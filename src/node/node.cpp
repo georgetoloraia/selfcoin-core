@@ -496,8 +496,10 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return;
   if (finalized_height_ != 0) return;
   if (!validators_.active_sorted(1).empty()) return;
-  if (peer_count() != 0) return;
-  if (now_ms < startup_ms_ + 5000) return;
+  if (established_peer_count() != 0) return;
+  const bool has_bootstrap_sources = !cfg_.disable_p2p && (!bootstrap_peers_.empty() || !dns_seed_peers_.empty());
+  const std::uint64_t wait_ms = has_bootstrap_sources ? 30000ULL : 5000ULL;
+  if (now_ms < startup_ms_ + wait_ms) return;
   if (bootstrap_template_bind_validator(local_key_.public_key, true)) {
     log_line("bootstrap single-node genesis from local validator pubkey=" +
              hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())));
@@ -646,6 +648,7 @@ NodeStatus Node::status() const {
   if (leader.has_value()) s.leader = *leader;
   s.votes_for_current = 0;
   s.peers = peer_count();
+  s.established_peers = established_peer_count();
   s.mempool_size = mempool_.size();
   const auto committee = committee_for_height_round(finalized_height_ + 1, current_round_);
   s.committee_size = committee.size();
@@ -660,6 +663,12 @@ NodeStatus Node::status() const {
   s.rejected_pre_handshake = rejected_pre_handshake_;
   s.consensus_version = kFixedValidationRulesVersion;
   s.participation_eligible_signers = static_cast<std::uint64_t>(last_participation_eligible_signers_);
+  s.bootstrap_template_mode = bootstrap_template_mode_;
+  if (bootstrap_validator_pubkey_.has_value()) {
+    s.bootstrap_validator_pubkey =
+        hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+  }
+  s.pending_bootstrap_joiners = pending_bootstrap_joiners_.size();
   return s;
 }
 
@@ -853,7 +862,8 @@ void Node::event_loop() {
           std::ostringstream j;
           j << "{\"type\":\"status\",\"network\":\"" << cfg_.network.name << "\",\"height\":" << finalized_height_
             << ",\"hash\":\"" << hex_encode32(finalized_hash_) << "\",\"round\":" << current_round_
-            << ",\"peers\":" << peer_count() << ",\"mempool_size\":" << mempool_.size()
+            << ",\"peers\":" << peer_count() << ",\"established_peers\":" << established_peer_count()
+            << ",\"mempool_size\":" << mempool_.size()
             << ",\"committee_size\":" << committee.size() << ",\"addrman_size\":" << addrman_.size()
             << ",\"consensus_version\":" << kFixedValidationRulesVersion
             << ",\"genesis_hash\":\"" << chain_id_.genesis_hash_hex << "\""
@@ -862,6 +872,13 @@ void Node::event_loop() {
             << ",\"outbound_connected\":" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count())
             << ",\"inbound_connected\":" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
             << ",\"last_bootstrap_source\":\"" << last_bootstrap_source_ << "\""
+            << ",\"bootstrap_template_mode\":" << (bootstrap_template_mode_ ? "true" : "false")
+            << ",\"pending_bootstrap_joiners\":" << pending_bootstrap_joiners_.size();
+          if (bootstrap_validator_pubkey_.has_value()) {
+            j << ",\"bootstrap_validator_pubkey\":\""
+              << hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end())) << "\"";
+          }
+          j
             << ",\"rejected_network_id\":" << rejected_network_id_
             << ",\"rejected_protocol_version\":" << rejected_protocol_version_
             << ",\"rejected_pre_handshake\":" << rejected_pre_handshake_ << "}";
@@ -882,21 +899,41 @@ void Node::event_loop() {
             << ",\"tip\":\"" << short_hash_hex(finalized_hash_) << "\",\"genesis_hash\":\""
             << chain_id_.genesis_hash_hex << "\",\"genesis_source\":\"" << chain_id_.genesis_source
             << "\",\"chain_id_ok\":" << (chain_id_.chain_id_ok ? "true" : "false") << ",\"peers\":" << peer_count()
+            << ",\"established_peers\":" << established_peer_count()
             << ",\"outbound_connected\":" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count())
             << ",\"inbound_connected\":" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
             << ",\"outbound_target\":" << cfg_.outbound_target << ",\"addrman_size\":" << addrman_.size()
             << ",\"bootstrap_source_last\":\"" << last_bootstrap_source_ << "\",\"committee_size\":" << committee.size()
             << ",\"quorum_threshold\":" << q << ",\"observed_signers\":" << observed
             << ",\"consensus_state\":\"" << state << "\",\"consensus_version\":" << kFixedValidationRulesVersion
-            << "}";
+            << ",\"bootstrap_template_mode\":" << (bootstrap_template_mode_ ? "true" : "false")
+            << ",\"pending_bootstrap_joiners\":" << pending_bootstrap_joiners_.size();
+          if (bootstrap_validator_pubkey_.has_value()) {
+            j << ",\"bootstrap_validator_pubkey\":\""
+              << hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end())) << "\"";
+          }
+          j << "}";
           std::cout << j.str() << "\n";
         } else {
           std::cout << cfg_.network.name << " h=" << finalized_height_ << " tip=" << short_hash_hex(finalized_hash_)
                     << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8)
                     << " peers=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
                     << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
-                    << " addrman=" << addrman_.size() << " cv=" << kFixedValidationRulesVersion << " state=" << state
-                    << "\n";
+                    << " established=" << established_peer_count() << " addrman=" << addrman_.size()
+                    << " cv=" << kFixedValidationRulesVersion << " state=" << state;
+          if (bootstrap_template_mode_) {
+            std::cout << " bootstrap=template";
+            if (bootstrap_validator_pubkey_.has_value()) {
+              std::cout << " validator=" << short_pub_hex(*bootstrap_validator_pubkey_);
+            }
+            if (!last_bootstrap_source_.empty()) {
+              std::cout << " source=" << last_bootstrap_source_;
+            }
+            if (!pending_bootstrap_joiners_.empty()) {
+              std::cout << " pending_joiners=" << pending_bootstrap_joiners_.size();
+            }
+          }
+          std::cout << "\n";
         }
         last_summary_log_ms_ = now_ms;
       }
@@ -2317,6 +2354,7 @@ void Node::join_local_bus_tasks() {
 }
 
 void Node::load_persisted_peers() {
+  if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value()) return;
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "peers.dat";
   std::ifstream in(p);
   if (!in.good()) return;
@@ -2343,6 +2381,7 @@ void Node::persist_peers() const {
 }
 
 void Node::load_addrman() {
+  if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value()) return;
   const std::filesystem::path p = std::filesystem::path(cfg_.db_path) / "addrman.dat";
   (void)addrman_.load(p.string());
 }
@@ -2441,15 +2480,29 @@ bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {
 }
 
 void Node::try_connect_bootstrap_peers() {
-  std::set<std::string> uniq;
+  struct Candidate {
+    std::string peer;
+    const char* source;
+  };
+  std::vector<Candidate> candidates;
+  std::set<std::string> seen;
   {
     std::lock_guard<std::mutex> lk(mu_);
-    for (const auto& p : bootstrap_peers_) uniq.insert(p);
-    for (const auto& p : dns_seed_peers_) uniq.insert(p);
-    for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) uniq.insert(a.key());
+    for (const auto& p : bootstrap_peers_) {
+      if (seen.insert(p).second) candidates.push_back({p, "seeds"});
+    }
+    for (const auto& p : dns_seed_peers_) {
+      if (seen.insert(p).second) candidates.push_back({p, "dns"});
+    }
+    if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) {
+      for (const auto& a : addrman_.select_candidates(cfg_.outbound_target * 2, now_unix())) {
+        if (seen.insert(a.key()).second) candidates.push_back({a.key(), "addrman"});
+      }
+    }
   }
 
-  for (const auto& peer : uniq) {
+  for (const auto& candidate : candidates) {
+    const auto& peer = candidate.peer;
     const auto pos = peer.find(':');
     if (pos == std::string::npos) continue;
     const std::string host = peer.substr(0, pos);
@@ -2468,12 +2521,7 @@ void Node::try_connect_bootstrap_peers() {
     if (!p2p_.connect_to(host, port)) continue;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      if (std::find(dns_seed_peers_.begin(), dns_seed_peers_.end(), peer) != dns_seed_peers_.end())
-        last_bootstrap_source_ = "dns";
-      else if (std::find(bootstrap_peers_.begin(), bootstrap_peers_.end(), peer) != bootstrap_peers_.end())
-        last_bootstrap_source_ = "seeds";
-      else
-        last_bootstrap_source_ = "addrman";
+      last_bootstrap_source_ = candidate.source;
       addrman_.mark_success(p2p::NetAddress{host, port}, now_unix());
     }
     for (int pid : p2p_.peer_ids()) send_version(pid);
@@ -2481,6 +2529,14 @@ void Node::try_connect_bootstrap_peers() {
 }
 
 std::size_t Node::peer_count() const { return static_cast<std::size_t>(p2p_.peer_ids().size()); }
+
+std::size_t Node::established_peer_count() const {
+  std::size_t n = 0;
+  for (int id : p2p_.peer_ids()) {
+    if (p2p_.get_peer_info(id).established()) ++n;
+  }
+  return n;
+}
 
 std::string Node::peer_ip_for(int peer_id) const {
   auto it = peer_ip_cache_.find(peer_id);

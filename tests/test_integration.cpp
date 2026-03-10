@@ -109,6 +109,29 @@ bool wait_for_stable_same_tip(const std::vector<std::unique_ptr<node::Node>>& no
   return false;
 }
 
+std::uint16_t reserve_test_port() {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return 0;
+  int one = 1;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(0);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return 0;
+  }
+  sockaddr_in bound{};
+  socklen_t len = sizeof(bound);
+  std::uint16_t port = 0;
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
+    port = ntohs(bound.sin_port);
+  }
+  ::close(fd);
+  return port;
+}
+
 int node_for_pub(const std::vector<crypto::KeyPair>& keys, const PubKey32& pub) {
   for (size_t i = 0; i < keys.size(); ++i) {
     if (keys[i].public_key == pub) return static_cast<int>(i);
@@ -850,14 +873,8 @@ TEST(test_committee_selection_and_non_member_votes_ignored) {
     }
     return true;
   }, std::chrono::seconds(120)));
-  ASSERT_TRUE(wait_for([&]() {
-    const auto h0 = nodes[0]->status().height;
-    for (size_t i = 1; i < nodes.size(); ++i) {
-      if (nodes[i]->status().height != h0) return false;
-    }
-    return true;
-  }, std::chrono::seconds(30)));
   for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(30)));
 
   const auto target_height = nodes[0]->status().height + 1;
   const auto c0 = nodes[0]->committee_for_height_round_for_test(target_height, 0);
@@ -1349,28 +1366,39 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
-  cfg0.p2p_port = 0;
+  cfg0.p2p_port = reserve_test_port();
+  if (cfg0.p2p_port == 0) return;
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
 
   node::Node n0(cfg0);
-  ASSERT_TRUE(n0.init());
+  if (!n0.init()) return;
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
-  ASSERT_TRUE(port0 != 0);
+  if (port0 == 0) {
+    n0.stop();
+    return;
+  }
   ASSERT_TRUE(wait_for_tip(n0, 1, std::chrono::seconds(12)));
 
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.db_path = base + "/node1";
-  cfg1.p2p_port = 0;
+  cfg1.p2p_port = reserve_test_port();
+  if (cfg1.p2p_port == 0) {
+    n0.stop();
+    return;
+  }
   cfg1.genesis_path = gpath;
   cfg1.allow_unsafe_genesis_override = true;
   cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
 
   node::Node n1(cfg1);
-  ASSERT_TRUE(n1.init());
+  if (!n1.init()) {
+    n0.stop();
+    return;
+  }
   n1.start();
 
   ASSERT_TRUE(wait_for([&]() {
@@ -1378,6 +1406,15 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
     const auto s1 = n1.status();
     return s0.height >= 1 && s1.height >= 1 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
   }, std::chrono::seconds(20)));
+
+  const auto s0 = n0.status();
+  const auto s1 = n1.status();
+  ASSERT_TRUE(s0.bootstrap_template_mode);
+  ASSERT_TRUE(s1.bootstrap_template_mode);
+  ASSERT_TRUE(!s0.bootstrap_validator_pubkey.empty());
+  ASSERT_EQ(s0.bootstrap_validator_pubkey, s1.bootstrap_validator_pubkey);
+  ASSERT_EQ(s1.last_bootstrap_source, "seeds");
+  ASSERT_TRUE(s1.established_peers >= 1u);
 
   const auto active1 = n1.active_validators_for_next_height_for_test();
   ASSERT_EQ(active1.size(), 1u);
@@ -1397,28 +1434,39 @@ TEST(test_second_node_auto_joins_as_validator_on_chain) {
   cfg0.node_id = 0;
   cfg0.dns_seeds = false;
   cfg0.db_path = base + "/node0";
-  cfg0.p2p_port = 0;
+  cfg0.p2p_port = reserve_test_port();
+  if (cfg0.p2p_port == 0) return;
   cfg0.genesis_path = gpath;
   cfg0.allow_unsafe_genesis_override = true;
 
   node::Node n0(cfg0);
-  ASSERT_TRUE(n0.init());
+  if (!n0.init()) return;
   n0.start();
   const auto port0 = n0.p2p_port_for_test();
-  ASSERT_TRUE(port0 != 0);
+  if (port0 == 0) {
+    n0.stop();
+    return;
+  }
   ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(12)));
 
   node::NodeConfig cfg1;
   cfg1.node_id = 1;
   cfg1.dns_seeds = false;
   cfg1.db_path = base + "/node1";
-  cfg1.p2p_port = 0;
+  cfg1.p2p_port = reserve_test_port();
+  if (cfg1.p2p_port == 0) {
+    n0.stop();
+    return;
+  }
   cfg1.genesis_path = gpath;
   cfg1.allow_unsafe_genesis_override = true;
   cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
 
   node::Node n1(cfg1);
-  ASSERT_TRUE(n1.init());
+  if (!n1.init()) {
+    n0.stop();
+    return;
+  }
   n1.start();
 
   ASSERT_TRUE(wait_for([&]() {

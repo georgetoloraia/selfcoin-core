@@ -341,10 +341,13 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
 TEST(test_lightserver_exposes_finality_certificate_endpoint) {
   const std::string base = "/tmp/selfcoin_light_cert_rpc";
   auto cluster = make_cluster(base);
-  auto& node = *cluster.nodes[0];
-  ASSERT_TRUE(wait_for([&]() { return node.status().height >= 6; }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() { return cluster.nodes[0]->status().height >= 6; }, std::chrono::seconds(30)));
+  const auto tip = cluster.nodes[0]->status();
 
-  const auto tip = node.status();
+  for (auto& n : cluster.nodes) {
+    if (n) n->stop();
+  }
+  cluster.nodes.clear();
 
   lightserver::Config lcfg;
   lcfg.db_path = base + "/node0";
@@ -382,6 +385,7 @@ TEST(test_snapshot_export_import_bootstraps_imported_db) {
   for (auto& n : cluster.nodes) {
     if (n) n->stop();
   }
+  cluster.nodes.clear();
 
   const std::string snapshot_path = base + "/finalized.snapshot";
   const std::string imported_db_path = base + "/imported-node";

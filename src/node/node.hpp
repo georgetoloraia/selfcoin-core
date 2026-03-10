@@ -94,6 +94,7 @@ struct NodeStatus {
   PubKey32 leader{};
   std::size_t votes_for_current{0};
   std::size_t peers{0};
+  std::size_t established_peers{0};
   std::size_t mempool_size{0};
   std::size_t committee_size{0};
   std::size_t quorum_threshold{0};
@@ -108,6 +109,9 @@ struct NodeStatus {
   std::uint64_t rejected_pre_handshake{0};
   std::uint32_t consensus_version{1};
   std::uint64_t participation_eligible_signers{0};
+  bool bootstrap_template_mode{false};
+  std::string bootstrap_validator_pubkey;
+  std::size_t pending_bootstrap_joiners{0};
 };
 
 class Node {
@@ -190,6 +194,7 @@ class Node {
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
   std::size_t peer_count() const;
+  std::size_t established_peer_count() const;
   std::string peer_ip_for(int peer_id) const;
   std::optional<p2p::NetAddress> addrman_address_for_peer(const p2p::PeerInfo& info) const;
   void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);

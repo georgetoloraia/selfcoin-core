@@ -91,6 +91,12 @@ The recent recurring late-run test-suite segfault was traced to local-bus shutdo
 ./scripts/bootstrap_build.sh
 ```
 
+For the current public bootstrap-template flow:
+- all nodes must use the same `mainnet/genesis.bin`
+- `mainnet/SEEDS.json` should contain only real live bootstrap P2P endpoints
+- a fresh joining node should start with an empty `~/.selfcoin/mainnet` so it can adopt the running chain cleanly
+- only the first node self-bootstraps; later nodes are expected to sync from the live network and become validators only through the on-chain sponsored join path
+
 ### 2) Manual build
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

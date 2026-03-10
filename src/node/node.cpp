@@ -29,6 +29,7 @@
 #include "genesis/genesis.hpp"
 #include "keystore/validator_keystore.hpp"
 #include "merkle/merkle.hpp"
+#include "utxo/signing.hpp"
 
 namespace selfcoin::node {
 namespace {
@@ -243,6 +244,7 @@ bool Node::init() {
   if (!parent.empty()) (void)ensure_private_dir(parent.string());
   (void)ensure_private_dir(cfg_.db_path);
   mining_log_path_ = (dbp / "MiningLOG").string();
+  startup_ms_ = now_unix() * 1000;
   std::cout << "[node " << cfg_.node_id << "] db-dir=" << cfg_.db_path << "\n";
   std::cout << "[node " << cfg_.node_id << "] mining-log=" << mining_log_path_ << "\n";
   if (cfg_.public_mode) {
@@ -369,6 +371,7 @@ bool Node::init() {
       if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
         std::lock_guard<std::mutex> lk(mu_);
         peer_ip_cache_.erase(peer_id);
+        peer_validator_pubkeys_.erase(peer_id);
         getaddr_requested_peers_.erase(peer_id);
         msg_rate_buckets_.erase(peer_id);
         vote_verify_buckets_.erase(peer_id);
@@ -446,6 +449,140 @@ bool Node::init_local_validator_key() {
   local_key_.public_key = vk.pubkey;
   log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
   return true;
+}
+
+bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator) {
+  consensus::ValidatorInfo vi;
+  vi.status = consensus::ValidatorStatus::ACTIVE;
+  vi.joined_height = 0;
+  vi.has_bond = true;
+  vi.bonded_amount = BOND_AMOUNT;
+  vi.bond_outpoint = OutPoint{zero_hash(), 0};
+  vi.unbond_height = 0;
+
+  validators_.upsert(pub, vi);
+  if (!db_.put_validator(pub, vi)) return false;
+
+  genesis::Document effective;
+  effective.version = 1;
+  effective.network_name = cfg_.network.name;
+  effective.protocol_version = cfg_.network.protocol_version;
+  effective.network_id = cfg_.network.network_id;
+  effective.magic = cfg_.network.magic;
+  effective.genesis_time_unix = 1735689600ULL;
+  effective.initial_height = 0;
+  effective.initial_validators = {pub};
+  effective.initial_active_set_size = 1;
+  effective.initial_committee_params.min_committee = 1;
+  effective.initial_committee_params.max_committee = static_cast<std::uint32_t>(cfg_.network.max_committee);
+  effective.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  effective.initial_committee_params.c = 1;
+  effective.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
+  effective.note = local_validator ? "single-node bootstrap bound to local validator"
+                                   : "bootstrap validator adopted from network";
+  const auto json = genesis::to_json(effective);
+  if (!db_.put("G:J", Bytes(json.begin(), json.end()))) return false;
+
+  const UtxoSet empty_utxos;
+  (void)persist_state_roots(db_, 0, empty_utxos, validators_, kFixedValidationRulesVersion);
+  if (!db_.flush()) return false;
+
+  bootstrap_validator_pubkey_ = pub;
+  is_validator_ = local_validator;
+  return true;
+}
+
+void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
+  if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return;
+  if (finalized_height_ != 0) return;
+  if (!validators_.active_sorted(1).empty()) return;
+  if (peer_count() != 0) return;
+  if (now_ms < startup_ms_ + 5000) return;
+  if (bootstrap_template_bind_validator(local_key_.public_key, true)) {
+    log_line("bootstrap single-node genesis from local validator pubkey=" +
+             hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())));
+  }
+}
+
+std::optional<Tx> Node::build_bootstrap_validator_join_tx(const PubKey32& pub) const {
+  if (pub == local_key_.public_key) return std::nullopt;
+
+  const auto sender_pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
+  std::vector<std::pair<OutPoint, TxOut>> selected;
+  std::uint64_t in_sum = 0;
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& [op, e] : utxos_) {
+      std::array<std::uint8_t, 20> got{};
+      if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
+      if (got != sender_pkh) continue;
+      selected.push_back({op, e.out});
+      in_sum += e.out.value;
+      if (in_sum >= validator_bond_min_amount_) break;
+    }
+  }
+
+  if (in_sum < validator_bond_min_amount_) return std::nullopt;
+
+  Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  reg_spk.insert(reg_spk.end(), pub.begin(), pub.end());
+
+  std::vector<TxOut> outs{TxOut{validator_bond_min_amount_, reg_spk}};
+  const std::uint64_t change = in_sum - validator_bond_min_amount_;
+  if (change > 0) outs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  for (const auto& [op, _] : selected) tx.inputs.push_back(TxIn{op.txid, op.index, {}, 0xFFFFFFFF});
+  tx.outputs = outs;
+
+  for (std::size_t i = 0; i < selected.size(); ++i) {
+    auto msg = signing_message_for_input(tx, static_cast<std::uint32_t>(i));
+    if (!msg.has_value()) return std::nullopt;
+    auto sig = crypto::ed25519_sign(*msg, local_key_.private_key);
+    if (!sig.has_value()) return std::nullopt;
+    Bytes script;
+    script.push_back(0x40);
+    script.insert(script.end(), sig->begin(), sig->end());
+    script.push_back(0x20);
+    script.insert(script.end(), local_key_.public_key.begin(), local_key_.public_key.end());
+    tx.inputs[i].script_sig = std::move(script);
+  }
+
+  return tx;
+}
+
+void Node::maybe_submit_bootstrap_join() {
+  PubKey32 target{};
+  bool have_target = false;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!bootstrap_template_mode_ || !bootstrap_validator_pubkey_.has_value() ||
+        *bootstrap_validator_pubkey_ != local_key_.public_key) {
+      return;
+    }
+    for (const auto& pub : pending_bootstrap_joiners_) {
+      if (pub == local_key_.public_key) continue;
+      if (sponsored_bootstrap_joiners_.find(pub) != sponsored_bootstrap_joiners_.end()) continue;
+      if (validators_.get(pub).has_value()) continue;
+      target = pub;
+      have_target = true;
+      break;
+    }
+  }
+  if (!have_target) return;
+
+  auto tx = build_bootstrap_validator_join_tx(target);
+  if (!tx.has_value()) return;
+  if (!handle_tx(*tx, false)) return;
+  broadcast_tx(*tx);
+
+  std::lock_guard<std::mutex> lk(mu_);
+  sponsored_bootstrap_joiners_.insert(target);
+  log_line("submitted bootstrap validator join tx for pubkey=" +
+           hex_encode(Bytes(target.begin(), target.end())) + " txid=" + hex_encode32(tx->txid()));
 }
 
 void Node::start() {
@@ -764,6 +901,8 @@ void Node::event_loop() {
         last_summary_log_ms_ = now_ms;
       }
 
+      maybe_self_bootstrap_template(now_ms);
+
       const bool can_propose = leader.has_value() && *leader == local_key_.public_key;
 
       if (!pause_proposals_.load() && can_propose) {
@@ -785,6 +924,8 @@ void Node::event_loop() {
       broadcast_propose(*to_propose);
       handle_propose(local_msg, false);
     }
+
+    maybe_submit_bootstrap_join();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!cfg_.disable_p2p) {
@@ -812,6 +953,12 @@ void Node::send_version(int peer_id) {
   v.start_height = tip ? tip->height : 0;
   v.start_hash = tip ? tip->hash : zero_hash();
   v.node_software_version = local_software_version_fingerprint(cfg_.network, chain_id_, kFixedValidationRulesVersion);
+  if (bootstrap_validator_pubkey_.has_value()) {
+    v.node_software_version +=
+        ";bootstrap_validator=" + hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
+  }
+  v.node_software_version +=
+      ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
 
   (void)p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
   p2p_.mark_handshake_tx(peer_id, true, false);
@@ -878,6 +1025,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
     const std::string local_nid = ascii_lower(network_id_hex(cfg_.network));
     const auto peer_genesis = software_fingerprint_value(v->node_software_version, "genesis");
     const auto peer_nid = software_fingerprint_value(v->node_software_version, "network_id");
+    const auto peer_bootstrap = software_fingerprint_value(v->node_software_version, "bootstrap_validator");
+    const auto peer_validator = software_fingerprint_value(v->node_software_version, "validator_pubkey");
     if (peer_genesis.has_value() && ascii_lower(*peer_genesis) != local_genesis) {
       log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=genesis-fingerprint-mismatch");
       p2p_.disconnect_peer(peer_id);
@@ -887,6 +1036,31 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       log_line("reject-version peer_id=" + std::to_string(peer_id) + " reason=network-id-fingerprint-mismatch");
       p2p_.disconnect_peer(peer_id);
       return;
+    }
+    if (peer_bootstrap.has_value()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && finalized_height_ == 0 &&
+          validators_.active_sorted(1).empty()) {
+        auto b = hex_decode(*peer_bootstrap);
+        if (b && b->size() == 32) {
+          PubKey32 pub{};
+          std::copy(b->begin(), b->end(), pub.begin());
+          if (bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) {
+            log_line("adopted bootstrap validator from peer pubkey=" +
+                     hex_encode(Bytes(pub.begin(), pub.end())));
+          }
+        }
+      }
+    }
+    if (peer_validator.has_value()) {
+      auto b = hex_decode(*peer_validator);
+      if (b && b->size() == 32) {
+        PubKey32 pub{};
+        std::copy(b->begin(), b->end(), pub.begin());
+        std::lock_guard<std::mutex> lk(mu_);
+        peer_validator_pubkeys_[peer_id] = pub;
+        pending_bootstrap_joiners_.insert(pub);
+      }
     }
     p2p_.set_peer_handshake_meta(peer_id, v->proto_version, v->network_id, v->feature_flags);
     p2p_.mark_handshake_rx(peer_id, true, false);
@@ -1630,14 +1804,8 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "genesis load failed: " << err << "\n";
     return false;
   }
-  if (!use_embedded && doc->initial_validators.empty()) {
-    doc->initial_validators.push_back(local_key_.public_key);
-    doc->initial_active_set_size = 1;
-    log_line("bootstrap single-node genesis from local validator pubkey=" +
-             hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())));
-  }
-  if (!use_embedded) ghash = genesis::hash_doc(*doc);
-  if (!genesis::validate_document(*doc, cfg_.network, &err, 1)) {
+  bootstrap_template_mode_ = (!use_embedded && doc->initial_validators.empty());
+  if (!genesis::validate_document(*doc, cfg_.network, &err, bootstrap_template_mode_ ? 0 : 1)) {
     std::cerr << "genesis validation failed: " << err << "\n";
     return false;
   }
@@ -1659,6 +1827,20 @@ bool Node::init_mainnet_genesis() {
     if (!db_.get("G:J").has_value()) {
       const auto json = genesis::to_json(*doc);
       (void)db_.put("G:J", Bytes(json.begin(), json.end()));
+    }
+    if (bootstrap_template_mode_) {
+      const auto all = db_.scan_prefix("V:");
+      if (all.size() == 1) {
+        const auto& key = all.begin()->first;
+        if (key.size() > 2) {
+          auto b = hex_decode(key.substr(2));
+          if (b && b->size() == 32) {
+            PubKey32 pub{};
+            std::copy(b->begin(), b->end(), pub.begin());
+            bootstrap_validator_pubkey_ = pub;
+          }
+        }
+      }
     }
     const auto tip = db_.get_tip();
     if (tip.has_value() && tip->height == 0 && tip->hash != gblock) {

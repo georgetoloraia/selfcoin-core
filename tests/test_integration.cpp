@@ -1338,6 +1338,109 @@ TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
   n.stop();
 }
 
+TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
+  const std::string base = "/tmp/selfcoin_it_single_node_sync_join";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg0;
+  cfg0.node_id = 0;
+  cfg0.dns_seeds = false;
+  cfg0.db_path = base + "/node0";
+  cfg0.p2p_port = 0;
+  cfg0.genesis_path = gpath;
+  cfg0.allow_unsafe_genesis_override = true;
+
+  node::Node n0(cfg0);
+  ASSERT_TRUE(n0.init());
+  n0.start();
+  const auto port0 = n0.p2p_port_for_test();
+  ASSERT_TRUE(port0 != 0);
+  ASSERT_TRUE(wait_for_tip(n0, 1, std::chrono::seconds(12)));
+
+  node::NodeConfig cfg1;
+  cfg1.node_id = 1;
+  cfg1.dns_seeds = false;
+  cfg1.db_path = base + "/node1";
+  cfg1.p2p_port = 0;
+  cfg1.genesis_path = gpath;
+  cfg1.allow_unsafe_genesis_override = true;
+  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  node::Node n1(cfg1);
+  ASSERT_TRUE(n1.init());
+  n1.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height >= 1 && s1.height >= 1 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(20)));
+
+  const auto active1 = n1.active_validators_for_next_height_for_test();
+  ASSERT_EQ(active1.size(), 1u);
+
+  n1.stop();
+  n0.stop();
+}
+
+TEST(test_second_node_auto_joins_as_validator_on_chain) {
+  const std::string base = "/tmp/selfcoin_it_single_node_validator_join";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg0;
+  cfg0.node_id = 0;
+  cfg0.dns_seeds = false;
+  cfg0.db_path = base + "/node0";
+  cfg0.p2p_port = 0;
+  cfg0.genesis_path = gpath;
+  cfg0.allow_unsafe_genesis_override = true;
+
+  node::Node n0(cfg0);
+  ASSERT_TRUE(n0.init());
+  n0.start();
+  const auto port0 = n0.p2p_port_for_test();
+  ASSERT_TRUE(port0 != 0);
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(12)));
+
+  node::NodeConfig cfg1;
+  cfg1.node_id = 1;
+  cfg1.dns_seeds = false;
+  cfg1.db_path = base + "/node1";
+  cfg1.p2p_port = 0;
+  cfg1.genesis_path = gpath;
+  cfg1.allow_unsafe_genesis_override = true;
+  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  node::Node n1(cfg1);
+  ASSERT_TRUE(n1.init());
+  n1.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto a0 = n0.active_validators_for_next_height_for_test();
+    const auto a1 = n1.active_validators_for_next_height_for_test();
+    return a0.size() >= 2 && a1.size() >= 2;
+  }, std::chrono::seconds(45)));
+
+  const auto a0 = n0.active_validators_for_next_height_for_test();
+  const auto a1 = n1.active_validators_for_next_height_for_test();
+  ASSERT_EQ(a0.size(), 2u);
+  ASSERT_EQ(a1.size(), 2u);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height == s1.height && s0.tip_hash == s1.tip_hash && s0.height >= 120;
+  }, std::chrono::seconds(20)));
+
+  n1.stop();
+  n0.stop();
+}
+
 TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {
   const std::string base = "/tmp/selfcoin_it_reject_mainnet_vs_testnet";
   std::filesystem::remove_all(base);

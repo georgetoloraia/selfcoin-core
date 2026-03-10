@@ -169,6 +169,10 @@ class Node {
 
   bool persist_finalized_block(const Block& block, const FinalityCertificate& certificate);
   bool init_local_validator_key();
+  bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
+  void maybe_self_bootstrap_template(std::uint64_t now_ms);
+  std::optional<Tx> build_bootstrap_validator_join_tx(const PubKey32& pub) const;
+  void maybe_submit_bootstrap_join();
   bool init_mainnet_genesis();
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
@@ -279,6 +283,12 @@ class Node {
   std::set<int> getaddr_requested_peers_;
   std::string last_bootstrap_source_{"none"};
   std::string mining_log_path_;
+  bool bootstrap_template_mode_{false};
+  std::optional<PubKey32> bootstrap_validator_pubkey_;
+  std::uint64_t startup_ms_{0};
+  std::map<int, PubKey32> peer_validator_pubkeys_;
+  std::set<PubKey32> pending_bootstrap_joiners_;
+  std::set<PubKey32> sponsored_bootstrap_joiners_;
   bool restart_debug_{false};
 };
 

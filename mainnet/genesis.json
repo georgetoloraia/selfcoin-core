@@ -6,21 +6,18 @@
   "magic": 1396919630,
   "genesis_time_unix": 1735689600,
   "initial_height": 0,
-  "initial_validators": [
-    "3ae5ced7dd151d5fca1913fb1ef646e9390dd864d581d8ff01b9b910bb3fe97b",
-    "97e5ca9c7f021cde712795f57ac79c5ab820db41b4837b3ac63707babffa0ad6"
-  ],
-  "initial_active_set_size": 2,
+  "initial_validators": [],
+  "initial_active_set_size": 0,
   "initial_committee_params": {
-    "min_committee": 2,
+    "min_committee": 1,
     "max_committee": 128,
     "sizing_rule": "min(MAX_COMMITTEE,ACTIVE_SIZE)",
-    "C": 2
+    "C": 1
   },
   "monetary_params_ref": "README.md#monetary-policy-7m-hard-cap",
   "seeds": [
     "167.172.97.180:19440",
     "138.197.113.69:19440"
   ],
-  "note": "mainnet genesis with two initial validators"
+  "note": "mainnet bootstrap template; first custom-genesis node binds itself as the sole initial validator"
 }

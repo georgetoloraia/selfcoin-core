@@ -58,6 +58,26 @@ std::string make_mainnet_genesis_json(bool duplicate = false, bool bad_pub = fal
   return json;
 }
 
+std::string make_empty_mainnet_genesis_json() {
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1'730'000'000ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 0;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 1;
+  d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
+  d.seeds = mainnet_network().default_seeds;
+  d.note = "single-node-bootstrap-template";
+  return genesis::to_json(d);
+}
+
 }  // namespace
 
 TEST(test_genesis_json_bin_hash_stable) {
@@ -89,6 +109,14 @@ TEST(test_genesis_reject_invalid_pubkey_hex) {
   std::string err;
   auto doc = genesis::parse_json(make_mainnet_genesis_json(false, true), &err);
   ASSERT_TRUE(!doc.has_value());
+}
+
+TEST(test_genesis_empty_validator_template_allowed_only_when_requested) {
+  std::string err;
+  auto doc = genesis::parse_json(make_empty_mainnet_genesis_json(), &err);
+  ASSERT_TRUE(doc.has_value());
+  ASSERT_TRUE(genesis::validate_document(*doc, mainnet_network(), &err, 0));
+  ASSERT_TRUE(!genesis::validate_document(*doc, mainnet_network(), &err, 1));
 }
 
 void register_genesis_tests() {}

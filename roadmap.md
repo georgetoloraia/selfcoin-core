@@ -41,6 +41,11 @@ Repo-grounded observations from the current codebase:
   - docs that still describe more protocol surface than the live runtime needs
   - historical state-commitment naming in `src/consensus/state_commitment.*`
 - Snapshot-style fast sync is not trust-minimized today because active state roots are not committed in the live finalized block/header path.
+- Custom-genesis single-node bootstrap is now supported in a narrow form:
+  - `selfcoin-cli genesis_build` / `genesis_verify` accept an empty-validator custom genesis template
+  - `selfcoin-node` loads or creates the local validator keystore before genesis init
+  - on first start only, a custom genesis with `initial_validators = []` is bound to that local validator as the sole active validator
+  - embedded built-in mainnet genesis remains unchanged
 
 ## Target Protocol Identity
 

@@ -454,6 +454,31 @@ bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validator
   return out.good();
 }
 
+bool write_empty_mainnet_bootstrap_genesis_file(const std::string& path) {
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 0;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 1;
+  d.monetary_params_ref = "README.md#monetary-policy-7m-hard-cap";
+  d.seeds = {};
+  d.note = "single-node-bootstrap-template";
+
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+  std::ofstream out(path, std::ios::trunc);
+  if (!out.good()) return false;
+  out << genesis::to_json(d);
+  return out.good();
+}
+
 }  // namespace
 
 TEST(test_devnet_4_nodes_finalize_and_faults) {
@@ -1272,6 +1297,45 @@ TEST(test_mainnet_bootstrap_with_genesis) {
   }, std::chrono::seconds(45)));
 
   ASSERT_TRUE(wait_for_same_tip(c.nodes, std::chrono::seconds(10)));
+}
+
+TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
+  const std::string base = "/tmp/selfcoin_it_single_node_bootstrap";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg;
+  cfg.node_id = 0;
+  cfg.disable_p2p = true;
+  cfg.dns_seeds = false;
+  cfg.listen = false;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+
+  ASSERT_TRUE(wait_for_tip(n, 1, std::chrono::seconds(10)));
+
+  const std::string key_path = keystore::default_validator_keystore_path(cfg.db_path);
+  keystore::ValidatorKey vk;
+  std::string err;
+  ASSERT_TRUE(keystore::load_validator_keystore(key_path, "", &vk, &err));
+
+  const auto active = n.active_validators_for_next_height_for_test();
+  ASSERT_EQ(active.size(), 1u);
+  ASSERT_EQ(active[0], vk.pubkey);
+  const auto committee = n.committee_for_next_height_for_test();
+  ASSERT_EQ(committee.size(), 1u);
+  ASSERT_EQ(committee[0], vk.pubkey);
+  ASSERT_EQ(n.quorum_threshold_for_next_height_for_test(), 1u);
+
+  n.stop();
 }
 
 TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {

@@ -18,7 +18,7 @@ LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-2}"
 NODE_PUBLIC="${NODE_PUBLIC:-1}"
 NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
-USE_SEEDS_JSON="${USE_SEEDS_JSON:-0}"
+USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
 
 log() { printf '[bootstrap] %s\n' "$*"; }
@@ -304,8 +304,10 @@ Type=simple
 User=${USER}
 WorkingDirectory=${ROOT_DIR}
 ExecStart=${exec_line}
-Restart=always
+Restart=on-failure
 RestartSec=2
+TimeoutStopSec=90
+KillSignal=SIGINT
 LimitNOFILE=65535
 
 [Install]
@@ -333,6 +335,11 @@ post_build_setup() {
     log "  GENESIS_BIN=${GENESIS_BIN}"
   elif [[ -f "${ROOT_DIR}/mainnet/genesis.bin" ]]; then
     log "  GENESIS_BIN=${ROOT_DIR}/mainnet/genesis.bin (auto-detected)"
+  fi
+  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
+    log "  Peer bootstrap=mainnet/SEEDS.json (default)"
+  else
+    log "  Peer bootstrap=network defaults / DNS seeds"
   fi
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"

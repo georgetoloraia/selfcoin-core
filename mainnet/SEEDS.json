@@ -1,18 +1,10 @@
 {
   "network": "mainnet",
   "seeds_p2p": [
-    "212.58.103.170:19440",
-    "seed1.gotdns.ch:19440",
-    "138.197.113.69:19440",
     "167.172.97.180:19440"
   ],
-  "lightservers_rpc": [
-    "http://167.172.97.180:19444/rpc",
-    "http://138.197.113.69:19444/rpc"
-  ],
+  "lightservers_rpc": [],
   "notes": [
-    "Seeds must be raw P2P endpoints on :19440.",
-    "Lightservers are RPC-only endpoints on :19444.",
-    "Do not put Cloudflare/nginx/TLS in front of P2P."
+    "Private bootstrap for this deployment."
   ]
 }

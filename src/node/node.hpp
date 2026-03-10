@@ -168,6 +168,7 @@ class Node {
   void broadcast_tx(const Tx& tx, int skip_peer_id = 0);
 
   bool persist_finalized_block(const Block& block, const FinalityCertificate& certificate);
+  bool init_local_validator_key();
   bool init_mainnet_genesis();
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);

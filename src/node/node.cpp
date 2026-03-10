@@ -286,6 +286,7 @@ bool Node::init() {
       .warmup_blocks = v4_warmup_blocks_,
       .cooldown_blocks = v4_cooldown_blocks_,
   });
+  if (!init_local_validator_key()) return false;
   p2p::AddrPolicy addr_policy;
   addr_policy.required_port = cfg_.network.p2p_default_port;
   addr_policy.reject_unroutable = true;
@@ -329,31 +330,7 @@ bool Node::init() {
              std::to_string(current_round_) + " tip=" + hex_encode32(finalized_hash_));
   }
 
-  {
-    const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
-                                                      ? keystore::default_validator_keystore_path(cfg_.db_path)
-                                                      : cfg_.validator_key_file);
-    keystore::ValidatorKey vk;
-    std::string kerr;
-    if (keystore::keystore_exists(key_path)) {
-      if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
-        std::cerr << "failed to load validator keystore: " << kerr << "\n";
-        return false;
-      }
-    } else {
-      if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
-                                               keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk,
-                                               &kerr)) {
-        std::cerr << "failed to create validator keystore: " << kerr << "\n";
-        return false;
-      }
-      log_line("created validator keystore path=" + key_path);
-    }
-    local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
-    local_key_.public_key = vk.pubkey;
-    log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
-    is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
-  }
+  is_validator_ = validators_.is_active_for_height(local_key_.public_key, finalized_height_ + 1);
 
   round_started_ms_ = now_unix() * 1000;
   last_finalized_progress_ms_ = now_unix() * 1000;
@@ -443,6 +420,31 @@ bool Node::init() {
     try_connect_bootstrap_peers();
   }
 
+  return true;
+}
+
+bool Node::init_local_validator_key() {
+  const std::string key_path = expand_user_home(cfg_.validator_key_file.empty()
+                                                    ? keystore::default_validator_keystore_path(cfg_.db_path)
+                                                    : cfg_.validator_key_file);
+  keystore::ValidatorKey vk;
+  std::string kerr;
+  if (keystore::keystore_exists(key_path)) {
+    if (!keystore::load_validator_keystore(key_path, cfg_.validator_passphrase, &vk, &kerr)) {
+      std::cerr << "failed to load validator keystore: " << kerr << "\n";
+      return false;
+    }
+  } else {
+    if (!keystore::create_validator_keystore(key_path, cfg_.validator_passphrase, cfg_.network.name,
+                                             keystore::hrp_for_network(cfg_.network.name), std::nullopt, &vk, &kerr)) {
+      std::cerr << "failed to create validator keystore: " << kerr << "\n";
+      return false;
+    }
+    log_line("created validator keystore path=" + key_path);
+  }
+  local_key_.private_key.assign(vk.privkey.begin(), vk.privkey.end());
+  local_key_.public_key = vk.pubkey;
+  log_line("validator pubkey=" + hex_encode(Bytes(vk.pubkey.begin(), vk.pubkey.end())) + " address=" + vk.address);
   return true;
 }
 
@@ -1628,6 +1630,13 @@ bool Node::init_mainnet_genesis() {
     std::cerr << "genesis load failed: " << err << "\n";
     return false;
   }
+  if (!use_embedded && doc->initial_validators.empty()) {
+    doc->initial_validators.push_back(local_key_.public_key);
+    doc->initial_active_set_size = 1;
+    log_line("bootstrap single-node genesis from local validator pubkey=" +
+             hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())));
+  }
+  if (!use_embedded) ghash = genesis::hash_doc(*doc);
   if (!genesis::validate_document(*doc, cfg_.network, &err, 1)) {
     std::cerr << "genesis validation failed: " << err << "\n";
     return false;
@@ -1647,6 +1656,10 @@ bool Node::init_mainnet_genesis() {
       std::cerr << "genesis mismatch against existing database\n";
       return false;
     }
+    if (!db_.get("G:J").has_value()) {
+      const auto json = genesis::to_json(*doc);
+      (void)db_.put("G:J", Bytes(json.begin(), json.end()));
+    }
     const auto tip = db_.get_tip();
     if (tip.has_value() && tip->height == 0 && tip->hash != gblock) {
       std::cerr << "genesis block id mismatch against existing database tip\n";
@@ -1657,6 +1670,10 @@ bool Node::init_mainnet_genesis() {
 
   if (!db_.put("G:", ghash_b)) return false;
   if (!db_.put("GB:", gblock_b)) return false;
+  {
+    const auto json = genesis::to_json(*doc);
+    if (!db_.put("G:J", Bytes(json.begin(), json.end()))) return false;
+  }
   auto tip = db_.get_tip();
   if (!tip.has_value()) {
     if (!db_.set_tip(storage::TipState{0, gblock})) return false;

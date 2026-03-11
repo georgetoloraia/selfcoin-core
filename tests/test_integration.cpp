@@ -474,6 +474,168 @@ std::optional<Block> find_block_with_tx(const std::string& db_path, const Hash32
   return std::nullopt;
 }
 
+std::optional<Block> load_block_at_height(const std::string& db_path, std::uint64_t height) {
+  storage::DB db;
+  if (!db.open_readonly(db_path) && !db.open(db_path)) return std::nullopt;
+  auto hh = db.get_height_hash(height);
+  if (!hh.has_value()) return std::nullopt;
+  auto bb = db.get_block(*hh);
+  if (!bb.has_value()) return std::nullopt;
+  return Block::parse(*bb);
+}
+
+std::optional<PubKey32> pubkey_from_hex32(const std::string& hex) {
+  auto b = hex_decode(hex);
+  if (!b.has_value() || b->size() != 32) return std::nullopt;
+  PubKey32 pub{};
+  std::copy(b->begin(), b->end(), pub.begin());
+  return pub;
+}
+
+struct OutOfOrderBlockSyncServer {
+  int fd{-1};
+  std::uint16_t port{0};
+  std::atomic<bool> running{false};
+  std::thread th;
+  NetworkConfig net{};
+  std::string genesis_hash;
+  Hash32 tip_hash{};
+  std::uint64_t tip_height{0};
+  PubKey32 bootstrap_pub{};
+  std::map<Hash32, Block> blocks;
+  mutable std::mutex mu;
+  std::vector<Hash32> requested_hashes;
+
+  bool start(const NetworkConfig& cfg, const std::string& genesis_hash_hex, const PubKey32& pub, std::uint64_t height,
+             const Hash32& hash, std::map<Hash32, Block> send_blocks) {
+    net = cfg;
+    genesis_hash = genesis_hash_hex;
+    bootstrap_pub = pub;
+    tip_height = height;
+    tip_hash = hash;
+    blocks = std::move(send_blocks);
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
+    if (::listen(fd, 8) != 0) return false;
+    sockaddr_in bound{};
+    socklen_t bl = sizeof(bound);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bl) != 0) return false;
+    port = ntohs(bound.sin_port);
+    running = true;
+    th = std::thread([this]() { run(); });
+    return true;
+  }
+
+  void stop() {
+    running = false;
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+      fd = -1;
+    }
+    if (th.joinable()) th.join();
+  }
+
+  std::vector<Hash32> requested_hashes_snapshot() const {
+    std::lock_guard<std::mutex> lk(mu);
+    return requested_hashes;
+  }
+
+  void run() {
+    sockaddr_in caddr{};
+    socklen_t len = sizeof(caddr);
+    const int cfd = ::accept(fd, reinterpret_cast<sockaddr*>(&caddr), &len);
+    if (cfd < 0) return;
+
+    bool sent_version = false;
+    bool sent_verack = false;
+    bool sent_tip = false;
+
+    while (running) {
+      p2p::FrameReadError ferr = p2p::FrameReadError::NONE;
+      auto frame = p2p::read_frame_fd_timed(cfd, net.max_payload_len, net.magic, net.protocol_version, 5000, 3000, &ferr);
+      if (!frame.has_value()) break;
+
+      switch (frame->msg_type) {
+        case p2p::MsgType::VERSION: {
+          auto v = p2p::de_version(frame->payload);
+          if (!v.has_value()) break;
+          if (!sent_version) {
+            p2p::VersionMsg reply;
+            reply.proto_version = static_cast<std::uint32_t>(net.protocol_version);
+            reply.network_id = net.network_id;
+            reply.feature_flags = net.feature_flags;
+            reply.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+            reply.nonce = 777001;
+            reply.start_height = tip_height;
+            reply.start_hash = tip_hash;
+            reply.node_software_version =
+                "selfcoin-tests/0.7;genesis=" + genesis_hash + ";network_id=" +
+                hex_encode(Bytes(net.network_id.begin(), net.network_id.end())) + ";cv=7;bootstrap_validator=" +
+                hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end())) + ";validator_pubkey=" +
+                hex_encode(Bytes(bootstrap_pub.begin(), bootstrap_pub.end()));
+            (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(reply)}, net.magic,
+                                      net.protocol_version);
+            sent_version = true;
+          }
+          break;
+        }
+        case p2p::MsgType::VERACK: {
+          if (!sent_verack) {
+            (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::VERACK, {}}, net.magic, net.protocol_version);
+            sent_verack = true;
+          }
+          if (!sent_tip) {
+            p2p::FinalizedTipMsg tip{tip_height, tip_hash};
+            (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip)}, net.magic,
+                                      net.protocol_version);
+            sent_tip = true;
+          }
+          break;
+        }
+        case p2p::MsgType::GETADDR: {
+          (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::ADDR, p2p::ser_addr(p2p::AddrMsg{})}, net.magic,
+                                    net.protocol_version);
+          break;
+        }
+        case p2p::MsgType::GET_FINALIZED_TIP: {
+          p2p::FinalizedTipMsg tip{tip_height, tip_hash};
+          (void)p2p::write_frame_fd(cfd, p2p::Frame{p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip)}, net.magic,
+                                    net.protocol_version);
+          sent_tip = true;
+          break;
+        }
+        case p2p::MsgType::GET_BLOCK: {
+          auto gb = p2p::de_get_block(frame->payload);
+          if (!gb.has_value()) break;
+          {
+            std::lock_guard<std::mutex> lk(mu);
+            requested_hashes.push_back(gb->hash);
+          }
+          auto it = blocks.find(gb->hash);
+          if (it == blocks.end()) break;
+          (void)p2p::write_frame_fd(cfd,
+                                    p2p::Frame{p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{it->second.serialize()})},
+                                    net.magic, net.protocol_version);
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    ::shutdown(cfd, SHUT_RDWR);
+    ::close(cfd);
+  }
+};
+
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators = 4) {
   const auto keys = node::Node::deterministic_test_keypairs();
   if (keys.size() < n_validators) return false;
@@ -1509,6 +1671,217 @@ TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
   bootstrap.stop();
 }
 
+TEST(test_follower_connected_before_bootstrap_self_binding_adopts_and_catches_up) {
+  const std::string base = "/tmp/selfcoin_it_early_follower_bootstrap";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.node_id = 0;
+  bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.db_path = base + "/bootstrap";
+  bootstrap_cfg.p2p_port = reserve_test_port();
+  if (bootstrap_cfg.p2p_port == 0) return;
+  bootstrap_cfg.genesis_path = gpath;
+  bootstrap_cfg.allow_unsafe_genesis_override = true;
+
+  node::Node bootstrap(bootstrap_cfg);
+  if (!bootstrap.init()) return;
+  bootstrap.start();
+  bootstrap.pause_proposals_for_test(true);
+  const auto port0 = bootstrap.p2p_port_for_test();
+  if (port0 == 0) {
+    bootstrap.stop();
+    return;
+  }
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 1;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  if (follower_cfg.p2p_port == 0) {
+    bootstrap.stop();
+    return;
+  }
+  follower_cfg.genesis_path = gpath;
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  node::Node follower(follower_cfg);
+  if (!follower.init()) {
+    bootstrap.stop();
+    return;
+  }
+  follower.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = bootstrap.status();
+    const auto s1 = follower.status();
+    return s0.established_peers >= 1 && s1.established_peers >= 1;
+  }, std::chrono::seconds(8)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = bootstrap.status();
+    const auto s1 = follower.status();
+    return s0.height == 0 && !s0.bootstrap_validator_pubkey.empty() &&
+           s1.height == 0 && s1.bootstrap_validator_pubkey == s0.bootstrap_validator_pubkey;
+  }, std::chrono::seconds(10)));
+
+  const auto active1 = follower.active_validators_for_next_height_for_test();
+  ASSERT_EQ(active1.size(), 1u);
+
+  bootstrap.pause_proposals_for_test(false);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = bootstrap.status();
+    const auto s1 = follower.status();
+    return s0.height >= 1 && s1.height >= 1 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(20)));
+
+  follower.stop();
+  bootstrap.stop();
+}
+
+TEST(test_adopted_bootstrap_identity_persists_across_restart_before_first_block) {
+  const std::string base = "/tmp/selfcoin_it_bootstrap_identity_restart";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.node_id = 0;
+  bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.db_path = base + "/bootstrap";
+  bootstrap_cfg.p2p_port = reserve_test_port();
+  if (bootstrap_cfg.p2p_port == 0) return;
+  bootstrap_cfg.genesis_path = gpath;
+  bootstrap_cfg.allow_unsafe_genesis_override = true;
+
+  node::Node bootstrap(bootstrap_cfg);
+  if (!bootstrap.init()) return;
+  bootstrap.start();
+  bootstrap.pause_proposals_for_test(true);
+  const auto port0 = bootstrap.p2p_port_for_test();
+  if (port0 == 0) {
+    bootstrap.stop();
+    return;
+  }
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 1;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  if (follower_cfg.p2p_port == 0) {
+    bootstrap.stop();
+    return;
+  }
+  follower_cfg.genesis_path = gpath;
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  {
+    node::Node follower(follower_cfg);
+    if (!follower.init()) {
+      bootstrap.stop();
+      return;
+    }
+    follower.start();
+
+    ASSERT_TRUE(wait_for([&]() {
+      const auto s0 = bootstrap.status();
+      const auto s1 = follower.status();
+      return s0.established_peers >= 1 && s1.established_peers >= 1;
+    }, std::chrono::seconds(8)));
+
+    ASSERT_TRUE(wait_for([&]() {
+      const auto s0 = bootstrap.status();
+      const auto s1 = follower.status();
+      return s0.height == 0 && !s0.bootstrap_validator_pubkey.empty() &&
+             s1.height == 0 && s1.bootstrap_validator_pubkey == s0.bootstrap_validator_pubkey;
+    }, std::chrono::seconds(10)));
+  }
+
+  node::Node restarted(follower_cfg);
+  ASSERT_TRUE(restarted.init());
+  const auto persisted = restarted.status();
+  ASSERT_EQ(persisted.height, 0u);
+  ASSERT_EQ(persisted.bootstrap_validator_pubkey, bootstrap.status().bootstrap_validator_pubkey);
+  ASSERT_EQ(restarted.active_validators_for_next_height_for_test().size(), 1u);
+
+  restarted.start();
+  bootstrap.pause_proposals_for_test(false);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = bootstrap.status();
+    const auto s1 = restarted.status();
+    return s0.height >= 1 && s1.height >= 1 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(20)));
+
+  restarted.stop();
+  bootstrap.stop();
+}
+
+TEST(test_height_zero_bootstrap_adoption_rejects_non_explicit_fallback_path) {
+  const std::string base = "/tmp/selfcoin_it_height0_fallback_rejected";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.node_id = 0;
+  bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.db_path = base + "/bootstrap";
+  bootstrap_cfg.p2p_port = reserve_test_port();
+  if (bootstrap_cfg.p2p_port == 0) return;
+  bootstrap_cfg.genesis_path = gpath;
+  bootstrap_cfg.allow_unsafe_genesis_override = true;
+  bootstrap_cfg.peers = {"127.0.0.1:1"};
+
+  node::Node bootstrap(bootstrap_cfg);
+  if (!bootstrap.init()) return;
+  bootstrap.start();
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 1;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  if (follower_cfg.p2p_port == 0) {
+    bootstrap.stop();
+    return;
+  }
+  follower_cfg.genesis_path = gpath;
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(bootstrap_cfg.p2p_port)};
+
+  node::Node follower(follower_cfg);
+  if (!follower.init()) {
+    bootstrap.stop();
+    return;
+  }
+  follower.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = bootstrap.status();
+    const auto s1 = follower.status();
+    return s0.established_peers >= 1 && s1.established_peers >= 1;
+  }, std::chrono::seconds(8)));
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  const auto s = follower.status();
+  ASSERT_TRUE(s.bootstrap_template_mode);
+  ASSERT_TRUE(s.bootstrap_validator_pubkey.empty());
+  ASSERT_EQ(s.height, 0u);
+  ASSERT_EQ(follower.active_validators_for_next_height_for_test().size(), 0u);
+
+  follower.stop();
+  bootstrap.stop();
+}
+
 TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   const std::string base = "/tmp/selfcoin_it_single_node_sync_join";
   std::filesystem::remove_all(base);
@@ -1638,6 +2011,10 @@ TEST(test_second_node_auto_joins_as_validator_on_chain) {
     const auto s1 = n1.status();
     return s0.height == s1.height && s0.tip_hash == s1.tip_hash && s0.height >= 120;
   }, std::chrono::seconds(20)));
+  const auto s0 = n0.status();
+  const auto s1 = n1.status();
+  ASSERT_TRUE(!s0.bootstrap_validator_pubkey.empty());
+  ASSERT_EQ(s1.bootstrap_validator_pubkey, s0.bootstrap_validator_pubkey);
 
   n1.stop();
   n0.stop();
@@ -1754,8 +2131,91 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
     return s0.height >= 12 && s1.height >= 12 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
   }, std::chrono::seconds(25)));
 
+  const auto s0 = n0.status();
+  const auto s1 = n1.status();
+  ASSERT_TRUE(!s0.bootstrap_validator_pubkey.empty());
+  ASSERT_EQ(s1.bootstrap_validator_pubkey, s0.bootstrap_validator_pubkey);
+  ASSERT_EQ(n1.active_validators_for_next_height_for_test().size(), 1u);
+
   n1.stop();
   n0.stop();
+}
+
+TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descendants) {
+  const std::string base = "/tmp/selfcoin_it_out_of_order_block_sync";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.node_id = 0;
+  bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.db_path = base + "/bootstrap";
+  bootstrap_cfg.p2p_port = reserve_test_port();
+  if (bootstrap_cfg.p2p_port == 0) return;
+  bootstrap_cfg.genesis_path = gpath;
+  bootstrap_cfg.allow_unsafe_genesis_override = true;
+
+  node::Node bootstrap(bootstrap_cfg);
+  if (!bootstrap.init()) return;
+  bootstrap.start();
+  ASSERT_TRUE(wait_for_tip(bootstrap, 3, std::chrono::seconds(15)));
+
+  const auto bootstrap_status = bootstrap.status();
+  auto bootstrap_pub = pubkey_from_hex32(bootstrap_status.bootstrap_validator_pubkey);
+  ASSERT_TRUE(bootstrap_pub.has_value());
+  auto b1 = load_block_at_height(bootstrap_cfg.db_path, 1);
+  auto b2 = load_block_at_height(bootstrap_cfg.db_path, 2);
+  auto b3 = load_block_at_height(bootstrap_cfg.db_path, 3);
+  ASSERT_TRUE(b1.has_value());
+  ASSERT_TRUE(b2.has_value());
+  ASSERT_TRUE(b3.has_value());
+
+  OutOfOrderBlockSyncServer server;
+  std::map<Hash32, Block> blocks;
+  blocks.emplace(b1->header.block_id(), *b1);
+  blocks.emplace(b2->header.block_id(), *b2);
+  blocks.emplace(b3->header.block_id(), *b3);
+  ASSERT_TRUE(server.start(bootstrap_cfg.network, bootstrap_status.genesis_hash, *bootstrap_pub, 3, b3->header.block_id(),
+                           std::move(blocks)));
+
+  bootstrap.stop();
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 1;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  if (follower_cfg.p2p_port == 0) {
+    server.stop();
+    return;
+  }
+  follower_cfg.genesis_path = gpath;
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.peers = {"127.0.0.1:" + std::to_string(server.port)};
+
+  node::Node follower(follower_cfg);
+  if (!follower.init()) {
+    server.stop();
+    return;
+  }
+  follower.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s = follower.status();
+    return s.height >= 3 && s.tip_hash == b3->header.block_id();
+  }, std::chrono::seconds(20)));
+
+  follower.stop();
+  server.stop();
+
+  const auto requested = server.requested_hashes_snapshot();
+  ASSERT_TRUE(requested.size() >= 3u);
+  ASSERT_EQ(requested[0], b3->header.block_id());
+  ASSERT_EQ(requested[1], b2->header.block_id());
+  ASSERT_EQ(requested[2], b1->header.block_id());
+  ASSERT_EQ(follower.active_validators_for_next_height_for_test().size(), 1u);
 }
 
 TEST(test_reject_cross_network_mainnet_vs_testnet_handshake) {

@@ -95,7 +95,8 @@ For the current public bootstrap-template flow:
 - all nodes must use the same `mainnet/genesis.bin`
 - `mainnet/SEEDS.json` should contain only real live bootstrap P2P endpoints
 - a fresh joining node should start with an empty `~/.selfcoin/mainnet` so it can adopt the running chain cleanly
-- only the first node self-bootstraps; later nodes are expected to sync from the live network and become validators only through the on-chain sponsored join path
+- only a node started without configured bootstrap peers/seeds can self-bootstrap; seeded nodes wait for the existing network instead of forking themselves
+- later nodes are expected to sync from the live network and become validators only through the on-chain sponsored join path
 
 ### 2) Manual build
 ```bash

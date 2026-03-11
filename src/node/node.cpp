@@ -1119,6 +1119,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   if (msg_type == p2p::MsgType::VERACK) {
     p2p_.mark_handshake_rx(peer_id, false, true);
     maybe_request_getaddr(peer_id);
+    request_finalized_tip(peer_id);
     auto pi = p2p_.get_peer_info(peer_id);
     auto na = addrman_address_for_peer(pi);
     if (na.has_value()) {
@@ -2430,6 +2431,11 @@ void Node::maybe_request_getaddr(int peer_id) {
   std::lock_guard<std::mutex> lk(mu_);
   if (!getaddr_requested_peers_.insert(peer_id).second) return;
   (void)p2p_.send_to(peer_id, p2p::MsgType::GETADDR, p2p::ser_getaddr(p2p::GetAddrMsg{}), true);
+}
+
+void Node::request_finalized_tip(int peer_id) {
+  (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP,
+                     p2p::ser_finalized_tip(p2p::FinalizedTipMsg{}), true);
 }
 
 bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {

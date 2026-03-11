@@ -194,6 +194,8 @@ class Node {
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
   void request_finalized_tip(int peer_id);
+  void maybe_request_sync_parent_locked(int peer_id, const Block& blk);
+  void maybe_apply_buffered_sync_blocks_locked();
   std::size_t peer_count() const;
   std::size_t established_peer_count() const;
   std::size_t outbound_peer_count() const;
@@ -242,6 +244,8 @@ class Node {
   std::map<int, p2p::TokenBucket> vote_verify_buckets_;
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
+  std::map<Hash32, Block> buffered_sync_blocks_;
+  std::set<Hash32> requested_sync_blocks_;
   std::map<int, std::string> peer_ip_cache_;
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::map<std::string, std::uint64_t> addr_drop_log_ms_;

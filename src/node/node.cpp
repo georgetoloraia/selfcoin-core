@@ -1200,6 +1200,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         return;
       }
       std::lock_guard<std::mutex> lk(mu_);
+      if (blk->header.height > finalized_height_ + 1 || blk->header.prev_finalized_hash != finalized_hash_) {
+        buffered_sync_blocks_[blk->header.block_id()] = *blk;
+        accepted_block_payloads_.insert(payload_id);
+        maybe_request_sync_parent_locked(peer_id, *blk);
+        maybe_apply_buffered_sync_blocks_locked();
+        return;
+      }
       if (blk->header.height == finalized_height_ + 1 && blk->header.prev_finalized_hash == finalized_hash_) {
         if (candidate_blocks_.size() >= kMaxCandidateBlocks ||
             (candidate_block_sizes_.size() >= kMaxCandidateBlocks &&
@@ -1258,6 +1265,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             votes_.clear_height(blk->header.height);
             candidate_blocks_.clear();
             candidate_block_sizes_.clear();
+            requested_sync_blocks_.erase(bid);
+            maybe_apply_buffered_sync_blocks_locked();
           }
         } else {
           candidate_blocks_[bid] = *blk;
@@ -2445,6 +2454,74 @@ void Node::maybe_request_getaddr(int peer_id) {
 void Node::request_finalized_tip(int peer_id) {
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP,
                      p2p::ser_finalized_tip(p2p::FinalizedTipMsg{}), true);
+}
+
+void Node::maybe_request_sync_parent_locked(int peer_id, const Block& blk) {
+  if (blk.header.height <= finalized_height_ + 1) return;
+  if (blk.header.prev_finalized_hash == finalized_hash_) return;
+  if (db_.get_block(blk.header.prev_finalized_hash).has_value()) return;
+  if (!requested_sync_blocks_.insert(blk.header.prev_finalized_hash).second) return;
+  (void)p2p_.send_to(peer_id, p2p::MsgType::GET_BLOCK,
+                     p2p::ser_get_block(p2p::GetBlockMsg{blk.header.prev_finalized_hash}), true);
+}
+
+void Node::maybe_apply_buffered_sync_blocks_locked() {
+  for (;;) {
+    bool advanced = false;
+    for (auto it = buffered_sync_blocks_.begin(); it != buffered_sync_blocks_.end(); ++it) {
+      const auto& blk = it->second;
+      if (blk.header.height != finalized_height_ + 1 || blk.header.prev_finalized_hash != finalized_hash_) continue;
+
+      const auto bid = blk.header.block_id();
+      std::set<PubKey32> committee_set;
+      const auto committee = committee_for_height_round(blk.header.height, blk.header.round);
+      if (committee.empty()) continue;
+      const std::size_t quorum = consensus::quorum_threshold(committee.size());
+      committee_set.insert(committee.begin(), committee.end());
+      std::set<PubKey32> seen;
+      std::size_t valid_sigs = 0;
+      std::vector<FinalitySig> filtered_sigs;
+      filtered_sigs.reserve(blk.finality_proof.sigs.size());
+      for (const auto& s : blk.finality_proof.sigs) {
+        if (committee_set.find(s.validator_pubkey) == committee_set.end()) continue;
+        if (!seen.insert(s.validator_pubkey).second) continue;
+        Bytes bid_bytes(bid.begin(), bid.end());
+        if (!crypto::ed25519_verify(bid_bytes, s.signature, s.validator_pubkey)) continue;
+        ++valid_sigs;
+        filtered_sigs.push_back(s);
+      }
+      if (valid_sigs < quorum) continue;
+      if (!validate_v4_registration_rules(blk, blk.header.height)) continue;
+
+      const FinalityCertificate certificate =
+          make_finality_certificate(blk.header.height, blk.header.round, bid, quorum, committee, filtered_sigs);
+      if (!persist_finalized_block(blk, certificate)) continue;
+
+      std::vector<Hash32> confirmed_txids;
+      confirmed_txids.reserve(blk.txs.size());
+      for (const auto& tx : blk.txs) confirmed_txids.push_back(tx.txid());
+      mempool_.remove_confirmed(confirmed_txids);
+      UtxoSet pre_utxos = utxos_;
+      update_v4_liveness_from_finality(blk.header.height, blk.header.round, filtered_sigs);
+      apply_validator_state_changes(blk, pre_utxos, blk.header.height);
+      apply_block_to_utxo(blk, utxos_);
+      mempool_.prune_against_utxo(utxos_);
+      finalized_height_ = blk.header.height;
+      finalized_hash_ = bid;
+      (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
+      last_finalized_progress_ms_ = now_unix() * 1000;
+      current_round_ = 0;
+      round_started_ms_ = now_unix() * 1000;
+      votes_.clear_height(blk.header.height);
+      candidate_blocks_.clear();
+      candidate_block_sizes_.clear();
+      requested_sync_blocks_.erase(bid);
+      buffered_sync_blocks_.erase(it);
+      advanced = true;
+      break;
+    }
+    if (!advanced) break;
+  }
 }
 
 bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {

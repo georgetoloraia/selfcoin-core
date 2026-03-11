@@ -178,6 +178,7 @@ class Node {
                                                  const char* source);
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
   std::optional<Tx> build_bootstrap_validator_join_tx(const PubKey32& pub) const;
+  bool bootstrap_joiner_ready_locked(const PubKey32& pub) const;
   void maybe_submit_bootstrap_join();
   bool init_mainnet_genesis();
   bool load_state();

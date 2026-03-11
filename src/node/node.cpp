@@ -51,6 +51,35 @@ std::string short_hash_hex(const Hash32& h) {
   return hex_encode(b);
 }
 
+const char* msg_type_name(std::uint16_t msg_type) {
+  switch (msg_type) {
+    case p2p::MsgType::VERSION:
+      return "VERSION";
+    case p2p::MsgType::VERACK:
+      return "VERACK";
+    case p2p::MsgType::GET_FINALIZED_TIP:
+      return "GET_FINALIZED_TIP";
+    case p2p::MsgType::FINALIZED_TIP:
+      return "FINALIZED_TIP";
+    case p2p::MsgType::PROPOSE:
+      return "PROPOSE";
+    case p2p::MsgType::VOTE:
+      return "VOTE";
+    case p2p::MsgType::GET_BLOCK:
+      return "GET_BLOCK";
+    case p2p::MsgType::BLOCK:
+      return "BLOCK";
+    case p2p::MsgType::TX:
+      return "TX";
+    case p2p::MsgType::GETADDR:
+      return "GETADDR";
+    case p2p::MsgType::ADDR:
+      return "ADDR";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 bool restart_debug_enabled() {
   const char* v = std::getenv("SELFCOIN_RESTART_DEBUG");
   if (!v) return false;
@@ -364,15 +393,20 @@ bool Node::init() {
           std::lock_guard<std::mutex> lk(mu_);
           peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
         }
+        const auto info = p2p_.get_peer_info(peer_id);
+        log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
+                 " endpoint=" + detail);
         if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
           p2p_.disconnect_peer(peer_id);
           return;
         }
-        auto info = p2p_.get_peer_info(peer_id);
         if (!info.version_tx) send_version(peer_id);
         return;
       }
       if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {
+        const auto info = p2p_.get_peer_info(peer_id);
+        log_line("peer-disconnected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
+                 " detail=" + detail);
         std::lock_guard<std::mutex> lk(mu_);
         peer_ip_cache_.erase(peer_id);
         peer_validator_pubkeys_.erase(peer_id);
@@ -415,6 +449,9 @@ bool Node::init() {
                  type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
         const auto pi = p2p_.get_peer_info(peer_id);
         const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
+        log_line("peer-timeout peer_id=" + std::to_string(peer_id) + " dir=" + (pi.inbound ? "inbound" : "outbound") +
+                 " endpoint=" + pi.endpoint + " detail=" + detail + " stage=" +
+                 (type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT ? "handshake" : "frame"));
         if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && is_bootstrap_peer_ip(ip)) {
           log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
           return;
@@ -507,14 +544,43 @@ bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32
                                                      const char* source) {
   const auto info = p2p_.get_peer_info(peer_id);
   const std::string ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
-  if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return false;
-  if (finalized_height_ != 0) return false;
-  if (!validators_.active_sorted(1).empty()) return false;
-  if (!is_bootstrap_peer_ip(ip)) return false;
-  if (peer_height == 0) return false;
-  if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) return false;
+  // Trust boundary: height-0 bootstrap adoption is only allowed from an explicitly
+  // configured bootstrap peer that advertises bootstrap_validator in VERSION.
+  const bool explicit_bootstrap_advertisement = std::string(source) == "version-bootstrap";
+  if (!bootstrap_template_mode_) return false;
+  if (bootstrap_validator_pubkey_.has_value()) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=already-bound");
+    return false;
+  }
+  if (finalized_height_ != 0) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=already-synced height=" + std::to_string(finalized_height_));
+    return false;
+  }
+  if (!validators_.active_sorted(1).empty()) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=validators-present");
+    return false;
+  }
+  if (!is_bootstrap_peer_ip(ip)) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=peer-not-bootstrap ip=" + ip);
+    return false;
+  }
+  if (peer_height == 0 && !explicit_bootstrap_advertisement) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=peer-height-zero");
+    return false;
+  }
+  if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) {
+    log_line("bootstrap-adopt-skip peer_id=" + std::to_string(peer_id) + " source=" + source +
+             " reason=bind-failed");
+    return false;
+  }
   log_line(std::string("adopted bootstrap validator from peer pubkey=") +
-           hex_encode(Bytes(pub.begin(), pub.end())) + " source=" + source);
+           hex_encode(Bytes(pub.begin(), pub.end())) + " source=" + source + " peer_id=" + std::to_string(peer_id) +
+           " peer_height=" + std::to_string(peer_height));
   return true;
 }
 
@@ -524,12 +590,16 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   if (!validators_.active_sorted(1).empty()) return;
   const bool has_bootstrap_sources = !cfg_.disable_p2p && (!bootstrap_peers_.empty() || !dns_seed_peers_.empty());
   if (has_bootstrap_sources) return;
-  if (established_peer_count() != 0) return;
   const std::uint64_t wait_ms = 5000ULL;
   if (now_ms < startup_ms_ + wait_ms) return;
   if (bootstrap_template_bind_validator(local_key_.public_key, true)) {
     log_line("bootstrap single-node genesis from local validator pubkey=" +
              hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end())));
+    if (!cfg_.disable_p2p) {
+      // Safe: duplicate VERSION handling is idempotent and is used here to refresh
+      // already-connected peers with the newly-bound bootstrap validator identity.
+      for (int peer_id : p2p_.peer_ids()) send_version(peer_id);
+    }
   }
 }
 
@@ -583,6 +653,18 @@ std::optional<Tx> Node::build_bootstrap_validator_join_tx(const PubKey32& pub) c
   return tx;
 }
 
+bool Node::bootstrap_joiner_ready_locked(const PubKey32& pub) const {
+  for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
+    if (peer_pub != pub) continue;
+    const auto tip_it = peer_finalized_tips_.find(peer_id);
+    if (tip_it == peer_finalized_tips_.end()) continue;
+    if (tip_it->second.height != finalized_height_ || tip_it->second.hash != finalized_hash_) continue;
+    if (!p2p_.get_peer_info(peer_id).established()) continue;
+    return true;
+  }
+  return false;
+}
+
 void Node::maybe_submit_bootstrap_join() {
   PubKey32 target{};
   bool have_target = false;
@@ -596,17 +678,7 @@ void Node::maybe_submit_bootstrap_join() {
       if (pub == local_key_.public_key) continue;
       if (sponsored_bootstrap_joiners_.find(pub) != sponsored_bootstrap_joiners_.end()) continue;
       if (validators_.get(pub).has_value()) continue;
-      bool ready = false;
-      for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
-        if (peer_pub != pub) continue;
-        const auto tip_it = peer_finalized_tips_.find(peer_id);
-        if (tip_it == peer_finalized_tips_.end()) continue;
-        if (tip_it->second.height != finalized_height_ || tip_it->second.hash != finalized_hash_) continue;
-        if (!p2p_.get_peer_info(peer_id).established()) continue;
-        ready = true;
-        break;
-      }
-      if (!ready) continue;
+      if (!bootstrap_joiner_ready_locked(pub)) continue;
       target = pub;
       have_target = true;
       break;
@@ -954,8 +1026,8 @@ void Node::event_loop() {
           std::cout << j.str() << "\n";
         } else {
           std::cout << cfg_.network.name << " h=" << finalized_height_ << " tip=" << short_hash_hex(finalized_hash_)
-                    << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8)
-                    << " peers=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
+                    << " gen=" << chain_id_.genesis_hash_hex.substr(0, 8) << " peers=" << peer_count()
+                    << " outbound=" << (cfg_.disable_p2p ? peer_count() : p2p_.outbound_count()) << "/"
                     << cfg_.outbound_target << " inbound=" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
                     << " established=" << established_peer_count() << " addrman=" << addrman_.size()
                     << " cv=" << kFixedValidationRulesVersion << " state=" << state;
@@ -1078,6 +1150,11 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-version");
       return;
     }
+    // Duplicate VERSION on an established connection is intentional in bootstrap-template
+    // mode: after self-bootstrap, the node refreshes peer metadata with the bound
+    // bootstrap validator identity. This handler keeps VERSION processing idempotent.
+    log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+             " start_height=" + std::to_string(v->start_height) + " start_hash=" + short_hash_hex(v->start_hash));
     if (v->network_id != cfg_.network.network_id) {
       {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1153,6 +1230,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   }
 
   if (msg_type == p2p::MsgType::VERACK) {
+    log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
     p2p_.mark_handshake_rx(peer_id, false, true);
     maybe_request_getaddr(peer_id);
     send_finalized_tip(peer_id);
@@ -1181,6 +1259,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   switch (msg_type) {
     case p2p::MsgType::GET_FINALIZED_TIP: {
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
       p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
       (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
       break;
@@ -1191,6 +1270,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
         return;
       }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(tip->height) + " hash=" + short_hash_hex(tip->hash));
       {
         std::lock_guard<std::mutex> lk(mu_);
         peer_finalized_tips_[peer_id] = *tip;
@@ -1203,6 +1284,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         }
       }
       if (tip->height > finalized_height_) {
+        log_line("request-sync-tip-block peer_id=" + std::to_string(peer_id) + " remote_height=" +
+                 std::to_string(tip->height) + " remote_hash=" + short_hash_hex(tip->hash));
         auto req = p2p::GetBlockMsg{tip->hash};
         (void)p2p_.send_to(peer_id, p2p::MsgType::GET_BLOCK, p2p::ser_get_block(req));
       }
@@ -1214,6 +1297,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-get-block");
         return;
       }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " hash=" + short_hash_hex(gb->hash));
       auto blk = db_.get_block(gb->hash);
       if (!blk.has_value()) return;
       (void)p2p_.send_to(peer_id, p2p::MsgType::BLOCK, p2p::ser_block(p2p::BlockMsg{*blk}), true);
@@ -1238,10 +1323,16 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-block-parse");
         return;
       }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(blk->header.height) + " hash=" + short_hash_hex(blk->header.block_id()) +
+               " prev=" + short_hash_hex(blk->header.prev_finalized_hash));
       std::lock_guard<std::mutex> lk(mu_);
       if (blk->header.height > finalized_height_ + 1 || blk->header.prev_finalized_hash != finalized_hash_) {
         buffered_sync_blocks_[blk->header.block_id()] = *blk;
         accepted_block_payloads_.insert(payload_id);
+        log_line("buffer-sync-block peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(blk->header.height) +
+                 " hash=" + short_hash_hex(blk->header.block_id()) + " local_height=" +
+                 std::to_string(finalized_height_) + " local_tip=" + short_hash_hex(finalized_hash_));
         maybe_request_sync_parent_locked(peer_id, *blk);
         maybe_apply_buffered_sync_blocks_locked();
         return;
@@ -1324,6 +1415,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-propose-msg");
         return;
       }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round));
       {
         std::lock_guard<std::mutex> lk(mu_);
         if (accepted_propose_payloads_.contains(payload_id)) return;
@@ -1346,6 +1439,9 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-vote-msg");
         return;
       }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round) +
+               " block=" + short_hash_hex(v->vote.block_id));
       if (!handle_vote(v->vote, true, peer_id, v->vrf_proof, v->vrf_proof.empty() ? nullptr : &v->vrf_output)) {
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);
@@ -2493,12 +2589,16 @@ void Node::maybe_request_getaddr(int peer_id) {
 }
 
 void Node::request_finalized_tip(int peer_id) {
+  log_line("request-finalized-tip peer_id=" + std::to_string(peer_id) + " local_height=" + std::to_string(finalized_height_) +
+           " local_tip=" + short_hash_hex(finalized_hash_));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_FINALIZED_TIP,
                      p2p::ser_finalized_tip(p2p::FinalizedTipMsg{}), true);
 }
 
 void Node::send_finalized_tip(int peer_id) {
   p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
+  log_line("send-finalized-tip peer_id=" + std::to_string(peer_id) + " height=" + std::to_string(tip.height) +
+           " hash=" + short_hash_hex(tip.hash));
   (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip), true);
 }
 
@@ -2515,8 +2615,20 @@ void Node::broadcast_finalized_tip() {
 void Node::maybe_request_sync_parent_locked(int peer_id, const Block& blk) {
   if (blk.header.height <= finalized_height_ + 1) return;
   if (blk.header.prev_finalized_hash == finalized_hash_) return;
-  if (db_.get_block(blk.header.prev_finalized_hash).has_value()) return;
-  if (!requested_sync_blocks_.insert(blk.header.prev_finalized_hash).second) return;
+  if (db_.get_block(blk.header.prev_finalized_hash).has_value()) {
+    log_line("sync-parent-skip peer_id=" + std::to_string(peer_id) + " child_height=" +
+             std::to_string(blk.header.height) + " reason=parent-already-present parent=" +
+             short_hash_hex(blk.header.prev_finalized_hash));
+    return;
+  }
+  if (!requested_sync_blocks_.insert(blk.header.prev_finalized_hash).second) {
+    log_line("sync-parent-skip peer_id=" + std::to_string(peer_id) + " child_height=" +
+             std::to_string(blk.header.height) + " reason=already-requested parent=" +
+             short_hash_hex(blk.header.prev_finalized_hash));
+    return;
+  }
+  log_line("request-sync-parent peer_id=" + std::to_string(peer_id) + " child_height=" +
+           std::to_string(blk.header.height) + " parent=" + short_hash_hex(blk.header.prev_finalized_hash));
   (void)p2p_.send_to(peer_id, p2p::MsgType::GET_BLOCK,
                      p2p::ser_get_block(p2p::GetBlockMsg{blk.header.prev_finalized_hash}), true);
 }
@@ -2531,7 +2643,11 @@ void Node::maybe_apply_buffered_sync_blocks_locked() {
       const auto bid = blk.header.block_id();
       std::set<PubKey32> committee_set;
       const auto committee = committee_for_height_round(blk.header.height, blk.header.round);
-      if (committee.empty()) continue;
+      if (committee.empty()) {
+        log_line("buffered-sync-skip height=" + std::to_string(blk.header.height) + " hash=" + short_hash_hex(bid) +
+                 " reason=empty-committee");
+        continue;
+      }
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
       committee_set.insert(committee.begin(), committee.end());
       std::set<PubKey32> seen;
@@ -2546,12 +2662,25 @@ void Node::maybe_apply_buffered_sync_blocks_locked() {
         ++valid_sigs;
         filtered_sigs.push_back(s);
       }
-      if (valid_sigs < quorum) continue;
-      if (!validate_v4_registration_rules(blk, blk.header.height)) continue;
+      if (valid_sigs < quorum) {
+        log_line("buffered-sync-skip height=" + std::to_string(blk.header.height) + " hash=" + short_hash_hex(bid) +
+                 " reason=insufficient-finality valid=" + std::to_string(valid_sigs) +
+                 " quorum=" + std::to_string(quorum));
+        continue;
+      }
+      if (!validate_v4_registration_rules(blk, blk.header.height)) {
+        log_line("buffered-sync-skip height=" + std::to_string(blk.header.height) + " hash=" + short_hash_hex(bid) +
+                 " reason=v4-registration-rules");
+        continue;
+      }
 
       const FinalityCertificate certificate =
           make_finality_certificate(blk.header.height, blk.header.round, bid, quorum, committee, filtered_sigs);
-      if (!persist_finalized_block(blk, certificate)) continue;
+      if (!persist_finalized_block(blk, certificate)) {
+        log_line("buffered-sync-skip height=" + std::to_string(blk.header.height) + " hash=" + short_hash_hex(bid) +
+                 " reason=persist-failed");
+        continue;
+      }
 
       std::vector<Hash32> confirmed_txids;
       confirmed_txids.reserve(blk.txs.size());
@@ -2573,6 +2702,7 @@ void Node::maybe_apply_buffered_sync_blocks_locked() {
       candidate_block_sizes_.clear();
       requested_sync_blocks_.erase(bid);
       buffered_sync_blocks_.erase(it);
+      log_line("buffered-sync-applied height=" + std::to_string(finalized_height_) + " hash=" + short_hash_hex(bid));
       broadcast_finalized_tip();
       advanced = true;
       break;

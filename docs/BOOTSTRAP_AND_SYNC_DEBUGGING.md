@@ -220,10 +220,20 @@ These are the best “intended behavior” references for bootstrap-template mod
 
 ## 9. Open questions to recheck directly in code
 
-- Does every established bootstrap peer always get `GET_FINALIZED_TIP`, or are there branches where the request can be skipped?
-- Is bootstrap validator adoption guaranteed from `VERSION` metadata alone, or does current behavior rely on later `FINALIZED_TIP`/peer-state metadata too?
-- Are there any remaining circular dependencies between “synced enough to sponsor” and “needs sponsored validator state to progress”?
-- Are any summary counters mixing live peer status and historical session state in a way that can mislead debugging?
+Current answers from the code path in [src/node/node.cpp](./../src/node/node.cpp):
+
+- every peer that reaches `VERACK` is sent `FINALIZED_TIP` and is also asked for `GET_FINALIZED_TIP`
+- bootstrap validator adoption can happen from `VERSION` metadata, with a fallback retry on later `FINALIZED_TIP`
+- sponsored join still waits for a peer claiming the joiner pubkey to be established and at the same finalized tip as the sponsor, which avoids sponsoring a clearly-unsynced joiner
+- plain-text runtime summary now treats `peers` as total live peers and reports outbound separately as `outbound=x/target`, so the counters line up with the debugging checklist
+
+Useful new runtime logs now exist at the critical decision points:
+
+- peer connect/disconnect and timeout reasons
+- bootstrap validator adoption success and skip reasons
+- `VERSION`, `VERACK`, `GET_FINALIZED_TIP`, `FINALIZED_TIP`, `GET_BLOCK`, `BLOCK`, `PROPOSE`, `VOTE`
+- finalized-tip requests/sends
+- sync-parent requests and buffered-sync replay/apply outcomes
 
 ## 10. Debugging summary
 

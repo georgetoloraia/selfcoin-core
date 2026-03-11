@@ -980,7 +980,9 @@ void Node::event_loop() {
 
       const bool can_propose = leader.has_value() && *leader == local_key_.public_key;
 
-      if (!pause_proposals_.load() && can_propose) {
+      const bool block_interval_elapsed =
+          now_ms >= last_finalized_progress_ms_ + static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
+      if (!pause_proposals_.load() && can_propose && block_interval_elapsed) {
         auto key = std::make_pair(h, current_round_);
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           auto b = build_proposal_block(h, current_round_);

@@ -14,10 +14,14 @@
 #include <random>
 #include <string>
 #include <algorithm>
+#include <vector>
+#include <filesystem>
+#include <cstdio>
 
 #include "address/address.hpp"
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
+#include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
@@ -206,12 +210,60 @@ std::optional<RpcStatusView> parse_get_status_result(const std::string& body, st
   return out;
 }
 
+std::string expand_user(const std::string& path) {
+  return selfcoin::expand_user_home(path);
+}
+
+std::vector<std::string> read_lines(const std::string& path) {
+  std::ifstream in(path);
+  std::vector<std::string> out;
+  std::string line;
+  while (std::getline(in, line)) out.push_back(line);
+  return out;
+}
+
+std::vector<std::string> tail_lines(const std::string& path, std::size_t count) {
+  auto lines = read_lines(path);
+  if (lines.size() <= count) return lines;
+  return std::vector<std::string>(lines.end() - static_cast<std::ptrdiff_t>(count), lines.end());
+}
+
+std::string trim_copy(std::string s) {
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+  std::size_t start = 0;
+  while (start < s.size() && (s[start] == ' ' || s[start] == '\t')) ++start;
+  return s.substr(start);
+}
+
+std::vector<std::string> run_command_lines(const std::string& cmd) {
+  std::vector<std::string> out;
+  FILE* fp = ::popen(cmd.c_str(), "r");
+  if (!fp) return out;
+  char buf[4096];
+  while (std::fgets(buf, sizeof(buf), fp)) out.push_back(trim_copy(buf));
+  (void)::pclose(fp);
+  return out;
+}
+
+bool contains_any(const std::string& s, const std::vector<std::string>& needles) {
+  for (const auto& n : needles) {
+    if (s.find(n) != std::string::npos) return true;
+  }
+  return false;
+}
+
+void print_section(const std::string& title) {
+  std::cout << "\n== " << title << " ==\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage:\n"
               << "  selfcoin-cli tip --db <dir>\n"
+              << "  selfcoin-cli --print-logs [--db <dir>] [--service <name>] [--tail <n>]\n"
+              << "  selfcoin-cli print_logs [--db <dir>] [--service <name>] [--tail <n>]\n"
               << "  selfcoin-cli snapshot_export --db <dir> --out <snapshot.bin>   # stopped/quiescent db expected\n"
               << "  selfcoin-cli snapshot_import --db <dir> --in <snapshot.bin>    # empty db only\n"
               << "  selfcoin-cli create_keypair [--seed-hex <32b-hex>] [--hrp sc]\n"
@@ -235,6 +287,124 @@ int main(int argc, char** argv) {
   }
 
   std::string cmd = argv[1];
+  if (cmd == "--print-logs" || cmd == "print_logs") {
+    std::string db_path = "./data/node";
+    std::string service_name = "selfcoin";
+    std::size_t tail = 20;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--service" && i + 1 < argc) service_name = argv[++i];
+      else if (a == "--tail" && i + 1 < argc) tail = static_cast<std::size_t>(std::stoull(argv[++i]));
+    }
+
+    db_path = expand_user(db_path);
+    const auto db_dir = std::filesystem::path(db_path);
+    const auto mining_log = (db_dir / "MiningLOG").string();
+    const auto peers_path = (db_dir / "peers.dat").string();
+    const auto addrman_path = (db_dir / "addrman.dat").string();
+    const auto key_path = (db_dir / "keystore" / "validator.json").string();
+
+    selfcoin::storage::DB db;
+    const bool opened = db.open_readonly(db_path) || db.open(db_path);
+
+    print_section("Node");
+    std::cout << "db=" << db_path << "\n";
+    std::cout << "service=" << service_name << "\n";
+    std::cout << "opened_db=" << (opened ? "yes" : "no") << "\n";
+
+    if (opened) {
+      const auto tip = db.get_tip();
+      if (tip) {
+        std::cout << "height=" << tip->height << "\n";
+        std::cout << "tip_hash=" << selfcoin::hex_encode32(tip->hash) << "\n";
+        const auto cert = db.get_finality_certificate_by_height(tip->height);
+        if (cert) {
+          std::cout << "finality_quorum=" << cert->quorum_threshold << "\n";
+          std::cout << "finality_signatures=" << cert->signatures.size() << "\n";
+          std::cout << "committee_members=" << cert->committee_members.size() << "\n";
+        }
+      } else {
+        std::cout << "height=unknown\n";
+      }
+
+      const auto validators = db.load_validators();
+      std::size_t active = 0;
+      std::size_t pending = 0;
+      std::size_t exiting = 0;
+      std::size_t suspended = 0;
+      std::size_t banned = 0;
+      for (const auto& [_, info] : validators) {
+        switch (info.status) {
+          case selfcoin::consensus::ValidatorStatus::ACTIVE: ++active; break;
+          case selfcoin::consensus::ValidatorStatus::PENDING: ++pending; break;
+          case selfcoin::consensus::ValidatorStatus::EXITING: ++exiting; break;
+          case selfcoin::consensus::ValidatorStatus::SUSPENDED: ++suspended; break;
+          case selfcoin::consensus::ValidatorStatus::BANNED: ++banned; break;
+        }
+      }
+      std::cout << "validators_total=" << validators.size() << "\n";
+      std::cout << "validators_active=" << active << "\n";
+      std::cout << "validators_pending=" << pending << "\n";
+      std::cout << "validators_exiting=" << exiting << "\n";
+      std::cout << "validators_suspended=" << suspended << "\n";
+      std::cout << "validators_banned=" << banned << "\n";
+    }
+
+    std::string kerr;
+    selfcoin::keystore::ValidatorKey vk;
+    if (selfcoin::keystore::keystore_exists(key_path) &&
+        selfcoin::keystore::load_validator_keystore(key_path, "", &vk, &kerr)) {
+      std::cout << "local_validator_pubkey=" << selfcoin::hex_encode(selfcoin::Bytes(vk.pubkey.begin(), vk.pubkey.end()))
+                << "\n";
+      std::cout << "local_validator_address=" << vk.address << "\n";
+    }
+
+    print_section("Peers");
+    if (std::filesystem::exists(peers_path)) {
+      const auto peers = tail_lines(peers_path, tail);
+      std::cout << "persisted_peers=" << peers.size() << "\n";
+      for (const auto& line : peers) std::cout << line << "\n";
+    } else {
+      std::cout << "persisted_peers=0\n";
+    }
+    if (std::filesystem::exists(addrman_path)) {
+      const auto addrman = tail_lines(addrman_path, tail);
+      std::cout << "addrman_entries=" << addrman.size() << "\n";
+      for (const auto& line : addrman) std::cout << line << "\n";
+    } else {
+      std::cout << "addrman_entries=0\n";
+    }
+
+    print_section("Mining");
+    if (std::filesystem::exists(mining_log)) {
+      const auto mining = tail_lines(mining_log, tail);
+      std::cout << "mined_blocks_logged=" << mining.size() << "\n";
+      for (const auto& line : mining) std::cout << line << "\n";
+    } else {
+      std::cout << "MiningLOG not found\n";
+    }
+
+    print_section("Security");
+    const std::string journal_cmd =
+        "journalctl -u " + service_name + " -n " + std::to_string(tail * 10) + " --no-pager -l -q 2>/dev/null";
+    const auto journal_lines = run_command_lines(journal_cmd);
+    const std::vector<std::string> security_needles = {
+        "peer-banned", "peer-soft-muted", "reject-version", "drop-addr", "pre-handshake", "timeout",
+        "adopted bootstrap validator", "bootstrap single-node genesis", "pending_joiners"};
+    std::size_t emitted = 0;
+    for (const auto& line : journal_lines) {
+      if (!contains_any(line, security_needles)) continue;
+      std::cout << line << "\n";
+      ++emitted;
+      if (emitted >= tail) break;
+    }
+    if (emitted == 0) {
+      std::cout << "no recent security/runtime events found via journalctl\n";
+    }
+    return 0;
+  }
+
   if (cmd == "tip") {
     std::string db_path = "./data/node";
     for (int i = 2; i < argc; ++i) {

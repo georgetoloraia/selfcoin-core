@@ -274,8 +274,8 @@ build_execstart_args() {
 
   if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
     mapfile -t seeds < <(read_seed_list || true)
+    args+=("--no-dns-seeds")
     if (( ${#seeds[@]} > 0 )); then
-      args+=("--no-dns-seeds")
       for s in "${seeds[@]}"; do
         args+=("--seeds" "${s}")
       done

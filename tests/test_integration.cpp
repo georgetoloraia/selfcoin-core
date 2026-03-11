@@ -1413,6 +1413,75 @@ TEST(test_seeded_bootstrap_template_node_does_not_self_bootstrap) {
   n.stop();
 }
 
+TEST(test_seeded_bootstrap_template_retries_with_inbound_noise_present) {
+  const std::string base = "/tmp/selfcoin_it_seeded_retry_ignores_inbound_noise";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig bootstrap_cfg;
+  bootstrap_cfg.node_id = 0;
+  bootstrap_cfg.dns_seeds = false;
+  bootstrap_cfg.db_path = base + "/bootstrap";
+  bootstrap_cfg.p2p_port = reserve_test_port();
+  if (bootstrap_cfg.p2p_port == 0) return;
+  bootstrap_cfg.genesis_path = gpath;
+  bootstrap_cfg.allow_unsafe_genesis_override = true;
+
+  node::Node bootstrap(bootstrap_cfg);
+  if (!bootstrap.init()) return;
+  bootstrap.start();
+  ASSERT_TRUE(wait_for_tip(bootstrap, 1, std::chrono::seconds(12)));
+
+  node::NodeConfig follower_cfg;
+  follower_cfg.node_id = 1;
+  follower_cfg.dns_seeds = false;
+  follower_cfg.db_path = base + "/follower";
+  follower_cfg.p2p_port = reserve_test_port();
+  if (follower_cfg.p2p_port == 0) {
+    bootstrap.stop();
+    return;
+  }
+  follower_cfg.genesis_path = gpath;
+  follower_cfg.allow_unsafe_genesis_override = true;
+  follower_cfg.seeds = {"127.0.0.1:" + std::to_string(bootstrap_cfg.p2p_port)};
+  follower_cfg.outbound_target = 1;
+
+  node::Node follower(follower_cfg);
+  if (!follower.init()) {
+    bootstrap.stop();
+    return;
+  }
+  follower.start();
+
+  // Occupy the follower's inbound table with junk connections; outbound bootstrap
+  // retry must still continue because it is based on outbound, not total peers.
+  std::vector<int> junk_fds;
+  for (int i = 0; i < 3; ++i) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) continue;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(follower_cfg.p2p_port);
+    ASSERT_EQ(::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr), 1);
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) junk_fds.push_back(fd);
+    else ::close(fd);
+  }
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s = follower.status();
+    return s.height >= 1 && s.established_peers >= 1;
+  }, std::chrono::seconds(20)));
+
+  for (int fd : junk_fds) {
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+  }
+  follower.stop();
+  bootstrap.stop();
+}
+
 TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   const std::string base = "/tmp/selfcoin_it_single_node_sync_join";
   std::filesystem::remove_all(base);

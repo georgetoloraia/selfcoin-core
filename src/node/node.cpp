@@ -503,6 +503,21 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   return true;
 }
 
+bool Node::maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
+                                                     const char* source) {
+  const auto info = p2p_.get_peer_info(peer_id);
+  const std::string ip = info.ip.empty() ? endpoint_to_ip(info.endpoint) : info.ip;
+  if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return false;
+  if (finalized_height_ != 0) return false;
+  if (!validators_.active_sorted(1).empty()) return false;
+  if (!is_bootstrap_peer_ip(ip)) return false;
+  if (peer_height == 0) return false;
+  if (!bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) return false;
+  log_line(std::string("adopted bootstrap validator from peer pubkey=") +
+           hex_encode(Bytes(pub.begin(), pub.end())) + " source=" + source);
+  return true;
+}
+
 void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return;
   if (finalized_height_ != 0) return;
@@ -1098,18 +1113,11 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       return;
     }
     if (peer_bootstrap.has_value()) {
-      std::lock_guard<std::mutex> lk(mu_);
-      if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && finalized_height_ == 0 &&
-          validators_.active_sorted(1).empty()) {
-        auto b = hex_decode(*peer_bootstrap);
-        if (b && b->size() == 32) {
-          PubKey32 pub{};
-          std::copy(b->begin(), b->end(), pub.begin());
-          if (bootstrap_template_bind_validator(pub, pub == local_key_.public_key)) {
-            log_line("adopted bootstrap validator from peer pubkey=" +
-                     hex_encode(Bytes(pub.begin(), pub.end())));
-          }
-        }
+      auto b = hex_decode(*peer_bootstrap);
+      if (b && b->size() == 32) {
+        PubKey32 pub{};
+        std::copy(b->begin(), b->end(), pub.begin());
+        (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-bootstrap");
       }
     }
     if (peer_validator.has_value()) {
@@ -1117,9 +1125,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       if (b && b->size() == 32) {
         PubKey32 pub{};
         std::copy(b->begin(), b->end(), pub.begin());
-        std::lock_guard<std::mutex> lk(mu_);
-        peer_validator_pubkeys_[peer_id] = pub;
-        pending_bootstrap_joiners_.insert(pub);
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          peer_validator_pubkeys_[peer_id] = pub;
+          pending_bootstrap_joiners_.insert(pub);
+        }
+        if (!peer_bootstrap.has_value()) {
+          (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-validator-fallback");
+        }
       }
     }
     p2p_.set_peer_handshake_meta(peer_id, v->proto_version, v->network_id, v->feature_flags);
@@ -1179,6 +1192,13 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       {
         std::lock_guard<std::mutex> lk(mu_);
         peer_finalized_tips_[peer_id] = *tip;
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = peer_validator_pubkeys_.find(peer_id);
+        if (it != peer_validator_pubkeys_.end()) {
+          (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, it->second, tip->height, "finalized-tip-fallback");
+        }
       }
       if (tip->height > finalized_height_) {
         auto req = p2p::GetBlockMsg{tip->hash};

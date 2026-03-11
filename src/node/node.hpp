@@ -174,6 +174,8 @@ class Node {
   bool persist_finalized_block(const Block& block, const FinalityCertificate& certificate);
   bool init_local_validator_key();
   bool bootstrap_template_bind_validator(const PubKey32& pub, bool local_validator);
+  bool maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
+                                                 const char* source);
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
   std::optional<Tx> build_bootstrap_validator_join_tx(const PubKey32& pub) const;
   void maybe_submit_bootstrap_join();

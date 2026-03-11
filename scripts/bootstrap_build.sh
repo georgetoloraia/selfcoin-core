@@ -193,6 +193,67 @@ except Exception:
 PY
 }
 
+dir_has_chain_state() {
+  local dir="$1"
+  [[ -d "${dir}" ]] || return 1
+  find "${dir}" -mindepth 1 -maxdepth 1 \
+    ! -name 'keystore' \
+    ! -name 'LOCK' \
+    -print -quit 2>/dev/null | grep -q .
+}
+
+is_bootstrap_template_json() {
+  local genesis_json="${ROOT_DIR}/mainnet/genesis.json"
+  [[ -f "${genesis_json}" ]] || return 1
+  python3 - "${genesis_json}" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    data = json.load(open(p, "r", encoding="utf-8"))
+    vals = data.get("initial_validators", [])
+    sys.exit(0 if isinstance(vals, list) and len(vals) == 0 else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+bootstrap_preflight() {
+  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
+  local genesis_bin="${GENESIS_BIN}"
+  if [[ -z "${genesis_bin}" && -f "${default_genesis_bin}" ]]; then
+    genesis_bin="${default_genesis_bin}"
+  fi
+
+  local -a seeds=()
+  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
+    mapfile -t seeds < <(read_seed_list || true)
+  fi
+
+  local template_mode=0
+  if [[ -n "${genesis_bin}" && -f "${genesis_bin}" ]] && is_bootstrap_template_json; then
+    template_mode=1
+  fi
+
+  if [[ "${template_mode}" != "1" ]]; then
+    return 0
+  fi
+
+  if (( ${#seeds[@]} == 0 )); then
+    log "Bootstrap mode: first-node bootstrap (no configured seeds)."
+    return 0
+  fi
+
+  log "Bootstrap mode: follower join via configured seeds."
+  if dir_has_chain_state "${DB_DIR}"; then
+    if [[ "${RESET_CHAIN_DATA}" != "1" ]]; then
+      log "Refusing to start follower join with existing chain state in ${DB_DIR}."
+      log "This usually means the node could keep an old fork instead of joining the live bootstrap chain."
+      log "Use RESET_CHAIN_DATA=1 ./scripts/bootstrap_build.sh after confirming the correct seeds/genesis."
+      exit 1
+    fi
+  fi
+}
+
 build_execstart_args() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/selfcoin-node"
   local key_file="${DB_DIR}/keystore/validator.json"
@@ -324,6 +385,7 @@ EOF
 }
 
 post_build_setup() {
+  bootstrap_preflight
   reset_chain_data_if_requested
   open_firewall_ports
   install_and_restart_service

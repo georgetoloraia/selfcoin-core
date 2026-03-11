@@ -366,7 +366,10 @@ bool Node::init() {
         }
         if (discipline_.is_banned(endpoint_to_ip(detail), now_unix())) {
           p2p_.disconnect_peer(peer_id);
+          return;
         }
+        auto info = p2p_.get_peer_info(peer_id);
+        if (!info.version_tx) send_version(peer_id);
         return;
       }
       if (type == p2p::PeerManager::PeerEventType::DISCONNECTED) {

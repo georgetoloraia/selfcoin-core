@@ -2606,6 +2606,7 @@ void Node::try_connect_bootstrap_peers() {
     } catch (...) {
       continue;
     }
+    if (has_peer_endpoint(host, port)) continue;
     if (discipline_.is_banned(host, now_unix())) continue;
     if (!seed_preflight_ok(host, port)) continue;
     {
@@ -2618,8 +2619,17 @@ void Node::try_connect_bootstrap_peers() {
       last_bootstrap_source_ = candidate.source;
       addrman_.mark_success(p2p::NetAddress{host, port}, now_unix());
     }
-    for (int pid : p2p_.peer_ids()) send_version(pid);
   }
+}
+
+bool Node::has_peer_endpoint(const std::string& host, std::uint16_t port) const {
+  const std::string endpoint = host + ":" + std::to_string(port);
+  for (int pid : p2p_.peer_ids()) {
+    const auto info = p2p_.get_peer_info(pid);
+    if (info.endpoint == endpoint) return true;
+    if (info.ip == host && !info.inbound) return true;
+  }
+  return false;
 }
 
 std::size_t Node::peer_count() const { return static_cast<std::size_t>(p2p_.peer_ids().size()); }

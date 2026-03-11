@@ -196,6 +196,7 @@ class Node {
   void request_finalized_tip(int peer_id);
   void maybe_request_sync_parent_locked(int peer_id, const Block& blk);
   void maybe_apply_buffered_sync_blocks_locked();
+  bool has_peer_endpoint(const std::string& host, std::uint16_t port) const;
   std::size_t peer_count() const;
   std::size_t established_peer_count() const;
   std::size_t outbound_peer_count() const;

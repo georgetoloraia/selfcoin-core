@@ -341,7 +341,8 @@ bool Node::init() {
   load_addrman();
   for (const auto& p : cfg_.peers) bootstrap_peers_.push_back(p);
   for (const auto& s : cfg_.seeds) bootstrap_peers_.push_back(s);
-  if (cfg_.seeds.empty()) {
+  const bool allow_default_seed_fallback = !bootstrap_template_mode_;
+  if (cfg_.seeds.empty() && allow_default_seed_fallback) {
     for (const auto& s : cfg_.network.default_seeds) bootstrap_peers_.push_back(s);
   }
   if (cfg_.dns_seeds) {

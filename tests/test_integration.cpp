@@ -1355,6 +1355,34 @@ TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
   n.stop();
 }
 
+TEST(test_unseeded_bootstrap_template_ignores_default_network_seeds) {
+  const std::string base = "/tmp/selfcoin_it_bootstrap_ignores_default_seeds";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg;
+  cfg.node_id = 0;
+  cfg.dns_seeds = false;
+  cfg.listen = false;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+
+  ASSERT_TRUE(wait_for_tip(n, 1, std::chrono::seconds(10)));
+  const auto s = n.status();
+  ASSERT_TRUE(s.bootstrap_template_mode);
+  ASSERT_TRUE(!s.bootstrap_validator_pubkey.empty());
+
+  n.stop();
+}
+
 TEST(test_seeded_bootstrap_template_node_does_not_self_bootstrap) {
   const std::string base = "/tmp/selfcoin_it_seeded_bootstrap_waits";
   std::filesystem::remove_all(base);

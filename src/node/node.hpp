@@ -193,6 +193,7 @@ class Node {
   void try_connect_bootstrap_peers();
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
+  void request_finalized_tip(int peer_id);
   std::size_t peer_count() const;
   std::size_t established_peer_count() const;
   std::string peer_ip_for(int peer_id) const;

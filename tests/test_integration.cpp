@@ -430,6 +430,33 @@ bool send_version_and_expect_disconnect(const std::string& ip, std::uint16_t por
   return disconnected;
 }
 
+int connect_bootstrap_joiner_without_sync(const std::string& ip, std::uint16_t port, const p2p::VersionMsg& v,
+                                          const NetworkConfig& net_cfg) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  if (::inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+    ::close(fd);
+    return -1;
+  }
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERSION, p2p::ser_version(v)}, net_cfg.magic,
+                           net_cfg.protocol_version)) {
+    ::close(fd);
+    return -1;
+  }
+  if (!p2p::write_frame_fd(fd, p2p::Frame{p2p::MsgType::VERACK, {}}, net_cfg.magic, net_cfg.protocol_version)) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 std::optional<Block> find_block_with_tx(const std::string& db_path, const Hash32& txid, std::uint64_t max_h) {
   storage::DB db;
   if (!db.open_readonly(db_path) && !db.open(db_path)) return std::nullopt;
@@ -1613,6 +1640,65 @@ TEST(test_second_node_auto_joins_as_validator_on_chain) {
   }, std::chrono::seconds(20)));
 
   n1.stop();
+  n0.stop();
+}
+
+TEST(test_bootstrap_joiner_is_not_sponsored_until_synced) {
+  const std::string base = "/tmp/selfcoin_it_bootstrap_joiner_waits_for_sync";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg0;
+  cfg0.node_id = 0;
+  cfg0.dns_seeds = false;
+  cfg0.db_path = base + "/node0";
+  cfg0.p2p_port = reserve_test_port();
+  if (cfg0.p2p_port == 0) return;
+  cfg0.genesis_path = gpath;
+  cfg0.allow_unsafe_genesis_override = true;
+  cfg0.validator_min_bond_override = 1;
+  cfg0.validator_bond_min_amount_override = 1;
+  cfg0.validator_bond_max_amount_override = 1;
+  cfg0.validator_warmup_blocks_override = 1;
+
+  node::Node n0(cfg0);
+  if (!n0.init()) return;
+  n0.start();
+  const auto port0 = n0.p2p_port_for_test();
+  if (port0 == 0) {
+    n0.stop();
+    return;
+  }
+  ASSERT_TRUE(wait_for_tip(n0, 3, std::chrono::seconds(12)));
+
+  const auto joiner = key_from_byte(99);
+  p2p::VersionMsg v;
+  v.proto_version = static_cast<std::uint32_t>(cfg0.network.protocol_version);
+  v.network_id = cfg0.network.network_id;
+  v.feature_flags = cfg0.network.feature_flags;
+  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
+  v.nonce = 424242;
+  v.start_height = 0;
+  v.start_hash = zero_hash();
+  v.node_software_version =
+      "selfcoin-tests/0.7;genesis=" + n0.status().genesis_hash + ";network_id=" +
+      hex_encode(Bytes(cfg0.network.network_id.begin(), cfg0.network.network_id.end())) + ";cv=7;validator_pubkey=" +
+      hex_encode(Bytes(joiner.public_key.begin(), joiner.public_key.end()));
+
+  int fd = connect_bootstrap_joiner_without_sync("127.0.0.1", port0, v, cfg0.network);
+  ASSERT_TRUE(fd >= 0);
+
+  ASSERT_TRUE(wait_for([&]() { return n0.status().pending_bootstrap_joiners >= 1; }, std::chrono::seconds(5)));
+  std::this_thread::sleep_for(std::chrono::seconds(6));
+
+  const auto info = n0.validator_info_for_test(joiner.public_key);
+  ASSERT_TRUE(!info.has_value());
+  ASSERT_EQ(n0.active_validators_for_next_height_for_test().size(), 1u);
+
+  ::shutdown(fd, SHUT_RDWR);
+  ::close(fd);
   n0.stop();
 }
 

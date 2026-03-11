@@ -194,6 +194,8 @@ class Node {
   std::vector<std::string> resolve_dns_seeds_once() const;
   void maybe_request_getaddr(int peer_id);
   void request_finalized_tip(int peer_id);
+  void send_finalized_tip(int peer_id);
+  void broadcast_finalized_tip();
   void maybe_request_sync_parent_locked(int peer_id, const Block& blk);
   void maybe_apply_buffered_sync_blocks_locked();
   bool has_peer_endpoint(const std::string& host, std::uint16_t port) const;
@@ -300,6 +302,7 @@ class Node {
   std::optional<PubKey32> bootstrap_validator_pubkey_;
   std::uint64_t startup_ms_{0};
   std::map<int, PubKey32> peer_validator_pubkeys_;
+  std::map<int, p2p::FinalizedTipMsg> peer_finalized_tips_;
   std::set<PubKey32> pending_bootstrap_joiners_;
   std::set<PubKey32> sponsored_bootstrap_joiners_;
   bool restart_debug_{false};

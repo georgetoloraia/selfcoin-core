@@ -14,12 +14,24 @@ RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
 SERVICE_NAME="${SERVICE_NAME:-selfcoin}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
+FOLLOWER_P2P_PORT="${FOLLOWER_P2P_PORT:-19440}"
 LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-2}"
 NODE_PUBLIC="${NODE_PUBLIC:-1}"
 NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
+GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
+ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
+NODE_ROLE="${NODE_ROLE:-bootstrap}"
+BOOTSTRAP_IP="${BOOTSTRAP_IP:-}"
+BOOTSTRAP_HOST="${BOOTSTRAP_HOST:-}"
+FOLLOWER_DB_DIR="${FOLLOWER_DB_DIR:-$HOME/.selfcoin/mainnet-follower}"
+CONFIG_OUTPUT_DIR="${CONFIG_OUTPUT_DIR:-${ROOT_DIR}/deploy/generated}"
+BOOTSTRAP_LAUNCHER="${CONFIG_OUTPUT_DIR}/bootstrap-node.sh"
+FOLLOWER_LAUNCHER="${CONFIG_OUTPUT_DIR}/follower-node.sh"
+BOOTSTRAP_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin-bootstrap.service"
+FOLLOWER_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin-follower.service"
 
 log() { printf '[bootstrap] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -193,6 +205,119 @@ except Exception:
 PY
 }
 
+resolve_genesis_source() {
+  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
+  local default_genesis_json="${ROOT_DIR}/mainnet/genesis.json"
+  if [[ -n "${GENESIS_PATH}" ]]; then
+    echo "${GENESIS_PATH}"
+  elif [[ -f "${default_genesis_bin}" ]]; then
+    echo "${default_genesis_bin}"
+  elif [[ -f "${default_genesis_json}" ]]; then
+    echo "${default_genesis_json}"
+  else
+    log "No genesis artifact found. Set GENESIS_PATH or provide mainnet/genesis.bin."
+    exit 1
+  fi
+}
+
+sha256_file() {
+  local path="$1"
+  if have sha256sum; then
+    sha256sum "${path}" | awk '{print $1}'
+  elif have shasum; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+  elif have openssl; then
+    openssl dgst -sha256 "${path}" | awk '{print $NF}'
+  else
+    echo "sha256-unavailable"
+  fi
+}
+
+join_csv() {
+  local IFS=,
+  printf '%s' "$*"
+}
+
+seed_csv() {
+  local -a seeds=()
+  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
+    mapfile -t seeds < <(read_seed_list || true)
+  fi
+  if (( ${#seeds[@]} > 0 )); then
+    join_csv "${seeds[@]}"
+  fi
+}
+
+detect_local_ip() {
+  if have hostname; then
+    local ip
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if [[ -n "${ip}" ]]; then
+      echo "${ip}"
+      return
+    fi
+  fi
+  if have ip; then
+    local ip_route
+    ip_route="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+    if [[ -n "${ip_route}" ]]; then
+      echo "${ip_route}"
+      return
+    fi
+  fi
+}
+
+bootstrap_host_value() {
+  if [[ -n "${BOOTSTRAP_IP}" ]]; then
+    echo "${BOOTSTRAP_IP}"
+  elif [[ -n "${BOOTSTRAP_HOST}" ]]; then
+    echo "${BOOTSTRAP_HOST}"
+  elif [[ "${NODE_ROLE}" == "bootstrap" ]]; then
+    detect_local_ip || true
+  fi
+}
+
+bootstrap_peer_endpoint() {
+  local host
+  if [[ -n "${BOOTSTRAP_IP}" ]]; then
+    host="${BOOTSTRAP_IP}"
+  elif [[ -n "${BOOTSTRAP_HOST}" ]]; then
+    host="${BOOTSTRAP_HOST}"
+  elif [[ "${NODE_ROLE}" == "bootstrap" ]]; then
+    host="$(detect_local_ip || true)"
+  else
+    host=""
+  fi
+  if [[ -z "${host}" ]]; then
+    host="REPLACE_WITH_BOOTSTRAP_IP"
+  fi
+  echo "${host}:${P2P_PORT}"
+}
+
+require_follower_bootstrap_peer() {
+  if [[ "${NODE_ROLE}" != "follower" ]]; then
+    return 0
+  fi
+  local peer
+  peer="$(bootstrap_peer_endpoint)"
+  if [[ "${peer}" == REPLACE_WITH_BOOTSTRAP_IP:* ]]; then
+    log "Follower role requires an explicit bootstrap address."
+    log "Set BOOTSTRAP_IP=<public-bootstrap-ip> (or BOOTSTRAP_HOST=<host>)."
+    exit 1
+  fi
+}
+
+package_genesis_artifact() {
+  local src="$1"
+  local dst_dir="${CONFIG_OUTPUT_DIR}/artifacts"
+  mkdir -p "${dst_dir}"
+  # Package the exact genesis artifact we built against so operators can copy one
+  # deterministic file to every node and verify it by sha256 before starting.
+  local dst="${dst_dir}/$(basename "${src}")"
+  install -m 0644 "${src}" "${dst}"
+  echo "${dst}"
+}
+
 dir_has_chain_state() {
   local dir="$1"
   [[ -d "${dir}" ]] || return 1
@@ -218,11 +343,8 @@ PY
 }
 
 bootstrap_preflight() {
-  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
-  local genesis_bin="${GENESIS_BIN}"
-  if [[ -z "${genesis_bin}" && -f "${default_genesis_bin}" ]]; then
-    genesis_bin="${default_genesis_bin}"
-  fi
+  local genesis_bin
+  genesis_bin="$(resolve_genesis_source)"
 
   local -a seeds=()
   if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
@@ -254,36 +376,35 @@ bootstrap_preflight() {
   fi
 }
 
-build_execstart_args() {
-  local node_bin="${ROOT_DIR}/${BUILD_DIR}/selfcoin-node"
-  local key_file="${DB_DIR}/keystore/validator.json"
-  local default_genesis_bin="${ROOT_DIR}/mainnet/genesis.bin"
-  local genesis_bin="${GENESIS_BIN}"
+build_bootstrap_args() {
+  local node_bin="$1"
+  local db_dir="$2"
+  local genesis_path="$3"
+  local key_file="${db_dir}/keystore/validator.json"
+  local seeds
+  seeds="$(seed_csv)"
   local -a args
-  args=("${node_bin}" "--db" "${DB_DIR}" "--outbound-target" "${OUTBOUND_TARGET}")
-  if [[ "${NODE_PUBLIC}" == "1" ]]; then
-    args+=("--public")
-  fi
+  args=(
+    "${node_bin}"
+    "--db" "${db_dir}"
+    "--genesis" "${genesis_path}"
+    "--public"
+    "--listen"
+    "--bind" "0.0.0.0"
+    "--port" "${P2P_PORT}"
+    "--outbound-target" "${OUTBOUND_TARGET}"
+    "--validator-key-file" "${key_file}"
+    "--no-dns-seeds"
+  )
 
-  if [[ -z "${genesis_bin}" && -f "${default_genesis_bin}" ]]; then
-    genesis_bin="${default_genesis_bin}"
+  # Public bootstrap nodes must listen on a routable interface so that followers
+  # can complete VERSION/VERACK and start bootstrap adoption/sync from a known peer.
+  if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
+    args+=("--allow-unsafe-genesis-override")
   fi
-  if [[ -n "${genesis_bin}" ]]; then
-    args+=("--genesis" "${genesis_bin}" "--allow-unsafe-genesis-override")
+  if [[ -n "${seeds}" ]]; then
+    args+=("--seeds" "${seeds}")
   fi
-
-  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
-    mapfile -t seeds < <(read_seed_list || true)
-    args+=("--no-dns-seeds")
-    if (( ${#seeds[@]} > 0 )); then
-      for s in "${seeds[@]}"; do
-        args+=("--seeds" "${s}")
-      done
-    fi
-  fi
-
-  args+=("--validator-key-file" "${key_file}")
-
   if [[ -n "${NODE_EXTRA_ARGS}" ]]; then
     # shellcheck disable=SC2206
     local extra=( ${NODE_EXTRA_ARGS} )
@@ -291,6 +412,99 @@ build_execstart_args() {
   fi
 
   printf '%q ' "${args[@]}"
+}
+
+build_follower_args() {
+  local node_bin="$1"
+  local db_dir="$2"
+  local genesis_path="$3"
+  local bootstrap_peer="$4"
+  local key_file="${db_dir}/keystore/validator.json"
+  local seeds
+  seeds="$(seed_csv)"
+  local -a args
+  args=(
+    "${node_bin}"
+    "--db" "${db_dir}"
+    "--genesis" "${genesis_path}"
+    "--port" "${FOLLOWER_P2P_PORT}"
+    "--outbound-target" "${OUTBOUND_TARGET}"
+    "--validator-key-file" "${key_file}"
+    "--no-dns-seeds"
+    "--peers" "${bootstrap_peer}"
+  )
+
+  # Followers should use a direct bootstrap peer for first sync instead of
+  # depending only on DNS seeds or ambient peer discovery.
+  if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
+    args+=("--allow-unsafe-genesis-override")
+  fi
+  if [[ -n "${seeds}" ]]; then
+    args+=("--seeds" "${seeds}")
+  fi
+  if [[ -n "${NODE_EXTRA_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    local extra=( ${NODE_EXTRA_ARGS} )
+    args+=("${extra[@]}")
+  fi
+
+  printf '%q ' "${args[@]}"
+}
+
+write_launcher() {
+  local path="$1"
+  local command_line="$2"
+  cat > "${path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec ${command_line}
+EOF
+  chmod +x "${path}"
+}
+
+write_unit_template() {
+  local path="$1"
+  local description="$2"
+  local launcher="$3"
+  cat > "${path}" <<EOF
+[Unit]
+Description=${description}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${USER}
+WorkingDirectory=${ROOT_DIR}
+ExecStart=${launcher}
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=90
+KillSignal=SIGINT
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+generate_runtime_artifacts() {
+  local node_bin="${ROOT_DIR}/${BUILD_DIR}/selfcoin-node"
+  local genesis_source
+  genesis_source="$(resolve_genesis_source)"
+  require_follower_bootstrap_peer
+  local packaged_genesis
+  packaged_genesis="$(package_genesis_artifact "${genesis_source}")"
+  local bootstrap_peer
+  bootstrap_peer="$(bootstrap_peer_endpoint)"
+  mkdir -p "${CONFIG_OUTPUT_DIR}" "${CONFIG_OUTPUT_DIR}/systemd"
+
+  write_launcher "${BOOTSTRAP_LAUNCHER}" "$(build_bootstrap_args "${node_bin}" "${DB_DIR}" "${packaged_genesis}")"
+  write_launcher "${FOLLOWER_LAUNCHER}" "$(build_follower_args "${node_bin}" "${FOLLOWER_DB_DIR}" "${packaged_genesis}" "${bootstrap_peer}")"
+  write_unit_template "${BOOTSTRAP_UNIT_TEMPLATE}" "SelfCoin Bootstrap Node" "${BOOTSTRAP_LAUNCHER}"
+  write_unit_template "${FOLLOWER_UNIT_TEMPLATE}" "SelfCoin Follower Node" "${FOLLOWER_LAUNCHER}"
+
+  printf '%s\n' "${packaged_genesis}"
 }
 
 reset_chain_data_if_requested() {
@@ -316,6 +530,10 @@ reset_chain_data_if_requested() {
 open_firewall_ports() {
   if [[ "${OPEN_FIREWALL_PORTS}" != "1" ]]; then
     log "Skipping firewall changes (OPEN_FIREWALL_PORTS=0)."
+    return 0
+  fi
+  if [[ "${NODE_ROLE}" == "follower" ]]; then
+    log "Skipping firewall changes for follower role."
     return 0
   fi
   local s; s="$(need_sudo)"
@@ -350,33 +568,21 @@ install_and_restart_service() {
 
   local s; s="$(need_sudo)"
   local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
-  local exec_line
-  exec_line="$(build_execstart_args)"
-  local tmp_unit="/tmp/${SERVICE_NAME}.service.$$"
+  local template_path
+  if [[ "${NODE_ROLE}" == "follower" ]]; then
+    local bootstrap_peer
+    bootstrap_peer="$(bootstrap_peer_endpoint)"
+    if [[ "${bootstrap_peer}" == REPLACE_WITH_BOOTSTRAP_IP:* ]]; then
+      log "Skipping systemd install for follower role: set BOOTSTRAP_IP to generate a usable direct peer."
+      log "Generated example follower launcher still exists at ${FOLLOWER_LAUNCHER}"
+      return 0
+    fi
+    template_path="${FOLLOWER_UNIT_TEMPLATE}"
+  else
+    template_path="${BOOTSTRAP_UNIT_TEMPLATE}"
+  fi
 
-  cat > "${tmp_unit}" <<EOF
-[Unit]
-Description=SelfCoin Node
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${USER}
-WorkingDirectory=${ROOT_DIR}
-ExecStart=${exec_line}
-Restart=on-failure
-RestartSec=2
-TimeoutStopSec=90
-KillSignal=SIGINT
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  ${s} install -m 0644 "${tmp_unit}" "${service_path}"
-  rm -f "${tmp_unit}"
+  ${s} install -m 0644 "${template_path}" "${service_path}"
 
   ${s} systemctl daemon-reload
   ${s} systemctl enable "${SERVICE_NAME}" >/dev/null || true
@@ -386,23 +592,53 @@ EOF
 
 post_build_setup() {
   bootstrap_preflight
+  require_follower_bootstrap_peer
   reset_chain_data_if_requested
   open_firewall_ports
+  local packaged_genesis
+  packaged_genesis="$(generate_runtime_artifacts)"
   install_and_restart_service
 
+  local bootstrap_peer
+  bootstrap_peer="$(bootstrap_peer_endpoint)"
+  local genesis_sha
+  genesis_sha="$(sha256_file "${packaged_genesis}")"
+  local verify_host
+  verify_host="$(bootstrap_host_value)"
+  if [[ -z "${verify_host}" ]]; then
+    verify_host="<bootstrap-ip>"
+  fi
+
   log "Post-build setup summary:"
-  log "  DB_DIR=${DB_DIR}"
-  log "  P2P_PORT=${P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
-  if [[ -n "${GENESIS_BIN}" ]]; then
-    log "  GENESIS_BIN=${GENESIS_BIN}"
-  elif [[ -f "${ROOT_DIR}/mainnet/genesis.bin" ]]; then
-    log "  GENESIS_BIN=${ROOT_DIR}/mainnet/genesis.bin (auto-detected)"
-  fi
-  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
-    log "  Peer bootstrap=mainnet/SEEDS.json (default)"
+  log "  NODE_ROLE=${NODE_ROLE}"
+  log "  Bootstrap DB=${DB_DIR}"
+  log "  Follower DB=${FOLLOWER_DB_DIR}"
+  log "  P2P_PORT=${P2P_PORT} FOLLOWER_P2P_PORT=${FOLLOWER_P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
+  log "  Packaged genesis=${packaged_genesis}"
+  log "  Packaged genesis sha256=${genesis_sha}"
+  log "  All nodes must use this exact genesis artifact or VERSION handshake will be rejected."
+  if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then
+    log "  Unsafe genesis override is ENABLED for generated commands."
   else
-    log "  Peer bootstrap=network defaults / DNS seeds"
+    log "  Unsafe genesis override is DISABLED by default."
   fi
+  log "  Bootstrap peer endpoint for followers=${bootstrap_peer}"
+  log "Generated runtime files:"
+  log "  ${BOOTSTRAP_LAUNCHER}"
+  log "  ${FOLLOWER_LAUNCHER}"
+  log "  ${BOOTSTRAP_UNIT_TEMPLATE}"
+  log "  ${FOLLOWER_UNIT_TEMPLATE}"
+  log "Bootstrap node command:"
+  log "  ${BOOTSTRAP_LAUNCHER}"
+  log "Follower node command:"
+  log "  ${FOLLOWER_LAUNCHER}"
+  log "Bootstrap verification:"
+  log "  Listener check: ss -ltnp | rg ${P2P_PORT}"
+  log "  Reachability check: nc -vz ${verify_host} ${P2P_PORT}"
+  log "Follower verification:"
+  log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|recv VERSION|recv VERACK|request-finalized-tip|recv BLOCK|buffered-sync-applied'"
+  log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height='"
+  log "If logs show 'genesis-fingerprint-mismatch', stop the node, replace the genesis artifact, and reset the follower DB before retrying."
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"
     ${s} systemctl status "${SERVICE_NAME}" --no-pager || true

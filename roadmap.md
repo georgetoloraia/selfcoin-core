@@ -369,6 +369,9 @@ Goal:
     - same `genesis.bin` on every node
     - live bootstrap endpoints in `mainnet/SEEDS.json`
     - fresh DB on first join
+  - bootstrap-template behavior now distinguishes first-node bootstrap from follower join explicitly:
+    - a node started without configured bootstrap peers/seeds may self-bootstrap
+    - a seeded node waits for existing network adoption and no longer self-bootstraps into a separate fork
 - Follow-on aggregate-suite stability pass:
   - the remaining late-run failures were not new protocol bugs; they were test/runtime coordination issues
   - root causes:

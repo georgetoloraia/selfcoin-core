@@ -1355,6 +1355,36 @@ TEST(test_single_node_custom_genesis_bootstraps_and_finalizes) {
   n.stop();
 }
 
+TEST(test_seeded_bootstrap_template_node_does_not_self_bootstrap) {
+  const std::string base = "/tmp/selfcoin_it_seeded_bootstrap_waits";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg;
+  cfg.node_id = 0;
+  cfg.dns_seeds = false;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.peers = {"127.0.0.1:1"};
+
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+
+  std::this_thread::sleep_for(std::chrono::seconds(8));
+  const auto s = n.status();
+  ASSERT_EQ(s.height, 0u);
+  ASSERT_TRUE(s.bootstrap_template_mode);
+  ASSERT_TRUE(s.bootstrap_validator_pubkey.empty());
+  ASSERT_EQ(n.active_validators_for_next_height_for_test().size(), 0u);
+
+  n.stop();
+}
+
 TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   const std::string base = "/tmp/selfcoin_it_single_node_sync_join";
   std::filesystem::remove_all(base);

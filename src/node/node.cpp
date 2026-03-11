@@ -496,9 +496,10 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   if (!bootstrap_template_mode_ || bootstrap_validator_pubkey_.has_value()) return;
   if (finalized_height_ != 0) return;
   if (!validators_.active_sorted(1).empty()) return;
-  if (established_peer_count() != 0) return;
   const bool has_bootstrap_sources = !cfg_.disable_p2p && (!bootstrap_peers_.empty() || !dns_seed_peers_.empty());
-  const std::uint64_t wait_ms = has_bootstrap_sources ? 30000ULL : 5000ULL;
+  if (has_bootstrap_sources) return;
+  if (established_peer_count() != 0) return;
+  const std::uint64_t wait_ms = 5000ULL;
   if (now_ms < startup_ms_ + wait_ms) return;
   if (bootstrap_template_bind_validator(local_key_.public_key, true)) {
     log_line("bootstrap single-node genesis from local validator pubkey=" +

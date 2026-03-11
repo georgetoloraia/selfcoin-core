@@ -196,7 +196,9 @@ class Node {
   void request_finalized_tip(int peer_id);
   std::size_t peer_count() const;
   std::size_t established_peer_count() const;
+  std::size_t outbound_peer_count() const;
   std::string peer_ip_for(int peer_id) const;
+  bool is_bootstrap_peer_ip(const std::string& ip) const;
   std::optional<p2p::NetAddress> addrman_address_for_peer(const p2p::PeerInfo& info) const;
   void score_peer(int peer_id, p2p::MisbehaviorReason reason, const std::string& note);
   bool should_mute_peer(int peer_id) const;

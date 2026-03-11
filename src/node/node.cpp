@@ -412,6 +412,12 @@ bool Node::init() {
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "invalid-frame");
       } else if (type == p2p::PeerManager::PeerEventType::FRAME_TIMEOUT ||
                  type == p2p::PeerManager::PeerEventType::HANDSHAKE_TIMEOUT) {
+        const auto pi = p2p_.get_peer_info(peer_id);
+        const std::string ip = pi.ip.empty() ? endpoint_to_ip(pi.endpoint) : pi.ip;
+        if (bootstrap_template_mode_ && !bootstrap_validator_pubkey_.has_value() && is_bootstrap_peer_ip(ip)) {
+          log_line("bootstrap-timeout peer_id=" + std::to_string(peer_id) + " ip=" + ip + " note=timeout");
+          return;
+        }
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_FRAME, "timeout");
       } else if (type == p2p::PeerManager::PeerEventType::QUEUE_OVERFLOW) {
         score_peer(peer_id, p2p::MisbehaviorReason::RATE_LIMIT, "queue-overflow");
@@ -972,7 +978,7 @@ void Node::event_loop() {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!cfg_.disable_p2p) {
       const std::uint64_t now_ms = now_unix() * 1000;
-      if (peer_count() < cfg_.outbound_target && now_ms > last_seed_attempt_ms_ + 3000) {
+      if (outbound_peer_count() < cfg_.outbound_target && now_ms > last_seed_attempt_ms_ + 3000) {
         try_connect_bootstrap_peers();
         last_seed_attempt_ms_ = now_ms;
       }
@@ -2549,12 +2555,36 @@ std::size_t Node::established_peer_count() const {
   return n;
 }
 
+std::size_t Node::outbound_peer_count() const {
+  if (cfg_.disable_p2p) return peer_count();
+  return p2p_.outbound_count();
+}
+
 std::string Node::peer_ip_for(int peer_id) const {
   auto it = peer_ip_cache_.find(peer_id);
   if (it != peer_ip_cache_.end()) return it->second;
   const auto pi = p2p_.get_peer_info(peer_id);
   if (!pi.ip.empty()) return pi.ip;
   return endpoint_to_ip(pi.endpoint);
+}
+
+bool Node::is_bootstrap_peer_ip(const std::string& ip) const {
+  if (ip.empty()) return false;
+  auto matches_host = [&](const std::string& peer) {
+    const auto pos = peer.find(':');
+    const std::string host = (pos == std::string::npos) ? peer : peer.substr(0, pos);
+    return host == ip;
+  };
+  for (const auto& peer : cfg_.peers) {
+    if (matches_host(peer)) return true;
+  }
+  for (const auto& seed : cfg_.seeds) {
+    if (matches_host(seed)) return true;
+  }
+  for (const auto& peer : bootstrap_peers_) {
+    if (matches_host(peer)) return true;
+  }
+  return false;
 }
 
 std::optional<p2p::NetAddress> Node::addrman_address_for_peer(const p2p::PeerInfo& info) const {

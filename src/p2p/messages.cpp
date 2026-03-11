@@ -5,7 +5,9 @@
 namespace selfcoin::p2p {
 namespace {
 
-constexpr std::size_t kMaxSoftwareVersionBytes = 256;
+// The VERSION fingerprint currently carries chain-id plus bootstrap/runtime
+// metadata, so the cap must comfortably exceed the minimal local fingerprint.
+constexpr std::size_t kMaxSoftwareVersionBytes = 512;
 constexpr std::size_t kMaxProposalBlockBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxVoteProofBytes = 256;
 constexpr std::size_t kMaxBlockMessageBytes = 2 * 1024 * 1024;

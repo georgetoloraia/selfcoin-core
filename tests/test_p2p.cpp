@@ -33,6 +33,28 @@ TEST(test_version_message_v07_roundtrip) {
   ASSERT_EQ(d->start_hash, v.start_hash);
 }
 
+TEST(test_version_message_accepts_bootstrap_fingerprint_length) {
+  p2p::VersionMsg v;
+  v.proto_version = PROTOCOL_VERSION;
+  v.network_id = mainnet_network().network_id;
+  v.feature_flags = 0;
+  v.services = 0;
+  v.timestamp = 1;
+  v.nonce = 2;
+  v.node_software_version =
+      "selfcoin-node/0.7;genesis=ad1eb4a5a0b1ee0e2f062539542b972d35bd216edd702e345fae76475a759a77;"
+      "network_id=192d26a3e3decbc1919afbbe9d849149;cv=7;"
+      "bootstrap_validator=f7b672871002c9286fab332251a82e2c7339dbf21fc8e8350ed1bcbeb671775f;"
+      "validator_pubkey=be71f29a6c3fa5f32cff5a2977ca38394a386183e48046190a52bcaaca5b1090";
+  v.start_height = 3;
+  v.start_hash.fill(0x44);
+
+  const Bytes b = p2p::ser_version(v);
+  auto d = p2p::de_version(b);
+  ASSERT_TRUE(d.has_value());
+  ASSERT_EQ(d->node_software_version, v.node_software_version);
+}
+
 TEST(test_prefix_classification) {
   ASSERT_EQ(p2p::classify_prefix(Bytes{'H', 'T', 'T', 'P'}), p2p::PrefixKind::HTTP);
   ASSERT_EQ(p2p::classify_prefix(Bytes{'{', '"', 'a'}), p2p::PrefixKind::JSON);
@@ -90,7 +112,7 @@ TEST(test_version_message_rejects_oversized_software_string) {
   w.u64le(0);
   w.u64le(0);
   w.u32le(0);
-  Bytes sw(300, 'x');
+  Bytes sw(600, 'x');
   w.varbytes(sw);
   w.u64le(0);
   Hash32 zero{};

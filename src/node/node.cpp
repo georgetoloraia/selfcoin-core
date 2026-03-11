@@ -376,6 +376,7 @@ bool Node::init() {
         std::lock_guard<std::mutex> lk(mu_);
         peer_ip_cache_.erase(peer_id);
         peer_validator_pubkeys_.erase(peer_id);
+        peer_finalized_tips_.erase(peer_id);
         getaddr_requested_peers_.erase(peer_id);
         msg_rate_buckets_.erase(peer_id);
         vote_verify_buckets_.erase(peer_id);
@@ -580,6 +581,17 @@ void Node::maybe_submit_bootstrap_join() {
       if (pub == local_key_.public_key) continue;
       if (sponsored_bootstrap_joiners_.find(pub) != sponsored_bootstrap_joiners_.end()) continue;
       if (validators_.get(pub).has_value()) continue;
+      bool ready = false;
+      for (const auto& [peer_id, peer_pub] : peer_validator_pubkeys_) {
+        if (peer_pub != pub) continue;
+        const auto tip_it = peer_finalized_tips_.find(peer_id);
+        if (tip_it == peer_finalized_tips_.end()) continue;
+        if (tip_it->second.height != finalized_height_ || tip_it->second.hash != finalized_hash_) continue;
+        if (!p2p_.get_peer_info(peer_id).established()) continue;
+        ready = true;
+        break;
+      }
+      if (!ready) continue;
       target = pub;
       have_target = true;
       break;
@@ -1128,6 +1140,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   if (msg_type == p2p::MsgType::VERACK) {
     p2p_.mark_handshake_rx(peer_id, false, true);
     maybe_request_getaddr(peer_id);
+    send_finalized_tip(peer_id);
     request_finalized_tip(peer_id);
     auto pi = p2p_.get_peer_info(peer_id);
     auto na = addrman_address_for_peer(pi);
@@ -1162,6 +1175,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       if (!tip.has_value()) {
         score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-finalized-tip");
         return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        peer_finalized_tips_[peer_id] = *tip;
       }
       if (tip->height > finalized_height_) {
         auto req = p2p::GetBlockMsg{tip->hash};
@@ -1266,6 +1283,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             candidate_blocks_.clear();
             candidate_block_sizes_.clear();
             requested_sync_blocks_.erase(bid);
+            broadcast_finalized_tip();
             maybe_apply_buffered_sync_blocks_locked();
           }
         } else {
@@ -1623,6 +1641,7 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   candidate_block_sizes_.clear();
 
   broadcast_finalized_block(b);
+  broadcast_finalized_tip();
 
   std::ostringstream oss;
   oss << "finalized height=" << finalized_height_ << " round=" << round << " leader="
@@ -2456,6 +2475,21 @@ void Node::request_finalized_tip(int peer_id) {
                      p2p::ser_finalized_tip(p2p::FinalizedTipMsg{}), true);
 }
 
+void Node::send_finalized_tip(int peer_id) {
+  p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
+  (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip), true);
+}
+
+void Node::broadcast_finalized_tip() {
+  if (cfg_.disable_p2p) return;
+  p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
+  const Bytes payload = p2p::ser_finalized_tip(tip);
+  for (int peer_id : p2p_.peer_ids()) {
+    if (!p2p_.get_peer_info(peer_id).established()) continue;
+    (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, payload, true);
+  }
+}
+
 void Node::maybe_request_sync_parent_locked(int peer_id, const Block& blk) {
   if (blk.header.height <= finalized_height_ + 1) return;
   if (blk.header.prev_finalized_hash == finalized_hash_) return;
@@ -2517,6 +2551,7 @@ void Node::maybe_apply_buffered_sync_blocks_locked() {
       candidate_block_sizes_.clear();
       requested_sync_blocks_.erase(bid);
       buffered_sync_blocks_.erase(it);
+      broadcast_finalized_tip();
       advanced = true;
       break;
     }

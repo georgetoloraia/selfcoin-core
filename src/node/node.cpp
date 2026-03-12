@@ -3059,7 +3059,6 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.outbound_target = static_cast<std::size_t>(std::stoull(*v));
-      if (cfg.outbound_target == 0) cfg.outbound_target = 1;
     } else if (a == "--dns-seeds") {
       cfg.dns_seeds = true;
     } else if (a == "--no-dns-seeds") {

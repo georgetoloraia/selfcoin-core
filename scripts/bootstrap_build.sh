@@ -11,10 +11,12 @@ CLEAN_ON_GENERATOR_MISMATCH="${CLEAN_ON_GENERATOR_MISMATCH:-1}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
 RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
 SETUP_NODE_SERVICE="${SETUP_NODE_SERVICE:-1}"
+OPEN_FIREWALL_PORTS="${OPEN_FIREWALL_PORTS:-1}"
 SERVICE_NAME="${SERVICE_NAME:-selfcoin}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
+LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-1}"
 HANDSHAKE_TIMEOUT_MS="${HANDSHAKE_TIMEOUT_MS:-30000}"
 FRAME_TIMEOUT_MS="${FRAME_TIMEOUT_MS:-30000}"
@@ -105,6 +107,35 @@ need_sudo() {
 
 systemd_available() {
   have systemctl && [[ -d /run/systemd/system ]]
+}
+
+open_firewall_ports() {
+  local mode="$1"
+  if [[ "${OPEN_FIREWALL_PORTS}" != "1" ]]; then
+    log "Skipping firewall changes (OPEN_FIREWALL_PORTS=0)."
+    return 0
+  fi
+  if [[ "${mode}" != "bootstrap" ]]; then
+    log "Skipping firewall changes for joiner mode."
+    return 0
+  fi
+
+  local s; s="$(need_sudo)"
+  if have ufw; then
+    log "Opening firewall ports with ufw: ${P2P_PORT}/tcp and ${LIGHTSERVER_PORT}/tcp."
+    ${s} ufw allow "${P2P_PORT}/tcp" >/dev/null || true
+    ${s} ufw allow "${LIGHTSERVER_PORT}/tcp" >/dev/null || true
+    return 0
+  fi
+  if have firewall-cmd; then
+    log "Opening firewall ports with firewalld: ${P2P_PORT}/tcp and ${LIGHTSERVER_PORT}/tcp."
+    ${s} firewall-cmd --permanent --add-port="${P2P_PORT}/tcp" >/dev/null || true
+    ${s} firewall-cmd --permanent --add-port="${LIGHTSERVER_PORT}/tcp" >/dev/null || true
+    ${s} firewall-cmd --reload >/dev/null || true
+    return 0
+  fi
+
+  log "No managed firewall command found (ufw/firewalld). Skipping firewall changes."
 }
 
 install_apt() {
@@ -497,6 +528,7 @@ main() {
   command_line="$(build_node_command "${genesis_path}" "${mode}")"
 
   print_summary "${mode}" "${genesis_path}" "${command_line}"
+  open_firewall_ports "${mode}"
   if install_and_restart_service "${command_line}"; then
     exit 0
   fi

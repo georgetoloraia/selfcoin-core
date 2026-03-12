@@ -12,6 +12,7 @@ SETUP_NODE_SERVICE="${SETUP_NODE_SERVICE:-1}"
 OPEN_FIREWALL_PORTS="${OPEN_FIREWALL_PORTS:-1}"
 RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
 SERVICE_NAME="${SERVICE_NAME:-selfcoin}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
 FOLLOWER_P2P_PORT="${FOLLOWER_P2P_PORT:-19440}"
@@ -345,6 +346,10 @@ PY
 bootstrap_preflight() {
   local genesis_bin
   genesis_bin="$(resolve_genesis_source)"
+  local state_dir="${DB_DIR}"
+  if [[ "${NODE_ROLE}" == "follower" ]]; then
+    state_dir="${FOLLOWER_DB_DIR}"
+  fi
 
   local -a seeds=()
   if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
@@ -366,9 +371,9 @@ bootstrap_preflight() {
   fi
 
   log "Bootstrap mode: follower join via configured seeds."
-  if dir_has_chain_state "${DB_DIR}"; then
+  if dir_has_chain_state "${state_dir}"; then
     if [[ "${RESET_CHAIN_DATA}" != "1" ]]; then
-      log "Refusing to start follower join with existing chain state in ${DB_DIR}."
+      log "Refusing to start follower join with existing chain state in ${state_dir}."
       log "This usually means the node could keep an old fork instead of joining the live bootstrap chain."
       log "Use RESET_CHAIN_DATA=1 ./scripts/bootstrap_build.sh after confirming the correct seeds/genesis."
       exit 1
@@ -474,7 +479,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${USER}
+User=${SERVICE_USER}
 WorkingDirectory=${ROOT_DIR}
 ExecStart=${launcher}
 Restart=on-failure
@@ -512,19 +517,24 @@ reset_chain_data_if_requested() {
     return 0
   fi
 
-  log "RESET_CHAIN_DATA=1: resetting ${DB_DIR} (keeping validator key if present)."
-  local key="${DB_DIR}/keystore/validator.json"
+  local state_dir="${DB_DIR}"
+  if [[ "${NODE_ROLE}" == "follower" ]]; then
+    state_dir="${FOLLOWER_DB_DIR}"
+  fi
+
+  log "RESET_CHAIN_DATA=1: resetting ${state_dir} (keeping validator key if present)."
+  local key="${state_dir}/keystore/validator.json"
   local tmp_key="/tmp/selfcoin.validator.$$.json"
   if [[ -f "${key}" ]]; then
     cp -f "${key}" "${tmp_key}"
   fi
-  rm -rf "${DB_DIR}"
-  mkdir -p "${DB_DIR}/keystore"
+  rm -rf "${state_dir}"
+  mkdir -p "${state_dir}/keystore"
   if [[ -f "${tmp_key}" ]]; then
     mv -f "${tmp_key}" "${key}"
     chmod 600 "${key}" || true
   fi
-  chmod 700 "${DB_DIR}/keystore" || true
+  chmod 700 "${state_dir}/keystore" || true
 }
 
 open_firewall_ports() {
@@ -636,8 +646,8 @@ post_build_setup() {
   log "  Listener check: ss -ltnp | rg ${P2P_PORT}"
   log "  Reachability check: nc -vz ${verify_host} ${P2P_PORT}"
   log "Follower verification:"
-  log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|recv VERSION|recv VERACK|request-finalized-tip|recv BLOCK|buffered-sync-applied'"
-  log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height='"
+  log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|peer-disconnected|peer-timeout|bootstrap-timeout|recv VERSION|recv VERACK|request-finalized-tip|send-finalized-tip|request-sync-tip-block|recv BLOCK|buffer-sync-block|request-sync-parent|buffered-sync-applied|reject-version'"
+  log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height=|bootstrap=template|validators_total='"
   log "If logs show 'genesis-fingerprint-mismatch', stop the node, replace the genesis artifact, and reset the follower DB before retrying."
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"

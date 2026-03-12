@@ -24,15 +24,13 @@ USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
 GENESIS_PATH="${GENESIS_PATH:-${GENESIS_BIN}}"
 ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
-NODE_ROLE="${NODE_ROLE:-bootstrap}"
+NODE_ROLE="${NODE_ROLE:-auto}"
 BOOTSTRAP_IP="${BOOTSTRAP_IP:-}"
 BOOTSTRAP_HOST="${BOOTSTRAP_HOST:-}"
 FOLLOWER_DB_DIR="${FOLLOWER_DB_DIR:-$HOME/.selfcoin/mainnet-follower}"
 CONFIG_OUTPUT_DIR="${CONFIG_OUTPUT_DIR:-${ROOT_DIR}/deploy/generated}"
-BOOTSTRAP_LAUNCHER="${CONFIG_OUTPUT_DIR}/bootstrap-node.sh"
-FOLLOWER_LAUNCHER="${CONFIG_OUTPUT_DIR}/follower-node.sh"
-BOOTSTRAP_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin-bootstrap.service"
-FOLLOWER_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin-follower.service"
+RUNTIME_LAUNCHER="${CONFIG_OUTPUT_DIR}/selfcoin-node.sh"
+RUNTIME_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin.service"
 
 log() { printf '[bootstrap] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -249,6 +247,14 @@ seed_csv() {
   fi
 }
 
+seed_count() {
+  local -a seeds=()
+  if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
+    mapfile -t seeds < <(read_seed_list || true)
+  fi
+  echo "${#seeds[@]}"
+}
+
 detect_local_ip() {
   if have hostname; then
     local ip
@@ -268,42 +274,87 @@ detect_local_ip() {
   fi
 }
 
+requested_mode() {
+  case "${NODE_ROLE}" in
+    auto|"")
+      echo "auto"
+      ;;
+    bootstrap)
+      echo "bootstrap"
+      ;;
+    follower|joiner)
+      echo "joiner"
+      ;;
+    *)
+      log "Unsupported NODE_ROLE=${NODE_ROLE}. Use auto, bootstrap, joiner, or follower."
+      exit 1
+      ;;
+  esac
+}
+
+detect_node_mode() {
+  local requested
+  requested="$(requested_mode)"
+  if [[ "${requested}" != "auto" ]]; then
+    echo "${requested}"
+    return
+  fi
+
+  if [[ "$(seed_count)" -gt 0 ]]; then
+    echo "joiner"
+  else
+    echo "bootstrap"
+  fi
+}
+
+active_db_dir() {
+  if [[ "$(detect_node_mode)" == "joiner" ]]; then
+    echo "${FOLLOWER_DB_DIR}"
+  else
+    echo "${DB_DIR}"
+  fi
+}
+
+active_p2p_port() {
+  if [[ "$(detect_node_mode)" == "joiner" ]]; then
+    echo "${FOLLOWER_P2P_PORT}"
+  else
+    echo "${P2P_PORT}"
+  fi
+}
+
 bootstrap_host_value() {
+  local mode
+  mode="$(detect_node_mode)"
   if [[ -n "${BOOTSTRAP_IP}" ]]; then
     echo "${BOOTSTRAP_IP}"
   elif [[ -n "${BOOTSTRAP_HOST}" ]]; then
     echo "${BOOTSTRAP_HOST}"
-  elif [[ "${NODE_ROLE}" == "bootstrap" ]]; then
+  elif [[ "${mode}" == "bootstrap" ]]; then
     detect_local_ip || true
   fi
 }
 
-bootstrap_peer_endpoint() {
-  local host
+joiner_peer_csv() {
   if [[ -n "${BOOTSTRAP_IP}" ]]; then
-    host="${BOOTSTRAP_IP}"
-  elif [[ -n "${BOOTSTRAP_HOST}" ]]; then
-    host="${BOOTSTRAP_HOST}"
-  elif [[ "${NODE_ROLE}" == "bootstrap" ]]; then
-    host="$(detect_local_ip || true)"
-  else
-    host=""
+    echo "${BOOTSTRAP_IP}:${P2P_PORT}"
+    return
   fi
-  if [[ -z "${host}" ]]; then
-    host="REPLACE_WITH_BOOTSTRAP_IP"
+  if [[ -n "${BOOTSTRAP_HOST}" ]]; then
+    echo "${BOOTSTRAP_HOST}:${P2P_PORT}"
+    return
   fi
-  echo "${host}:${P2P_PORT}"
+  seed_csv
 }
 
-require_follower_bootstrap_peer() {
-  if [[ "${NODE_ROLE}" != "follower" ]]; then
+require_joiner_peers() {
+  if [[ "$(detect_node_mode)" != "joiner" ]]; then
     return 0
   fi
-  local peer
-  peer="$(bootstrap_peer_endpoint)"
-  if [[ "${peer}" == REPLACE_WITH_BOOTSTRAP_IP:* ]]; then
-    log "Follower role requires an explicit bootstrap address."
-    log "Set BOOTSTRAP_IP=<public-bootstrap-ip> (or BOOTSTRAP_HOST=<host>)."
+  local peers
+  peers="$(joiner_peer_csv)"
+  if [[ -z "${peers}" ]]; then
+    log "Joiner mode requires at least one peer from mainnet/SEEDS.json or BOOTSTRAP_IP/BOOTSTRAP_HOST."
     exit 1
   fi
 }
@@ -346,10 +397,10 @@ PY
 bootstrap_preflight() {
   local genesis_bin
   genesis_bin="$(resolve_genesis_source)"
-  local state_dir="${DB_DIR}"
-  if [[ "${NODE_ROLE}" == "follower" ]]; then
-    state_dir="${FOLLOWER_DB_DIR}"
-  fi
+  local mode
+  mode="$(detect_node_mode)"
+  local state_dir
+  state_dir="$(active_db_dir)"
 
   local -a seeds=()
   if [[ "${USE_SEEDS_JSON}" == "1" ]]; then
@@ -370,10 +421,14 @@ bootstrap_preflight() {
     return 0
   fi
 
-  log "Bootstrap mode: follower join via configured seeds."
+  if [[ "${mode}" != "joiner" ]]; then
+    return 0
+  fi
+
+  log "Bootstrap mode: joiner sync via configured seeds."
   if dir_has_chain_state "${state_dir}"; then
     if [[ "${RESET_CHAIN_DATA}" != "1" ]]; then
-      log "Refusing to start follower join with existing chain state in ${state_dir}."
+      log "Refusing to start joiner sync with existing chain state in ${state_dir}."
       log "This usually means the node could keep an old fork instead of joining the live bootstrap chain."
       log "Use RESET_CHAIN_DATA=1 ./scripts/bootstrap_build.sh after confirming the correct seeds/genesis."
       exit 1
@@ -419,11 +474,11 @@ build_bootstrap_args() {
   printf '%q ' "${args[@]}"
 }
 
-build_follower_args() {
+build_joiner_args() {
   local node_bin="$1"
   local db_dir="$2"
   local genesis_path="$3"
-  local bootstrap_peer="$4"
+  local joiner_peers="$4"
   local key_file="${db_dir}/keystore/validator.json"
   local seeds
   seeds="$(seed_csv)"
@@ -436,7 +491,7 @@ build_follower_args() {
     "--outbound-target" "${OUTBOUND_TARGET}"
     "--validator-key-file" "${key_file}"
     "--no-dns-seeds"
-    "--peers" "${bootstrap_peer}"
+    "--peers" "${joiner_peers}"
   )
 
   # Followers should use a direct bootstrap peer for first sync instead of
@@ -495,19 +550,29 @@ EOF
 
 generate_runtime_artifacts() {
   local node_bin="${ROOT_DIR}/${BUILD_DIR}/selfcoin-node"
+  local mode
+  mode="$(detect_node_mode)"
   local genesis_source
   genesis_source="$(resolve_genesis_source)"
-  require_follower_bootstrap_peer
+  require_joiner_peers
   local packaged_genesis
   packaged_genesis="$(package_genesis_artifact "${genesis_source}")"
-  local bootstrap_peer
-  bootstrap_peer="$(bootstrap_peer_endpoint)"
+  local active_db
+  active_db="$(active_db_dir)"
+  local active_command
   mkdir -p "${CONFIG_OUTPUT_DIR}" "${CONFIG_OUTPUT_DIR}/systemd"
 
-  write_launcher "${BOOTSTRAP_LAUNCHER}" "$(build_bootstrap_args "${node_bin}" "${DB_DIR}" "${packaged_genesis}")"
-  write_launcher "${FOLLOWER_LAUNCHER}" "$(build_follower_args "${node_bin}" "${FOLLOWER_DB_DIR}" "${packaged_genesis}" "${bootstrap_peer}")"
-  write_unit_template "${BOOTSTRAP_UNIT_TEMPLATE}" "SelfCoin Bootstrap Node" "${BOOTSTRAP_LAUNCHER}"
-  write_unit_template "${FOLLOWER_UNIT_TEMPLATE}" "SelfCoin Follower Node" "${FOLLOWER_LAUNCHER}"
+  if [[ "${mode}" == "joiner" ]]; then
+    local joiner_peers
+    joiner_peers="$(joiner_peer_csv)"
+    active_command="$(build_joiner_args "${node_bin}" "${active_db}" "${packaged_genesis}" "${joiner_peers}")"
+    write_unit_template "${RUNTIME_UNIT_TEMPLATE}" "SelfCoin Joiner Node" "${RUNTIME_LAUNCHER}"
+  else
+    active_command="$(build_bootstrap_args "${node_bin}" "${active_db}" "${packaged_genesis}")"
+    write_unit_template "${RUNTIME_UNIT_TEMPLATE}" "SelfCoin Bootstrap Node" "${RUNTIME_LAUNCHER}"
+  fi
+
+  write_launcher "${RUNTIME_LAUNCHER}" "${active_command}"
 
   printf '%s\n' "${packaged_genesis}"
 }
@@ -517,10 +582,8 @@ reset_chain_data_if_requested() {
     return 0
   fi
 
-  local state_dir="${DB_DIR}"
-  if [[ "${NODE_ROLE}" == "follower" ]]; then
-    state_dir="${FOLLOWER_DB_DIR}"
-  fi
+  local state_dir
+  state_dir="$(active_db_dir)"
 
   log "RESET_CHAIN_DATA=1: resetting ${state_dir} (keeping validator key if present)."
   local key="${state_dir}/keystore/validator.json"
@@ -542,8 +605,8 @@ open_firewall_ports() {
     log "Skipping firewall changes (OPEN_FIREWALL_PORTS=0)."
     return 0
   fi
-  if [[ "${NODE_ROLE}" == "follower" ]]; then
-    log "Skipping firewall changes for follower role."
+  if [[ "$(detect_node_mode)" == "joiner" ]]; then
+    log "Skipping firewall changes for joiner mode."
     return 0
   fi
   local s; s="$(need_sudo)"
@@ -578,21 +641,9 @@ install_and_restart_service() {
 
   local s; s="$(need_sudo)"
   local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
-  local template_path
-  if [[ "${NODE_ROLE}" == "follower" ]]; then
-    local bootstrap_peer
-    bootstrap_peer="$(bootstrap_peer_endpoint)"
-    if [[ "${bootstrap_peer}" == REPLACE_WITH_BOOTSTRAP_IP:* ]]; then
-      log "Skipping systemd install for follower role: set BOOTSTRAP_IP to generate a usable direct peer."
-      log "Generated example follower launcher still exists at ${FOLLOWER_LAUNCHER}"
-      return 0
-    fi
-    template_path="${FOLLOWER_UNIT_TEMPLATE}"
-  else
-    template_path="${BOOTSTRAP_UNIT_TEMPLATE}"
-  fi
+  require_joiner_peers
 
-  ${s} install -m 0644 "${template_path}" "${service_path}"
+  ${s} install -m 0644 "${RUNTIME_UNIT_TEMPLATE}" "${service_path}"
 
   ${s} systemctl daemon-reload
   ${s} systemctl enable "${SERVICE_NAME}" >/dev/null || true
@@ -601,16 +652,18 @@ install_and_restart_service() {
 }
 
 post_build_setup() {
+  local mode
+  mode="$(detect_node_mode)"
   bootstrap_preflight
-  require_follower_bootstrap_peer
+  require_joiner_peers
   reset_chain_data_if_requested
   open_firewall_ports
   local packaged_genesis
   packaged_genesis="$(generate_runtime_artifacts)"
   install_and_restart_service
 
-  local bootstrap_peer
-  bootstrap_peer="$(bootstrap_peer_endpoint)"
+  local joiner_peers
+  joiner_peers="$(joiner_peer_csv)"
   local genesis_sha
   genesis_sha="$(sha256_file "${packaged_genesis}")"
   local verify_host
@@ -618,11 +671,18 @@ post_build_setup() {
   if [[ -z "${verify_host}" ]]; then
     verify_host="<bootstrap-ip>"
   fi
+  local active_db
+  active_db="$(active_db_dir)"
+  local seed_total
+  seed_total="$(seed_count)"
 
   log "Post-build setup summary:"
-  log "  NODE_ROLE=${NODE_ROLE}"
+  log "  Detected mode=${mode}"
+  log "  Requested NODE_ROLE=${NODE_ROLE}"
+  log "  Seed count=${seed_total}"
+  log "  Active DB=${active_db}"
   log "  Bootstrap DB=${DB_DIR}"
-  log "  Follower DB=${FOLLOWER_DB_DIR}"
+  log "  Joiner DB=${FOLLOWER_DB_DIR}"
   log "  P2P_PORT=${P2P_PORT} FOLLOWER_P2P_PORT=${FOLLOWER_P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
   log "  Packaged genesis=${packaged_genesis}"
   log "  Packaged genesis sha256=${genesis_sha}"
@@ -632,22 +692,25 @@ post_build_setup() {
   else
     log "  Unsafe genesis override is DISABLED by default."
   fi
-  log "  Bootstrap peer endpoint for followers=${bootstrap_peer}"
+  if [[ "${mode}" == "joiner" ]]; then
+    log "  Joiner peer list=${joiner_peers}"
+  else
+    log "  Joiner peer list=<none; seed file empty so this node is the bootstrap>"
+  fi
   log "Generated runtime files:"
-  log "  ${BOOTSTRAP_LAUNCHER}"
-  log "  ${FOLLOWER_LAUNCHER}"
-  log "  ${BOOTSTRAP_UNIT_TEMPLATE}"
-  log "  ${FOLLOWER_UNIT_TEMPLATE}"
-  log "Bootstrap node command:"
-  log "  ${BOOTSTRAP_LAUNCHER}"
-  log "Follower node command:"
-  log "  ${FOLLOWER_LAUNCHER}"
-  log "Bootstrap verification:"
-  log "  Listener check: ss -ltnp | rg ${P2P_PORT}"
-  log "  Reachability check: nc -vz ${verify_host} ${P2P_PORT}"
-  log "Follower verification:"
-  log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|peer-disconnected|peer-timeout|bootstrap-timeout|recv VERSION|recv VERACK|request-finalized-tip|send-finalized-tip|request-sync-tip-block|recv BLOCK|buffer-sync-block|request-sync-parent|buffered-sync-applied|reject-version'"
-  log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height=|bootstrap=template|validators_total='"
+  log "  ${RUNTIME_LAUNCHER}"
+  log "  ${RUNTIME_UNIT_TEMPLATE}"
+  log "Node command:"
+  log "  ${RUNTIME_LAUNCHER}"
+  if [[ "${mode}" == "bootstrap" ]]; then
+    log "Bootstrap verification:"
+    log "  Listener check: ss -ltnp | rg ${P2P_PORT}"
+    log "  Reachability check: nc -vz ${verify_host} ${P2P_PORT}"
+  else
+    log "Joiner verification:"
+    log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|peer-disconnected|peer-timeout|bootstrap-timeout|recv VERSION|recv VERACK|request-finalized-tip|send-finalized-tip|request-sync-tip-block|recv BLOCK|buffer-sync-block|request-sync-parent|buffered-sync-applied|reject-version'"
+    log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height=|bootstrap=template|validators_total='"
+  fi
   log "If logs show 'genesis-fingerprint-mismatch', stop the node, replace the genesis artifact, and reset the follower DB before retrying."
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"

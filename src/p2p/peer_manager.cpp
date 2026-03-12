@@ -30,6 +30,8 @@ std::string frame_fail_detail(const FrameFailureInfo& fi) {
   oss << "reason=" << frame_read_error_string(fi.reason) << " class=" << prefix_kind_string(fi.prefix_kind)
       << " expected_magic=" << u32_hex(fi.expected_magic)
       << " expected_proto=" << std::to_string(fi.expected_proto_version)
+      << " hdr_read=" << fi.header_bytes_read << " body_read=" << fi.body_bytes_read
+      << " checksum_read=" << fi.checksum_bytes_read << " eof=" << (fi.saw_eof ? "1" : "0")
       << " first16=" << bytes_to_hex_prefix(fi.first_bytes);
   if (fi.received_magic.has_value()) oss << " received_magic=" << u32_hex(*fi.received_magic);
   if (fi.payload_len.has_value()) oss << " payload_len=" << *fi.payload_len;
@@ -331,9 +333,10 @@ void PeerManager::read_loop(int peer_id) {
                                      &ferr, &finfo);
     if (!frame.has_value()) {
       if (ferr == FrameReadError::TIMEOUT_HEADER) {
-        emit_event(peer_id, info.established() ? PeerEventType::FRAME_TIMEOUT : PeerEventType::HANDSHAKE_TIMEOUT, "header-timeout");
+        emit_event(peer_id, info.established() ? PeerEventType::FRAME_TIMEOUT : PeerEventType::HANDSHAKE_TIMEOUT,
+                   frame_fail_detail(finfo));
       } else if (ferr == FrameReadError::TIMEOUT_BODY) {
-        emit_event(peer_id, PeerEventType::FRAME_TIMEOUT, "body-timeout");
+        emit_event(peer_id, PeerEventType::FRAME_TIMEOUT, frame_fail_detail(finfo));
       } else if (ferr != FrameReadError::NONE && ferr != FrameReadError::IO_EOF) {
         emit_event(peer_id, PeerEventType::FRAME_INVALID, frame_fail_detail(finfo));
       }

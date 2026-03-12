@@ -39,6 +39,10 @@ struct FrameFailureInfo {
   std::uint32_t expected_magic{0};
   std::uint16_t expected_proto_version{0};
   PrefixKind prefix_kind{PrefixKind::UNKNOWN};
+  std::size_t header_bytes_read{0};
+  std::size_t body_bytes_read{0};
+  std::size_t checksum_bytes_read{0};
+  bool saw_eof{false};
 };
 
 std::string frame_read_error_string(FrameReadError e);

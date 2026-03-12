@@ -124,7 +124,7 @@ bool wait_readable(int fd, std::uint32_t timeout_ms) {
   pfd.events = POLLIN;
   const int r = ::poll(&pfd, 1, static_cast<int>(timeout_ms));
   if (r <= 0) return false;
-  return (pfd.revents & POLLIN) != 0;
+  return (pfd.revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)) != 0;
 }
 
 bool read_exact_timed(int fd, std::uint8_t* dst, std::size_t n, std::uint32_t timeout_ms, std::size_t* bytes_read,
@@ -180,6 +180,8 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
     if (err) *err = hdr_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_HEADER;
     if (fail_info) {
       fail_info->reason = hdr_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_HEADER;
+      fail_info->header_bytes_read = hdr_read;
+      fail_info->saw_eof = hdr_eof;
       fail_info->first_bytes.assign(hdr.begin(), hdr.begin() + std::min<std::size_t>(hdr_read, 16));
       fail_info->prefix_kind = classify_prefix(fail_info->first_bytes);
     }
@@ -227,7 +229,11 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
   bool body_eof = false;
   if (*len > 0 && !read_exact_timed(fd, payload.data(), payload.size(), body_timeout_ms, &body_read, &body_eof)) {
     if (err) *err = body_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
-    if (fail_info) fail_info->reason = body_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
+    if (fail_info) {
+      fail_info->reason = body_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
+      fail_info->body_bytes_read = body_read;
+      fail_info->saw_eof = body_eof;
+    }
     return std::nullopt;
   }
   Hash32 checksum{};
@@ -235,7 +241,11 @@ std::optional<Frame> read_frame_fd_timed(int fd, std::size_t max_payload_len, st
   bool csum_eof = false;
   if (!read_exact_timed(fd, checksum.data(), checksum.size(), body_timeout_ms, &csum_read, &csum_eof)) {
     if (err) *err = csum_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
-    if (fail_info) fail_info->reason = csum_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
+    if (fail_info) {
+      fail_info->reason = csum_eof ? FrameReadError::IO_EOF : FrameReadError::TIMEOUT_BODY;
+      fail_info->checksum_bytes_read = csum_read;
+      fail_info->saw_eof = csum_eof;
+    }
     return std::nullopt;
   }
 

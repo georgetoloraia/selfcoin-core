@@ -86,6 +86,12 @@ bool restart_debug_enabled() {
   return std::string(v) == "1" || std::string(v) == "true" || std::string(v) == "yes";
 }
 
+bool is_loopback_seed_host(const std::string& host) {
+  if (host == "localhost") return true;
+  if (host == "::1") return true;
+  return host == "127.0.0.1" || host.rfind("127.", 0) == 0;
+}
+
 std::string endpoint_to_ip(std::string endpoint) {
   const auto pos = endpoint.find(':');
   if (pos == std::string::npos) return endpoint;
@@ -2723,6 +2729,11 @@ bool Node::seed_preflight_ok(const std::string& host, std::uint16_t port) {
     if (preflight_checked_seeds_.find(key) != preflight_checked_seeds_.end()) return true;
     preflight_checked_seeds_.insert(key);
   }
+
+  // Avoid sacrificial TCP probes against public seeds. They look like real
+  // inbound peers to a bootstrap node, trigger VERSION sends, and then close
+  // before the actual handshake connection is attempted.
+  if (!is_loopback_seed_host(host)) return true;
 
   addrinfo hints{};
   hints.ai_family = AF_INET;

@@ -13,6 +13,9 @@ RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-1}"
+HANDSHAKE_TIMEOUT_MS="${HANDSHAKE_TIMEOUT_MS:-30000}"
+FRAME_TIMEOUT_MS="${FRAME_TIMEOUT_MS:-30000}"
+IDLE_TIMEOUT_MS="${IDLE_TIMEOUT_MS:-120000}"
 NODE_EXTRA_ARGS="${NODE_EXTRA_ARGS:-}"
 USE_SEEDS_JSON="${USE_SEEDS_JSON:-1}"
 GENESIS_BIN="${GENESIS_BIN:-}"
@@ -350,6 +353,9 @@ build_node_command() {
     "--db" "${DB_DIR}"
     "--genesis" "${genesis_path}"
     "--port" "${P2P_PORT}"
+    "--handshake-timeout-ms" "${HANDSHAKE_TIMEOUT_MS}"
+    "--frame-timeout-ms" "${FRAME_TIMEOUT_MS}"
+    "--idle-timeout-ms" "${IDLE_TIMEOUT_MS}"
   )
 
   if [[ "${ALLOW_UNSAFE_GENESIS_OVERRIDE}" == "1" ]]; then

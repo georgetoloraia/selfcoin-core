@@ -1,11 +1,50 @@
 #include "test_framework.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include "common/network.hpp"
 #include "codec/bytes.hpp"
+#include "p2p/peer_manager.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 
 using namespace selfcoin;
+
+namespace {
+
+std::uint16_t reserve_test_port() {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return 0;
+  int one = 1;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(0);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return 0;
+  }
+  sockaddr_in bound{};
+  socklen_t len = sizeof(bound);
+  std::uint16_t port = 0;
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &len) == 0) {
+    port = ntohs(bound.sin_port);
+  }
+  ::close(fd);
+  return port;
+}
+
+}  // namespace
 
 TEST(test_version_message_v07_roundtrip) {
   p2p::VersionMsg v;
@@ -118,6 +157,77 @@ TEST(test_version_message_rejects_oversized_software_string) {
   Hash32 zero{};
   w.bytes_fixed(zero);
   ASSERT_TRUE(!p2p::de_version(w.take()).has_value());
+}
+
+TEST(test_peer_manager_starts_reader_before_connected_event) {
+  const auto net = mainnet_network();
+  const std::uint16_t port = reserve_test_port();
+  if (port == 0) return;
+
+  p2p::PeerManager listener;
+  p2p::PeerManager dialer;
+  listener.configure_network(net.magic, net.protocol_version, net.max_payload_len);
+  dialer.configure_network(net.magic, net.protocol_version, net.max_payload_len);
+  listener.configure_limits({3000, 3000, 3000, 1024 * 1024, 100, 8});
+  dialer.configure_limits({3000, 3000, 3000, 1024 * 1024, 100, 8});
+
+  std::mutex mu;
+  std::condition_variable cv;
+  bool listener_received_version = false;
+  bool listener_saw_connected = false;
+  bool listener_callback_observed_read = false;
+
+  p2p::VersionMsg v;
+  v.proto_version = net.protocol_version;
+  v.network_id = net.network_id;
+  v.feature_flags = net.feature_flags;
+  v.timestamp = 1;
+  v.nonce = 2;
+  v.node_software_version = "selfcoin-tests/0.7";
+  v.start_height = 0;
+  v.start_hash.fill(0x11);
+
+  listener.set_on_message([&](int, std::uint16_t msg_type, const Bytes&) {
+    if (msg_type != p2p::MsgType::VERSION) return;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      listener_received_version = true;
+    }
+    cv.notify_all();
+  });
+  dialer.set_on_message([](int, std::uint16_t, const Bytes&) {});
+
+  listener.set_on_event([&](int peer_id, p2p::PeerManager::PeerEventType type, const std::string&) {
+    if (type != p2p::PeerManager::PeerEventType::CONNECTED) return;
+    listener_saw_connected = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    std::unique_lock<std::mutex> lk(mu);
+    listener_callback_observed_read = cv.wait_until(lk, deadline, [&]() { return listener_received_version; });
+    (void)peer_id;
+  });
+  dialer.set_on_event([&](int peer_id, p2p::PeerManager::PeerEventType type, const std::string&) {
+    if (type != p2p::PeerManager::PeerEventType::CONNECTED) return;
+    ASSERT_TRUE(dialer.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v)));
+  });
+
+  ASSERT_TRUE(listener.start_listener("127.0.0.1", port));
+  ASSERT_TRUE(dialer.connect_to("127.0.0.1", port));
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (std::chrono::steady_clock::now() < deadline) {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (listener_received_version) break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  listener.stop();
+  dialer.stop();
+
+  ASSERT_TRUE(listener_saw_connected);
+  ASSERT_TRUE(listener_received_version);
+  ASSERT_TRUE(listener_callback_observed_read);
 }
 
 TEST(test_tx_message_rejects_oversized_payload) {

@@ -295,13 +295,22 @@ void PeerManager::start_peer(int fd, const std::string& endpoint, const std::str
     p->info.inbound = inbound;
     peers_[p->info.id] = p;
   }
-  emit_event(p->info.id, PeerEventType::CONNECTED, endpoint);
   active_readers_.fetch_add(1);
-  std::thread([this, peer_id = p->info.id]() {
+  std::thread([this, peer_id = p->info.id, p]() {
+    {
+      std::lock_guard<std::mutex> lk(p->start_mu);
+      p->reader_started = true;
+    }
+    p->start_cv.notify_all();
     read_loop(peer_id);
     active_readers_.fetch_sub(1);
     reader_wait_cv_.notify_all();
   }).detach();
+  {
+    std::unique_lock<std::mutex> lk(p->start_mu);
+    p->start_cv.wait(lk, [&p]() { return p->reader_started; });
+  }
+  emit_event(p->info.id, PeerEventType::CONNECTED, endpoint);
 }
 
 void PeerManager::read_loop(int peer_id) {

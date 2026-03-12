@@ -1286,8 +1286,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
   switch (msg_type) {
     case p2p::MsgType::GET_FINALIZED_TIP: {
       log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id));
-      p2p::FinalizedTipMsg tip{finalized_height_, finalized_hash_};
-      (void)p2p_.send_to(peer_id, p2p::MsgType::FINALIZED_TIP, p2p::ser_finalized_tip(tip));
+      send_finalized_tip(peer_id);
       break;
     }
     case p2p::MsgType::FINALIZED_TIP: {

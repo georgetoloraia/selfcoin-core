@@ -10,6 +10,9 @@ RUN_TESTS="${RUN_TESTS:-0}"
 CLEAN_ON_GENERATOR_MISMATCH="${CLEAN_ON_GENERATOR_MISMATCH:-1}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
 RESET_CHAIN_DATA="${RESET_CHAIN_DATA:-0}"
+SETUP_NODE_SERVICE="${SETUP_NODE_SERVICE:-1}"
+SERVICE_NAME="${SERVICE_NAME:-selfcoin}"
+SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-1}"
@@ -98,6 +101,10 @@ need_sudo() {
   else
     echo ""
   fi
+}
+
+systemd_available() {
+  have systemctl && [[ -d /run/systemd/system ]]
 }
 
 install_apt() {
@@ -433,6 +440,47 @@ run_node() {
   eval "exec ${command_line}"
 }
 
+install_and_restart_service() {
+  local command_line="$1"
+  if [[ "${SETUP_NODE_SERVICE}" != "1" ]]; then
+    return 1
+  fi
+  if ! systemd_available; then
+    return 1
+  fi
+
+  local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
+  local escaped
+  escaped="${command_line//\'/\'\\\'\'}"
+  local s; s="$(need_sudo)"
+  ${s} tee "${service_path}" >/dev/null <<EOF
+[Unit]
+Description=SelfCoin Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+WorkingDirectory=${ROOT_DIR}
+ExecStart=/bin/bash -lc 'exec ${escaped}'
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=90
+KillSignal=SIGINT
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  ${s} systemctl daemon-reload
+  ${s} systemctl enable "${SERVICE_NAME}" >/dev/null || true
+  ${s} systemctl restart "${SERVICE_NAME}"
+  log "Installed and restarted ${SERVICE_NAME}.service"
+  ${s} systemctl status "${SERVICE_NAME}" --no-pager || true
+  return 0
+}
+
 main() {
   log "Installing build dependencies (if missing)..."
   install_deps
@@ -448,6 +496,9 @@ main() {
   command_line="$(build_node_command "${genesis_path}" "${mode}")"
 
   print_summary "${mode}" "${genesis_path}" "${command_line}"
+  if install_and_restart_service "${command_line}"; then
+    exit 0
+  fi
   run_node "${command_line}"
 }
 

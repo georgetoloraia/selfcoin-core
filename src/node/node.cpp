@@ -1109,13 +1109,18 @@ void Node::send_version(int peer_id) {
   v.node_software_version +=
       ";validator_pubkey=" + hex_encode(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
 
-  (void)p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
-  p2p_.mark_handshake_tx(peer_id, true, false);
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::VERSION, p2p::ser_version(v));
+  log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERSION) + " peer_id=" + std::to_string(peer_id) +
+           " start_height=" + std::to_string(v.start_height) + " start_hash=" + short_hash_hex(v.start_hash) +
+           " status=" + (ok ? "ok" : "failed"));
+  if (ok) p2p_.mark_handshake_tx(peer_id, true, false);
 }
 
 void Node::maybe_send_verack(int peer_id) {
-  (void)p2p_.send_to(peer_id, p2p::MsgType::VERACK, {});
-  p2p_.mark_handshake_tx(peer_id, false, true);
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::VERACK, {});
+  log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERACK) + " peer_id=" + std::to_string(peer_id) +
+           " status=" + (ok ? "ok" : "failed"));
+  if (ok) p2p_.mark_handshake_tx(peer_id, false, true);
 }
 
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {

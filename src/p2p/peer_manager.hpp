@@ -81,6 +81,9 @@ class PeerManager {
     bool inbound{false};
     PeerInfo info;
     mutable std::mutex write_mu;
+    mutable std::mutex start_mu;
+    std::condition_variable start_cv;
+    bool reader_started{false};
     std::atomic<std::size_t> queued_bytes{0};
     std::atomic<std::size_t> queued_msgs{0};
   };

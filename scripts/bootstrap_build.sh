@@ -15,7 +15,6 @@ SERVICE_NAME="${SERVICE_NAME:-selfcoin}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$USER}}"
 DB_DIR="${DB_DIR:-$HOME/.selfcoin/mainnet}"
 P2P_PORT="${P2P_PORT:-19440}"
-FOLLOWER_P2P_PORT="${FOLLOWER_P2P_PORT:-19440}"
 LIGHTSERVER_PORT="${LIGHTSERVER_PORT:-19444}"
 OUTBOUND_TARGET="${OUTBOUND_TARGET:-2}"
 NODE_PUBLIC="${NODE_PUBLIC:-1}"
@@ -27,7 +26,6 @@ ALLOW_UNSAFE_GENESIS_OVERRIDE="${ALLOW_UNSAFE_GENESIS_OVERRIDE:-0}"
 NODE_ROLE="${NODE_ROLE:-auto}"
 BOOTSTRAP_IP="${BOOTSTRAP_IP:-}"
 BOOTSTRAP_HOST="${BOOTSTRAP_HOST:-}"
-FOLLOWER_DB_DIR="${FOLLOWER_DB_DIR:-$HOME/.selfcoin/mainnet-follower}"
 CONFIG_OUTPUT_DIR="${CONFIG_OUTPUT_DIR:-${ROOT_DIR}/deploy/generated}"
 RUNTIME_LAUNCHER="${CONFIG_OUTPUT_DIR}/selfcoin-node.sh"
 RUNTIME_UNIT_TEMPLATE="${CONFIG_OUTPUT_DIR}/systemd/selfcoin.service"
@@ -308,19 +306,7 @@ detect_node_mode() {
 }
 
 active_db_dir() {
-  if [[ "$(detect_node_mode)" == "joiner" ]]; then
-    echo "${FOLLOWER_DB_DIR}"
-  else
-    echo "${DB_DIR}"
-  fi
-}
-
-active_p2p_port() {
-  if [[ "$(detect_node_mode)" == "joiner" ]]; then
-    echo "${FOLLOWER_P2P_PORT}"
-  else
-    echo "${P2P_PORT}"
-  fi
+  echo "${DB_DIR}"
 }
 
 bootstrap_host_value() {
@@ -487,7 +473,7 @@ build_joiner_args() {
     "${node_bin}"
     "--db" "${db_dir}"
     "--genesis" "${genesis_path}"
-    "--port" "${FOLLOWER_P2P_PORT}"
+    "--port" "${P2P_PORT}"
     "--outbound-target" "${OUTBOUND_TARGET}"
     "--validator-key-file" "${key_file}"
     "--no-dns-seeds"
@@ -681,9 +667,8 @@ post_build_setup() {
   log "  Requested NODE_ROLE=${NODE_ROLE}"
   log "  Seed count=${seed_total}"
   log "  Active DB=${active_db}"
-  log "  Bootstrap DB=${DB_DIR}"
-  log "  Joiner DB=${FOLLOWER_DB_DIR}"
-  log "  P2P_PORT=${P2P_PORT} FOLLOWER_P2P_PORT=${FOLLOWER_P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
+  log "  DB_DIR=${DB_DIR}"
+  log "  P2P_PORT=${P2P_PORT} LIGHTSERVER_PORT=${LIGHTSERVER_PORT}"
   log "  Packaged genesis=${packaged_genesis}"
   log "  Packaged genesis sha256=${genesis_sha}"
   log "  All nodes must use this exact genesis artifact or VERSION handshake will be rejected."
@@ -711,7 +696,7 @@ post_build_setup() {
     log "  Peer/sync log check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'peer-connected|peer-disconnected|peer-timeout|bootstrap-timeout|recv VERSION|recv VERACK|request-finalized-tip|send-finalized-tip|request-sync-tip-block|recv BLOCK|buffer-sync-block|request-sync-parent|buffered-sync-applied|reject-version'"
     log "  Runtime status check: journalctl -u ${SERVICE_NAME} -n 100 --no-pager | rg 'established=|height=|bootstrap=template|validators_total='"
   fi
-  log "If logs show 'genesis-fingerprint-mismatch', stop the node, replace the genesis artifact, and reset the follower DB before retrying."
+  log "If logs show 'genesis-fingerprint-mismatch', stop the node, replace the genesis artifact, and reset ${DB_DIR} before retrying."
   if systemd_available && [[ "${SETUP_NODE_SERVICE}" == "1" ]]; then
     local s; s="$(need_sudo)"
     ${s} systemctl status "${SERVICE_NAME}" --no-pager || true

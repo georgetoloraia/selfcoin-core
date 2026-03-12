@@ -1261,15 +1261,26 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
 
   const auto info = p2p_.get_peer_info(peer_id);
   if (!info.established()) {
-    if (msg_type == p2p::MsgType::ADDR || msg_type == p2p::MsgType::GETADDR) {
-      log_line("drop-addr peer_id=" + std::to_string(peer_id) + " reason=pre-handshake");
+    const bool bootstrap_sync_msg =
+        msg_type == p2p::MsgType::GET_FINALIZED_TIP || msg_type == p2p::MsgType::FINALIZED_TIP ||
+        msg_type == p2p::MsgType::GET_BLOCK || msg_type == p2p::MsgType::BLOCK;
+    // After VERSION exchange and our VERACK transmit, the peer may already start
+    // sync bootstrap traffic before we have observed its VERACK locally. Allow
+    // these messages through instead of misclassifying them as pre-handshake
+    // consensus traffic and dropping the first finalized-tip/block sync step.
+    if (bootstrap_sync_msg && info.version_rx && info.version_tx && info.verack_tx) {
+      // fall through
+    } else {
+      if (msg_type == p2p::MsgType::ADDR || msg_type == p2p::MsgType::GETADDR) {
+        log_line("drop-addr peer_id=" + std::to_string(peer_id) + " reason=pre-handshake");
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        ++rejected_pre_handshake_;
+      }
+      score_peer(peer_id, p2p::MisbehaviorReason::PRE_HANDSHAKE_CONSENSUS, "pre-handshake-msg");
+      return;
     }
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      ++rejected_pre_handshake_;
-    }
-    score_peer(peer_id, p2p::MisbehaviorReason::PRE_HANDSHAKE_CONSENSUS, "pre-handshake-msg");
-    return;
   }
 
   switch (msg_type) {

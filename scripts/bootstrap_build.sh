@@ -450,15 +450,7 @@ install_and_restart_service() {
   fi
 
   local service_path="/etc/systemd/system/${SERVICE_NAME}.service"
-  local launcher_path="${ROOT_DIR}/deploy/generated/${SERVICE_NAME}.service.sh"
   local s; s="$(need_sudo)"
-  mkdir -p "${ROOT_DIR}/deploy/generated"
-  cat > "${launcher_path}" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec ${command_line}
-EOF
-  chmod +x "${launcher_path}"
   ${s} tee "${service_path}" >/dev/null <<EOF
 [Unit]
 Description=SelfCoin Node
@@ -469,7 +461,7 @@ Wants=network-online.target
 Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${ROOT_DIR}
-ExecStart=${launcher_path}
+ExecStart=${command_line}
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=90

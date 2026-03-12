@@ -23,6 +23,18 @@ NODE_ROLE="${NODE_ROLE:-auto}"
 log() { printf '[bootstrap] %s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+listener_pids_on_port() {
+  local port="$1"
+  if have ss; then
+    ss -ltnp "sport = :${port}" 2>/dev/null | grep -o "pid=[0-9]\+" | cut -d= -f2 | awk '!seen[$0]++'
+    return 0
+  fi
+  if have lsof; then
+    lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk '!seen[$0]++'
+    return 0
+  fi
+}
+
 detect_build_jobs() {
   if [[ -n "${BUILD_JOBS}" ]]; then
     echo "${BUILD_JOBS}"
@@ -274,6 +286,44 @@ sha256_file() {
 reset_chain_data_if_requested() {
   if [[ "${RESET_CHAIN_DATA}" != "1" ]]; then
     return 0
+  fi
+
+  local -a pids=()
+  mapfile -t pids < <(listener_pids_on_port "${P2P_PORT}" || true)
+  if (( ${#pids[@]} > 0 )); then
+    local pid
+    for pid in "${pids[@]}"; do
+      local comm
+      comm="$(ps -p "${pid}" -o comm= 2>/dev/null | tr -d '[:space:]')"
+      if [[ "${comm}" != "selfcoin-node" ]]; then
+        log "Port ${P2P_PORT} is already in use by pid=${pid} (${comm:-unknown})."
+        log "Stop that process manually, then retry."
+        exit 1
+      fi
+      log "Stopping existing selfcoin-node pid=${pid} on port ${P2P_PORT}."
+      kill "${pid}" 2>/dev/null || true
+    done
+
+    sleep 1
+    local -a stubborn_pids=()
+    mapfile -t stubborn_pids < <(listener_pids_on_port "${P2P_PORT}" || true)
+    if (( ${#stubborn_pids[@]} > 0 )); then
+      for pid in "${stubborn_pids[@]}"; do
+        local comm
+        comm="$(ps -p "${pid}" -o comm= 2>/dev/null | tr -d '[:space:]')"
+        if [[ "${comm}" == "selfcoin-node" ]]; then
+          log "Force stopping selfcoin-node pid=${pid} on port ${P2P_PORT}."
+          kill -9 "${pid}" 2>/dev/null || true
+        fi
+      done
+      sleep 1
+    fi
+
+    if listener_pids_on_port "${P2P_PORT}" | grep -q .; then
+      log "Port ${P2P_PORT} is still busy after cleanup."
+      log "Run: ss -ltnp | rg ${P2P_PORT}"
+      exit 1
+    fi
   fi
 
   log "RESET_CHAIN_DATA=1: resetting ${DB_DIR} (keeping validator key if present)."

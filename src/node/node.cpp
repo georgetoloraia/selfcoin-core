@@ -271,6 +271,10 @@ std::vector<crypto::KeyPair> Node::deterministic_test_keypairs() {
 }
 
 bool Node::init() {
+  // systemd/journald captures stdout via a pipe, which is block-buffered by
+  // default. Force line flushing so quiet followers still emit live handshake
+  // and sync diagnostics instead of holding them until process exit.
+  std::cout.setf(std::ios::unitbuf);
   if (cfg_.max_committee == 0) cfg_.max_committee = cfg_.network.max_committee;
   genesis_source_hint_ = cfg_.genesis_path.empty() ? "embedded" : "file";
   cfg_.db_path = expand_user_home(cfg_.db_path);

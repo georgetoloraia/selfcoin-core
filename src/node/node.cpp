@@ -401,6 +401,18 @@ bool Node::init() {
     p2p_.set_on_message([this](int peer_id, std::uint16_t msg_type, const Bytes& payload) {
       handle_message(peer_id, msg_type, payload);
     });
+    p2p_.set_read_timeout_override([this](int peer_id, const p2p::PeerInfo& info) -> std::optional<std::uint32_t> {
+      if (!info.established()) return std::nullopt;
+      std::lock_guard<std::mutex> lk(mu_);
+      bool sync_incomplete = bootstrap_sync_incomplete_locked(peer_id);
+      bool local_sync_backlog = !buffered_sync_blocks_.empty() || !requested_sync_blocks_.empty();
+      bool peer_tip_diverged = false;
+      if (auto it = peer_finalized_tips_.find(peer_id); it != peer_finalized_tips_.end()) {
+        peer_tip_diverged = it->second.height != finalized_height_ || it->second.hash != finalized_hash_;
+      }
+      if (!sync_incomplete && !local_sync_backlog && !peer_tip_diverged) return std::nullopt;
+      return std::max<std::uint32_t>(cfg_.idle_timeout_ms, 600'000u);
+    });
     p2p_.set_on_event([this](int peer_id, p2p::PeerManager::PeerEventType type, const std::string& detail) {
       if (type == p2p::PeerManager::PeerEventType::CONNECTED) {
         {

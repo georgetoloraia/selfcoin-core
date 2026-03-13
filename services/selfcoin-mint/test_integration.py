@@ -29,6 +29,13 @@ def http_get_json(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def http_post_json(url: str, payload: dict) -> dict:
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 class MintIntegrationTests(unittest.TestCase):
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()
@@ -109,6 +116,9 @@ class MintIntegrationTests(unittest.TestCase):
                 signed_blind = int(signed_line.split("=", 1)[1], 16)
                 unblinded = (signed_blind * pow(r, -1, n)) % n
                 self.assertEqual(pow(unblinded, e, n), message)
+                accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
+                self.assertEqual(accounting["total_deposited"], 100000)
+                self.assertEqual(accounting["issued_blind_count"], 1)
 
                 redeem_cmd = [
                     str(CLI),
@@ -117,6 +127,8 @@ class MintIntegrationTests(unittest.TestCase):
                     f"http://127.0.0.1:{port}/redemptions/create",
                     "--redeem-address",
                     "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
+                    "--amount",
+                    "60000",
                     "--note",
                     "note-1",
                     "--note",
@@ -138,6 +150,23 @@ class MintIntegrationTests(unittest.TestCase):
                 status_lines = dict(line.split("=", 1) for line in status.stdout.strip().splitlines())
                 self.assertEqual(status_lines["state"], "pending")
                 self.assertEqual(status_lines["l1_txid"], "")
+
+                reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                self.assertEqual(reserves["available_reserve"], 40000)
+
+                update = http_post_json(
+                    f"http://127.0.0.1:{port}/redemptions/update",
+                    {
+                        "redemption_batch_id": batch_id,
+                        "state": "finalized",
+                        "l1_txid": "44" * 32,
+                    },
+                )
+                self.assertTrue(update["accepted"])
+                finalized = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                finalized_lines = dict(line.split("=", 1) for line in finalized.stdout.strip().splitlines())
+                self.assertEqual(finalized_lines["state"], "finalized")
+                self.assertEqual(finalized_lines["l1_txid"], "44" * 32)
             finally:
                 proc.terminate()
                 try:

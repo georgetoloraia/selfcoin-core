@@ -311,7 +311,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
               << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
               << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> [--blind <msg> ...]\n"
-              << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --note <opaque> [--note <opaque> ...]\n"
+              << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --amount <u64> --note <opaque> [--note <opaque> ...]\n"
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
               << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
@@ -1491,19 +1491,22 @@ int main(int argc, char** argv) {
     std::string url;
     std::string redeem_address;
     std::vector<std::string> notes;
+    std::uint64_t amount = 0;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
       else if (a == "--redeem-address" && i + 1 < argc) redeem_address = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
       else if (a == "--note" && i + 1 < argc) notes.push_back(argv[++i]);
     }
-    if (url.empty() || redeem_address.empty() || notes.empty()) {
-      std::cerr << "mint_redeem_create requires --url, --redeem-address, and at least one --note\n";
+    if (url.empty() || redeem_address.empty() || amount == 0 || notes.empty()) {
+      std::cerr << "mint_redeem_create requires --url, --redeem-address, --amount, and at least one --note\n";
       return 1;
     }
     selfcoin::privacy::MintRedemptionRequest req;
     req.notes = notes;
     req.redeem_address = redeem_address;
+    req.amount = amount;
 
     std::string err;
     auto body = http_post_json(url, selfcoin::privacy::to_json(req), &err);
@@ -1569,6 +1572,7 @@ int main(int argc, char** argv) {
     selfcoin::privacy::MintRedemptionRequest redeem_req;
     redeem_req.notes = {"note-1", "note-2"};
     redeem_req.redeem_address = "sc1example";
+    redeem_req.amount = 100000;
 
     std::cout << "deposit_registration=" << selfcoin::privacy::to_json(deposit_req) << "\n";
     std::cout << "blind_issue=" << selfcoin::privacy::to_json(issue_req) << "\n";

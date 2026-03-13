@@ -17,6 +17,13 @@ TEST(test_mint_client_json_roundtrips) {
   ASSERT_TRUE(json.find("\"deposit_vout\":3") != std::string::npos);
   ASSERT_TRUE(json.find("\"amount\":42000") != std::string::npos);
 
+  privacy::MintRedemptionRequest redeem_req;
+  redeem_req.notes = {"note-1", "note-2"};
+  redeem_req.redeem_address = "sc1example";
+  redeem_req.amount = 1234;
+  const auto redeem_json = privacy::to_json(redeem_req);
+  ASSERT_TRUE(redeem_json.find("\"amount\":1234") != std::string::npos);
+
   const auto dep_resp = privacy::parse_mint_deposit_registration_response(
       "{\"accepted\":true,\"confirmations_required\":2,\"mint_deposit_ref\":\"ref-1\"}");
   ASSERT_TRUE(dep_resp.has_value());

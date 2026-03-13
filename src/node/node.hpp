@@ -36,7 +36,7 @@ struct NodeConfig {
   bool dns_seeds{true};
   std::size_t outbound_target{8};
   std::size_t max_inbound{64};
-  std::uint16_t p2p_port{18444};
+  std::uint16_t p2p_port{19440};
   std::vector<std::string> peers;
   std::vector<std::string> seeds;
   std::string db_path{"./data/node"};
@@ -46,7 +46,7 @@ struct NodeConfig {
   std::size_t max_committee{MAX_COMMITTEE};
   std::uint32_t handshake_timeout_ms{10'000};
   std::uint32_t frame_timeout_ms{3'000};
-  std::uint32_t idle_timeout_ms{120'000};
+  std::uint32_t idle_timeout_ms{600'000};
   std::size_t peer_queue_max_bytes{2 * 1024 * 1024};
   std::size_t peer_queue_max_msgs{2'000};
   std::uint64_t ban_seconds{600};

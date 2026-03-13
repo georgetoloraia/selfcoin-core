@@ -631,54 +631,21 @@ void Node::maybe_self_bootstrap_template(std::uint64_t now_ms) {
   }
 }
 
-std::optional<Tx> Node::build_bootstrap_validator_join_tx(const PubKey32& pub) const {
-  if (pub == local_key_.public_key) return std::nullopt;
-
-  const auto sender_pkh = crypto::h160(Bytes(local_key_.public_key.begin(), local_key_.public_key.end()));
-  std::vector<std::pair<OutPoint, TxOut>> selected;
-  std::uint64_t in_sum = 0;
-
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (const auto& [op, e] : utxos_) {
-      std::array<std::uint8_t, 20> got{};
-      if (!is_p2pkh_script_pubkey(e.out.script_pubkey, &got)) continue;
-      if (got != sender_pkh) continue;
-      selected.push_back({op, e.out});
-      in_sum += e.out.value;
-      if (in_sum >= validator_bond_min_amount_) break;
-    }
+std::optional<Hash32> Node::pending_join_request_for_validator_locked(const PubKey32& pub) const {
+  for (const auto& [request_txid, req] : validator_join_requests_) {
+    if (req.validator_pubkey != pub) continue;
+    if (req.status != ValidatorJoinRequestStatus::REQUESTED) continue;
+    return request_txid;
   }
+  return std::nullopt;
+}
 
-  if (in_sum < validator_bond_min_amount_) return std::nullopt;
-
-  Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
-  reg_spk.insert(reg_spk.end(), pub.begin(), pub.end());
-
-  std::vector<TxOut> outs{TxOut{validator_bond_min_amount_, reg_spk}};
-  const std::uint64_t change = in_sum - validator_bond_min_amount_;
-  if (change > 0) outs.push_back(TxOut{change, address::p2pkh_script_pubkey(sender_pkh)});
-
-  Tx tx;
-  tx.version = 1;
-  tx.lock_time = 0;
-  for (const auto& [op, _] : selected) tx.inputs.push_back(TxIn{op.txid, op.index, {}, 0xFFFFFFFF});
-  tx.outputs = outs;
-
-  for (std::size_t i = 0; i < selected.size(); ++i) {
-    auto msg = signing_message_for_input(tx, static_cast<std::uint32_t>(i));
-    if (!msg.has_value()) return std::nullopt;
-    auto sig = crypto::ed25519_sign(*msg, local_key_.private_key);
-    if (!sig.has_value()) return std::nullopt;
-    Bytes script;
-    script.push_back(0x40);
-    script.insert(script.end(), sig->begin(), sig->end());
-    script.push_back(0x20);
-    script.insert(script.end(), local_key_.public_key.begin(), local_key_.public_key.end());
-    tx.inputs[i].script_sig = std::move(script);
+std::size_t Node::pending_join_request_count_locked() const {
+  std::size_t count = 0;
+  for (const auto& [_, req] : validator_join_requests_) {
+    if (req.status == ValidatorJoinRequestStatus::REQUESTED) ++count;
   }
-
-  return tx;
+  return count;
 }
 
 bool Node::bootstrap_joiner_ready_locked(const PubKey32& pub) const {
@@ -700,38 +667,6 @@ bool Node::bootstrap_sync_incomplete_locked(int peer_id) const {
   const auto it = peer_finalized_tips_.find(peer_id);
   if (it == peer_finalized_tips_.end()) return false;
   return it->second.height > finalized_height_ || it->second.hash != finalized_hash_;
-}
-
-void Node::maybe_submit_bootstrap_join() {
-  PubKey32 target{};
-  bool have_target = false;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!bootstrap_template_mode_ || !bootstrap_validator_pubkey_.has_value() ||
-        *bootstrap_validator_pubkey_ != local_key_.public_key) {
-      return;
-    }
-    for (const auto& pub : pending_bootstrap_joiners_) {
-      if (pub == local_key_.public_key) continue;
-      if (sponsored_bootstrap_joiners_.find(pub) != sponsored_bootstrap_joiners_.end()) continue;
-      if (validators_.get(pub).has_value()) continue;
-      if (!bootstrap_joiner_ready_locked(pub)) continue;
-      target = pub;
-      have_target = true;
-      break;
-    }
-  }
-  if (!have_target) return;
-
-  auto tx = build_bootstrap_validator_join_tx(target);
-  if (!tx.has_value()) return;
-  if (!handle_tx(*tx, false)) return;
-  broadcast_tx(*tx);
-
-  std::lock_guard<std::mutex> lk(mu_);
-  sponsored_bootstrap_joiners_.insert(target);
-  log_line("submitted bootstrap validator join tx for pubkey=" +
-           hex_encode(Bytes(target.begin(), target.end())) + " txid=" + hex_encode32(tx->txid()));
 }
 
 void Node::start() {
@@ -815,7 +750,7 @@ NodeStatus Node::status() const {
     s.bootstrap_validator_pubkey =
         hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end()));
   }
-  s.pending_bootstrap_joiners = pending_bootstrap_joiners_.size();
+  s.pending_bootstrap_joiners = pending_join_request_count_locked();
   return s;
 }
 
@@ -1021,7 +956,7 @@ void Node::event_loop() {
             << ",\"inbound_connected\":" << (cfg_.disable_p2p ? 0 : p2p_.inbound_count())
             << ",\"last_bootstrap_source\":\"" << last_bootstrap_source_ << "\""
             << ",\"bootstrap_template_mode\":" << (bootstrap_template_mode_ ? "true" : "false")
-            << ",\"pending_bootstrap_joiners\":" << pending_bootstrap_joiners_.size();
+            << ",\"pending_bootstrap_joiners\":" << pending_join_request_count_locked();
           if (bootstrap_validator_pubkey_.has_value()) {
             j << ",\"bootstrap_validator_pubkey\":\""
               << hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end())) << "\"";
@@ -1055,7 +990,7 @@ void Node::event_loop() {
             << ",\"quorum_threshold\":" << q << ",\"observed_signers\":" << observed
             << ",\"consensus_state\":\"" << state << "\",\"consensus_version\":" << kFixedValidationRulesVersion
             << ",\"bootstrap_template_mode\":" << (bootstrap_template_mode_ ? "true" : "false")
-            << ",\"pending_bootstrap_joiners\":" << pending_bootstrap_joiners_.size();
+            << ",\"pending_bootstrap_joiners\":" << pending_join_request_count_locked();
           if (bootstrap_validator_pubkey_.has_value()) {
             j << ",\"bootstrap_validator_pubkey\":\""
               << hex_encode(Bytes(bootstrap_validator_pubkey_->begin(), bootstrap_validator_pubkey_->end())) << "\"";
@@ -1077,8 +1012,9 @@ void Node::event_loop() {
             if (!last_bootstrap_source_.empty()) {
               std::cout << " source=" << last_bootstrap_source_;
             }
-            if (!pending_bootstrap_joiners_.empty()) {
-              std::cout << " pending_joiners=" << pending_bootstrap_joiners_.size();
+            const auto pending_joiners = pending_join_request_count_locked();
+            if (pending_joiners != 0) {
+              std::cout << " pending_joiners=" << pending_joiners;
             }
           }
           std::cout << "\n";
@@ -1125,8 +1061,6 @@ void Node::event_loop() {
     }
 
     for (int peer_id : keepalive_peers) send_ping(peer_id);
-
-    maybe_submit_bootstrap_join();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!cfg_.disable_p2p) {
@@ -1271,7 +1205,6 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         {
           std::lock_guard<std::mutex> lk(mu_);
           peer_validator_pubkeys_[peer_id] = pub;
-          pending_bootstrap_joiners_.insert(pub);
         }
         if (!peer_bootstrap.has_value()) {
           (void)maybe_adopt_bootstrap_validator_from_peer(peer_id, pub, v->start_height, "version-validator-fallback");
@@ -2229,6 +2162,7 @@ bool Node::load_state() {
 
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
+  validator_join_requests_ = db_.load_validator_join_requests();
 
   if (auto b = db_.get(kV4JoinWindowStartKey); b.has_value()) {
     (void)codec::parse_exact(*b, [&](codec::ByteReader& r) {
@@ -2324,6 +2258,7 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
     }
   } else {
     consensus::ValidatorRegistry replay_validators;
+    std::map<Hash32, ValidatorJoinRequest> replay_join_requests;
     replay_validators.set_rules(validators_.rules());
     UtxoSet replay_utxos;
     if (auto gj = db_.get("G:J"); gj.has_value()) {
@@ -2362,11 +2297,50 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
 
       for (const auto& tx : block.txs) {
         const Hash32 txid = tx.txid();
+        std::set<PubKey32> requested_in_tx;
+        for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+          const auto& out = tx.outputs[out_i];
+          PubKey32 pub{};
+          PubKey32 payout{};
+          Sig64 pop{};
+          if (!is_validator_join_request_script(out.script_pubkey, &pub, &payout, &pop)) continue;
+          for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+            PubKey32 bond_pub{};
+            if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != pub) continue;
+            ValidatorJoinRequest req;
+            req.request_txid = txid;
+            req.validator_pubkey = pub;
+            req.payout_pubkey = payout;
+            req.bond_outpoint = OutPoint{txid, bond_i};
+            req.bond_amount = tx.outputs[bond_i].value;
+            req.requested_height = h;
+            req.status = ValidatorJoinRequestStatus::REQUESTED;
+            replay_join_requests[txid] = req;
+            requested_in_tx.insert(pub);
+            break;
+          }
+        }
         for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
           const auto& out = tx.outputs[out_i];
           PubKey32 pub{};
           if (is_validator_register_script(out.script_pubkey, &pub) && out.value == BOND_AMOUNT) {
+            if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
             replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+            continue;
+          }
+          Hash32 request_txid{};
+          PubKey32 validator_pub{};
+          PubKey32 approver_pub{};
+          Sig64 approval_sig{};
+          if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub, &approval_sig)) {
+            auto req_it = replay_join_requests.find(request_txid);
+            if (req_it == replay_join_requests.end()) continue;
+            auto& req = req_it->second;
+            if (req.validator_pubkey != validator_pub) continue;
+            if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
+            req.status = ValidatorJoinRequestStatus::APPROVED;
+            req.approved_height = h;
+            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
           }
         }
       }
@@ -2434,6 +2408,15 @@ bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t heig
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
+      bool gated_by_join_request = false;
+      for (const auto& out2 : tx.outputs) {
+        PubKey32 req_pub{};
+        if (is_validator_join_request_script(out2.script_pubkey, &req_pub, nullptr, nullptr) && req_pub == pub) {
+          gated_by_join_request = true;
+          break;
+        }
+      }
+      if (gated_by_join_request) continue;
       if (out.value < validator_bond_min_amount_ || out.value > validator_bond_max_amount_) return false;
 
       std::string err;
@@ -2527,10 +2510,37 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
   for (size_t txi = 0; txi < block.txs.size(); ++txi) {
     const auto& tx = block.txs[txi];
     const Hash32 txid = tx.txid();
+    std::set<PubKey32> requested_in_tx;
+    for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+      const auto& out = tx.outputs[out_i];
+      PubKey32 validator_pub{};
+      PubKey32 payout_pub{};
+      Sig64 pop{};
+      if (!is_validator_join_request_script(out.script_pubkey, &validator_pub, &payout_pub, &pop)) continue;
+
+      for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+        PubKey32 bond_pub{};
+        if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != validator_pub) continue;
+        ValidatorJoinRequest req;
+        req.request_txid = txid;
+        req.validator_pubkey = validator_pub;
+        req.payout_pubkey = payout_pub;
+        req.bond_outpoint = OutPoint{txid, bond_i};
+        req.bond_amount = tx.outputs[bond_i].value;
+        req.requested_height = height;
+        req.status = ValidatorJoinRequestStatus::REQUESTED;
+        validator_join_requests_[txid] = req;
+        (void)db_.put_validator_join_request(txid, req);
+        requested_in_tx.insert(validator_pub);
+        break;
+      }
+    }
+
     for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (is_validator_register_script(out.script_pubkey, &pub)) {
+        if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
         std::string err;
         if (validators_.register_bond(pub, OutPoint{txid, out_i}, height, out.value, &err)) {
           if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
@@ -2539,6 +2549,28 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
         } else if (!v4_active_for_height(height) && out.value == BOND_AMOUNT) {
           // Preserve pre-v4 behavior.
           validators_.register_bond_legacy(pub, OutPoint{txid, out_i}, height);
+        }
+        continue;
+      }
+
+      Hash32 request_txid{};
+      PubKey32 validator_pub{};
+      PubKey32 approver_pub{};
+      Sig64 approval_sig{};
+      if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub, &approval_sig)) {
+        auto req_it = validator_join_requests_.find(request_txid);
+        if (req_it == validator_join_requests_.end()) continue;
+        auto& req = req_it->second;
+        if (req.validator_pubkey != validator_pub) continue;
+        if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
+        req.status = ValidatorJoinRequestStatus::APPROVED;
+        req.approved_height = height;
+        (void)db_.put_validator_join_request(request_txid, req);
+        std::string err;
+        if (validators_.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err)) {
+          if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
+            ++v4_join_count_in_window_;
+          }
         }
       }
     }

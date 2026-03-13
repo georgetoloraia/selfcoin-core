@@ -113,6 +113,27 @@ using UtxoSet = std::map<OutPoint, UtxoEntry>;
 
 bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
 bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
+bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey = nullptr,
+                                      PubKey32* out_payout_pubkey = nullptr, Sig64* out_pop = nullptr);
+bool is_validator_join_approval_script(const Bytes& script, Hash32* out_request_txid = nullptr,
+                                       PubKey32* out_validator_pubkey = nullptr,
+                                       PubKey32* out_approver_pubkey = nullptr, Sig64* out_sig = nullptr);
 bool is_burn_script(const Bytes& script, Hash32* out_evidence_hash = nullptr);
+
+enum class ValidatorJoinRequestStatus : std::uint8_t {
+  REQUESTED = 0,
+  APPROVED = 1,
+};
+
+struct ValidatorJoinRequest {
+  Hash32 request_txid{};
+  PubKey32 validator_pubkey{};
+  PubKey32 payout_pubkey{};
+  OutPoint bond_outpoint{};
+  std::uint64_t bond_amount{0};
+  std::uint64_t requested_height{0};
+  std::uint64_t approved_height{0};
+  ValidatorJoinRequestStatus status{ValidatorJoinRequestStatus::REQUESTED};
+};
 
 }  // namespace selfcoin

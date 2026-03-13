@@ -53,7 +53,10 @@ bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig, PubKey32* out_
 
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
   return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
-         is_validator_unbond_script(script_pubkey, nullptr) || is_burn_script(script_pubkey, nullptr);
+         is_validator_unbond_script(script_pubkey, nullptr) ||
+         is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
+         is_validator_join_approval_script(script_pubkey, nullptr, nullptr, nullptr, nullptr) ||
+         is_burn_script(script_pubkey, nullptr);
 }
 
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index) {
@@ -84,6 +87,24 @@ std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_
   w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '0'});
   w.bytes_fixed(txh);
   w.u32le(input_index);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
+  w.bytes_fixed(validator_pubkey);
+  w.bytes_fixed(payout_pubkey);
+  const Hash32 msg = crypto::sha256d(w.data());
+  return Bytes(msg.begin(), msg.end());
+}
+
+Bytes validator_join_approval_message(const Hash32& request_txid, const PubKey32& validator_pubkey) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'A', 'P', 'P', '-', 'V', '1'});
+  w.bytes_fixed(request_txid);
+  w.bytes_fixed(validator_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -156,6 +177,38 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
         return {false, "SCVALREG output must equal BOND_AMOUNT", 0};
       }
     }
+    PubKey32 payout{};
+    Sig64 pop{};
+    if (is_validator_join_request_script(out.script_pubkey, &pub, &payout, &pop)) {
+      if (out.value != 0) return {false, "SCVALJRQ output must have zero value", 0};
+      if (!crypto::ed25519_verify(validator_join_request_pop_message(pub, payout), pop, pub)) {
+        return {false, "validator join request proof invalid", 0};
+      }
+    }
+    Hash32 req_txid{};
+    PubKey32 approver{};
+    Sig64 approval_sig{};
+    if (is_validator_join_approval_script(out.script_pubkey, &req_txid, &pub, &approver, &approval_sig)) {
+      if (out.value != 0) return {false, "SCVALJAP output must have zero value", 0};
+      if (!ctx || !ctx->validators) return {false, "validator join approval requires validator context", 0};
+      if (!ctx->validators->is_active_for_height(approver, ctx->current_height)) {
+        return {false, "validator join approver not active", 0};
+      }
+      if (!crypto::ed25519_verify(validator_join_approval_message(req_txid, pub), approval_sig, approver)) {
+        return {false, "validator join approval signature invalid", 0};
+      }
+    }
+  }
+
+  std::set<PubKey32> reg_outputs;
+  std::set<PubKey32> join_req_outputs;
+  for (const auto& out : tx.outputs) {
+    PubKey32 pub{};
+    if (is_validator_register_script(out.script_pubkey, &pub)) reg_outputs.insert(pub);
+    if (is_validator_join_request_script(out.script_pubkey, &pub, nullptr, nullptr)) join_req_outputs.insert(pub);
+  }
+  for (const auto& pub : join_req_outputs) {
+    if (reg_outputs.find(pub) == reg_outputs.end()) return {false, "join request missing matching SCVALREG output", 0};
   }
 
   std::uint64_t in_sum = 0;

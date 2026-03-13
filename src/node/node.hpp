@@ -178,10 +178,10 @@ class Node {
   bool maybe_adopt_bootstrap_validator_from_peer(int peer_id, const PubKey32& pub, std::uint64_t peer_height,
                                                  const char* source);
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
-  std::optional<Tx> build_bootstrap_validator_join_tx(const PubKey32& pub) const;
   bool bootstrap_joiner_ready_locked(const PubKey32& pub) const;
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
-  void maybe_submit_bootstrap_join();
+  std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
+  std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();
   bool load_state();
   void apply_validator_state_changes(const Block& block, const UtxoSet& pre_utxos, std::uint64_t height);
@@ -253,6 +253,7 @@ class Node {
   std::map<int, p2p::TokenBucket> tx_verify_buckets_;
   std::map<Hash32, std::size_t> candidate_block_sizes_;
   std::map<Hash32, Block> buffered_sync_blocks_;
+  std::map<Hash32, ValidatorJoinRequest> validator_join_requests_;
   std::set<Hash32> requested_sync_blocks_;
   std::map<int, std::string> peer_ip_cache_;
   std::map<int, std::uint64_t> peer_keepalive_ms_;
@@ -309,8 +310,6 @@ class Node {
   std::uint64_t startup_ms_{0};
   std::map<int, PubKey32> peer_validator_pubkeys_;
   std::map<int, p2p::FinalizedTipMsg> peer_finalized_tips_;
-  std::set<PubKey32> pending_bootstrap_joiners_;
-  std::set<PubKey32> sponsored_bootstrap_joiners_;
   bool restart_debug_{false};
 };
 

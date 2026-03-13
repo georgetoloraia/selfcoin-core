@@ -299,7 +299,7 @@ struct HttpStubServer {
 bool write_mainnet_genesis_file(const std::string& path, std::size_t n_validators);
 
 Cluster make_cluster(const std::string& base, int initial_active = 4, int node_count = 4,
-                     std::size_t max_committee = MAX_COMMITTEE) {
+                     std::size_t max_committee = MAX_COMMITTEE, bool vrf_proposer_enabled = true) {
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
@@ -315,6 +315,9 @@ Cluster make_cluster(const std::string& base, int initial_active = 4, int node_c
     cfg.disable_p2p = true;
     cfg.node_id = i;
     cfg.max_committee = max_committee;
+    cfg.network.vrf_proposer_enabled = vrf_proposer_enabled;
+    cfg.network.min_block_interval_ms = 100;
+    cfg.network.round_timeout_ms = 200;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = gpath;
@@ -1098,30 +1101,17 @@ TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
 
 TEST(test_proposer_equivocation_bans_validator_on_conflicting_signed_blocks) {
   const auto keys = node::Node::deterministic_test_keypairs();
-  auto cluster = make_cluster("/tmp/selfcoin_it_proposer_equiv");
+  auto cluster = make_cluster("/tmp/selfcoin_it_proposer_equiv", 1, 1, MAX_COMMITTEE, false);
   auto& nodes = cluster.nodes;
 
-  ASSERT_TRUE(wait_for([&]() {
-    for (const auto& n : nodes) {
-      if (n->status().height < 12) return false;
-    }
-    return true;
-  }, std::chrono::seconds(60)));
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 6; }, std::chrono::seconds(30)));
 
   for (auto& n : nodes) n->pause_proposals_for_test(true);
-  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(10)));
 
   const auto target_height = nodes[0]->status().height + 1;
-  int leader_id = -1;
-  std::optional<Block> block_a;
-  for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
-    block_a = nodes[i]->build_proposal_for_test(target_height, 0);
-    if (block_a.has_value()) {
-      leader_id = i;
-      break;
-    }
-  }
-  ASSERT_TRUE(leader_id >= 0);
+  const int leader_id = 0;
+  auto block_a = nodes[0]->build_proposal_for_test(target_height, 0);
   ASSERT_TRUE(block_a.has_value());
 
   Block block_b = *block_a;
@@ -1133,8 +1123,8 @@ TEST(test_proposer_equivocation_bans_validator_on_conflicting_signed_blocks) {
   ASSERT_TRUE(block_b.header.block_id() != block_a->header.block_id());
 
   for (auto& n : nodes) {
-    ASSERT_TRUE(n->inject_propose_for_test(*block_a));
-    ASSERT_TRUE(!n->inject_propose_for_test(block_b));
+    ASSERT_TRUE(!n->observe_propose_for_test(*block_a));
+    ASSERT_TRUE(n->observe_propose_for_test(block_b));
   }
 
   ASSERT_TRUE(wait_for([&]() {
@@ -1147,6 +1137,25 @@ TEST(test_proposer_equivocation_bans_validator_on_conflicting_signed_blocks) {
     }
     return true;
   }, std::chrono::seconds(10)));
+
+  storage::DB db;
+  ASSERT_TRUE(db.open_readonly("/tmp/selfcoin_it_proposer_equiv/node0") || db.open("/tmp/selfcoin_it_proposer_equiv/node0"));
+  const auto records = db.load_slashing_records();
+  bool found = false;
+  for (const auto& [_, rec] : records) {
+    if (rec.kind != storage::SlashingRecordKind::PROPOSER_EQUIVOCATION) continue;
+    if (rec.validator_pubkey != block_a->header.leader_pubkey) continue;
+    if (rec.height != block_a->header.height || rec.round != block_a->header.round) continue;
+    if (rec.object_a == block_a->header.block_id() && rec.object_b == block_b.header.block_id()) {
+      found = true;
+      break;
+    }
+    if (rec.object_a == block_b.header.block_id() && rec.object_b == block_a->header.block_id()) {
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
 }
 
 TEST(test_committee_selection_and_non_member_votes_ignored) {

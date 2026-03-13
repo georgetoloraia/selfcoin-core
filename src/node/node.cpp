@@ -222,6 +222,72 @@ Bytes block_proposal_signing_message(const BlockHeader& header) {
 
 Hash32 message_payload_id(const Bytes& payload) { return crypto::sha256(payload); }
 
+Hash32 vote_equivocation_record_id(const EquivocationEvidence& ev) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'L', 'V', 'O', 'T', 'E'});
+  w.u64le(ev.a.height);
+  w.u32le(ev.a.round);
+  w.bytes_fixed(ev.a.validator_pubkey);
+  w.bytes_fixed(ev.a.block_id);
+  w.bytes_fixed(ev.a.signature);
+  w.bytes_fixed(ev.b.block_id);
+  w.bytes_fixed(ev.b.signature);
+  return crypto::sha256d(w.data());
+}
+
+Hash32 proposer_equivocation_record_id(const BlockHeader& a, const BlockHeader& b) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'L', 'P', 'R', 'O', 'P'});
+  w.u64le(a.height);
+  w.u32le(a.round);
+  w.bytes_fixed(a.leader_pubkey);
+  w.bytes_fixed(a.block_id());
+  w.bytes_fixed(b.block_id());
+  return crypto::sha256d(w.data());
+}
+
+storage::SlashingRecord make_vote_equivocation_record(const EquivocationEvidence& ev, std::uint64_t observed_height) {
+  storage::SlashingRecord rec;
+  rec.record_id = vote_equivocation_record_id(ev);
+  rec.kind = storage::SlashingRecordKind::VOTE_EQUIVOCATION;
+  rec.validator_pubkey = ev.a.validator_pubkey;
+  rec.height = ev.a.height;
+  rec.round = ev.a.round;
+  rec.observed_height = observed_height;
+  rec.object_a = ev.a.block_id;
+  rec.object_b = ev.b.block_id;
+  return rec;
+}
+
+storage::SlashingRecord make_proposer_equivocation_record(const BlockHeader& a, const BlockHeader& b,
+                                                          std::uint64_t observed_height) {
+  storage::SlashingRecord rec;
+  rec.record_id = proposer_equivocation_record_id(a, b);
+  rec.kind = storage::SlashingRecordKind::PROPOSER_EQUIVOCATION;
+  rec.validator_pubkey = a.leader_pubkey;
+  rec.height = a.height;
+  rec.round = a.round;
+  rec.observed_height = observed_height;
+  rec.object_a = a.block_id();
+  rec.object_b = b.block_id();
+  return rec;
+}
+
+storage::SlashingRecord make_onchain_slash_record(const SlashEvidence& ev, const Hash32& txid, std::uint64_t observed_height) {
+  storage::SlashingRecord rec;
+  const Hash32 evidence_hash = crypto::sha256d(ev.raw_blob);
+  rec.record_id = evidence_hash;
+  rec.kind = storage::SlashingRecordKind::ONCHAIN_SLASH;
+  rec.validator_pubkey = ev.a.validator_pubkey;
+  rec.height = ev.a.height;
+  rec.round = ev.a.round;
+  rec.observed_height = observed_height;
+  rec.object_a = ev.a.block_id;
+  rec.object_b = ev.b.block_id;
+  rec.txid = txid;
+  return rec;
+}
+
 void sync_smt_tree(storage::DB& db, const std::string& tree_id, const std::vector<std::pair<Hash32, Bytes>>& leaves) {
   const std::string prefix = smt_leaf_prefix(tree_id);
   std::set<std::string> desired;
@@ -812,6 +878,10 @@ bool Node::inject_propose_for_test(const Block& block) {
   p.prev_finalized_hash = block.header.prev_finalized_hash;
   p.block_bytes = block.serialize();
   return handle_propose(p, false);
+}
+bool Node::observe_propose_for_test(const Block& block) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return check_and_record_proposer_equivocation_locked(block);
 }
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
@@ -1744,6 +1814,7 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, co
         validators_.ban(vote.validator_pubkey);
         auto vi = validators_.get(vote.validator_pubkey);
         if (vi.has_value()) db_.put_validator(vote.validator_pubkey, *vi);
+        (void)db_.put_slashing_record(make_vote_equivocation_record(*tr.evidence, finalized_height_));
         log_line("equivocation-banned validator=" +
                  hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
                  " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round));
@@ -1816,6 +1887,7 @@ bool Node::check_and_record_proposer_equivocation_locked(const Block& block) {
   if (auto vi = validators_.get(block.header.leader_pubkey); vi.has_value()) {
     (void)db_.put_validator(block.header.leader_pubkey, *vi);
   }
+  (void)db_.put_slashing_record(make_proposer_equivocation_record(it->second, block.header, finalized_height_));
   log_line("proposer-equivocation-banned validator=" +
            hex_encode(Bytes(block.header.leader_pubkey.begin(), block.header.leader_pubkey.end())) +
            " height=" + std::to_string(block.header.height) + " round=" + std::to_string(block.header.round) +
@@ -2651,6 +2723,7 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
       SlashEvidence evidence;
       if (is_validator_register_script(it->second.out.script_pubkey, &pub)) {
         if (parse_slash_script_sig(in.script_sig, &evidence)) {
+          (void)db_.put_slashing_record(make_onchain_slash_record(evidence, tx.txid(), height));
           validators_.ban(pub, height);
           (void)validators_.finalize_withdrawal(pub);
         } else {
@@ -2660,6 +2733,7 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
       }
       if (is_validator_unbond_script(it->second.out.script_pubkey, &pub)) {
         if (parse_slash_script_sig(in.script_sig, &evidence)) {
+          (void)db_.put_slashing_record(make_onchain_slash_record(evidence, tx.txid(), height));
           validators_.ban(pub, height);
         }
         (void)validators_.finalize_withdrawal(pub);

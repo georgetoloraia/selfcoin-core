@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "consensus/validators.hpp"
+#include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
 
 namespace selfcoin::storage {
@@ -14,6 +15,24 @@ namespace selfcoin::storage {
 struct TipState {
   std::uint64_t height{0};
   Hash32 hash{};
+};
+
+enum class SlashingRecordKind : std::uint8_t {
+  VOTE_EQUIVOCATION = 1,
+  PROPOSER_EQUIVOCATION = 2,
+  ONCHAIN_SLASH = 3,
+};
+
+struct SlashingRecord {
+  Hash32 record_id{};
+  SlashingRecordKind kind{SlashingRecordKind::ONCHAIN_SLASH};
+  PubKey32 validator_pubkey{};
+  std::uint64_t height{0};
+  std::uint32_t round{0};
+  std::uint64_t observed_height{0};
+  Hash32 object_a{};
+  Hash32 object_b{};
+  Hash32 txid{};
 };
 
 class DB {
@@ -58,6 +77,8 @@ class DB {
   std::map<PubKey32, consensus::ValidatorInfo> load_validators() const;
   bool put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
   std::map<Hash32, ValidatorJoinRequest> load_validator_join_requests() const;
+  bool put_slashing_record(const SlashingRecord& rec);
+  std::map<Hash32, SlashingRecord> load_slashing_records() const;
 
   struct TxLocation {
     std::uint64_t height{0};

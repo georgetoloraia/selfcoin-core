@@ -1082,6 +1082,71 @@ TEST(test_slash_consumes_bond_and_requires_rebond_warmup) {
     }
     return true;
   }, std::chrono::seconds(120)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto info = n->validator_info_for_test(slash_val.public_key);
+      if (!info.has_value()) return false;
+      if (info->status != consensus::ValidatorStatus::BANNED) return false;
+      if (info->has_bond) return false;
+      auto active = n->active_validators_for_next_height_for_test();
+      if (std::find(active.begin(), active.end(), slash_val.public_key) != active.end()) return false;
+    }
+    return true;
+  }, std::chrono::seconds(60)));
+}
+
+TEST(test_proposer_equivocation_bans_validator_on_conflicting_signed_blocks) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  auto cluster = make_cluster("/tmp/selfcoin_it_proposer_equiv");
+  auto& nodes = cluster.nodes;
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      if (n->status().height < 12) return false;
+    }
+    return true;
+  }, std::chrono::seconds(60)));
+
+  for (auto& n : nodes) n->pause_proposals_for_test(true);
+  ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
+
+  const auto target_height = nodes[0]->status().height + 1;
+  int leader_id = -1;
+  std::optional<Block> block_a;
+  for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+    block_a = nodes[i]->build_proposal_for_test(target_height, 0);
+    if (block_a.has_value()) {
+      leader_id = i;
+      break;
+    }
+  }
+  ASSERT_TRUE(leader_id >= 0);
+  ASSERT_TRUE(block_a.has_value());
+
+  Block block_b = *block_a;
+  block_b.header.timestamp += 1;
+  auto sig_b = crypto::ed25519_sign(Bytes(block_b.header.block_id().begin(), block_b.header.block_id().end()),
+                                    keys[leader_id].private_key);
+  ASSERT_TRUE(sig_b.has_value());
+  block_b.header.leader_signature = *sig_b;
+  ASSERT_TRUE(block_b.header.block_id() != block_a->header.block_id());
+
+  for (auto& n : nodes) {
+    ASSERT_TRUE(n->inject_propose_for_test(*block_a));
+    ASSERT_TRUE(!n->inject_propose_for_test(block_b));
+  }
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto info = n->validator_info_for_test(block_a->header.leader_pubkey);
+      if (!info.has_value()) return false;
+      if (info->status != consensus::ValidatorStatus::BANNED) return false;
+      auto active = n->active_validators_for_next_height_for_test();
+      if (std::find(active.begin(), active.end(), block_a->header.leader_pubkey) != active.end()) return false;
+    }
+    return true;
+  }, std::chrono::seconds(10)));
 }
 
 TEST(test_committee_selection_and_non_member_votes_ignored) {

@@ -120,6 +120,21 @@ std::optional<Tx> Tx::parse(const Bytes& b) {
 
 Hash32 Tx::txid() const { return crypto::sha256d(serialize_without_hashcash()); }
 
+Bytes BlockHeader::serialize_without_signature() const {
+  codec::ByteWriter w;
+  w.bytes_fixed(prev_finalized_hash);
+  w.u64le(height);
+  w.u64le(timestamp);
+  w.bytes_fixed(merkle_root);
+  w.bytes_fixed(leader_pubkey);
+  w.u32le(round);
+  if (!vrf_proof.empty()) {
+    w.varbytes(vrf_proof);
+    w.bytes_fixed(vrf_output);
+  }
+  return w.take();
+}
+
 Bytes BlockHeader::serialize() const {
   codec::ByteWriter w;
   w.bytes_fixed(prev_finalized_hash);
@@ -128,6 +143,7 @@ Bytes BlockHeader::serialize() const {
   w.bytes_fixed(merkle_root);
   w.bytes_fixed(leader_pubkey);
   w.u32le(round);
+  w.bytes_fixed(leader_signature);
   if (!vrf_proof.empty()) {
     w.varbytes(vrf_proof);
     w.bytes_fixed(vrf_output);
@@ -151,6 +167,9 @@ std::optional<BlockHeader> BlockHeader::parse(const Bytes& b) {
         h.merkle_root = *merkle;
         h.leader_pubkey = *leader;
         h.round = *round;
+        auto leader_sig = r.bytes_fixed<64>();
+        if (!leader_sig) return false;
+        h.leader_signature = *leader_sig;
         if (r.eof()) return true;
         auto proof = r.varbytes();
         if (!proof) return false;
@@ -168,7 +187,7 @@ std::optional<BlockHeader> BlockHeader::parse(const Bytes& b) {
 
 Hash32 BlockHeader::block_id() const {
   Bytes pre{'S', 'C', '-', 'B', 'L', 'O', 'C', 'K', '-', 'V', '0'};
-  const Bytes hbytes = serialize();
+  const Bytes hbytes = serialize_without_signature();
   pre.insert(pre.end(), hbytes.begin(), hbytes.end());
   return crypto::sha256d(pre);
 }
@@ -258,8 +277,7 @@ std::optional<FinalityCertificate> FinalityCertificate::parse(const Bytes& b) {
 
 Bytes Block::serialize() const {
   codec::ByteWriter w;
-  const Bytes h = header.serialize();
-  w.bytes(h);
+  w.varbytes(header.serialize());
   w.varint(txs.size());
   for (const auto& tx : txs) {
     w.bytes(tx.serialize_without_hashcash());
@@ -271,19 +289,11 @@ Bytes Block::serialize() const {
 std::optional<Block> Block::parse(const Bytes& b) {
   Block blk;
   if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
-        auto prev = r.bytes_fixed<32>();
-        auto height = r.u64le();
-        auto ts = r.u64le();
-        auto merkle = r.bytes_fixed<32>();
-        auto leader = r.bytes_fixed<32>();
-        auto round = r.u32le();
-        if (!prev || !height || !ts || !merkle || !leader || !round) return false;
-        blk.header.prev_finalized_hash = *prev;
-        blk.header.height = *height;
-        blk.header.timestamp = *ts;
-        blk.header.merkle_root = *merkle;
-        blk.header.leader_pubkey = *leader;
-        blk.header.round = *round;
+        auto header_bytes = r.varbytes();
+        if (!header_bytes) return false;
+        auto header = BlockHeader::parse(*header_bytes);
+        if (!header.has_value()) return false;
+        blk.header = *header;
 
         auto n = r.varint();
         if (!n || *n < 1) return false;

@@ -47,11 +47,13 @@ struct BlockHeader {
   std::uint64_t timestamp{0};
   Hash32 merkle_root;
   PubKey32 leader_pubkey;
+  Sig64 leader_signature{};
   std::uint32_t round{0};
   Bytes vrf_proof;
   Hash32 vrf_output{};
 
   Bytes serialize() const;
+  Bytes serialize_without_signature() const;
   static std::optional<BlockHeader> parse(const Bytes& b);
   Hash32 block_id() const;
 };

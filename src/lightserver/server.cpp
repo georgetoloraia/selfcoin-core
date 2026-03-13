@@ -279,6 +279,7 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
 
   consensus::ValidatorRegistry vr;
   UtxoSet utxos;
+  std::map<Hash32, ValidatorJoinRequest> join_requests;
   if (auto gj = db_.get("G:J"); gj.has_value()) {
     const std::string js(gj->begin(), gj->end());
     if (auto gd = genesis::parse_json(js); gd.has_value()) {
@@ -293,17 +294,26 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
   }
 
   auto apply_validator_changes = [&](const Block& block, std::uint64_t h) {
-    std::map<Hash32, ValidatorJoinRequest> join_requests;
     for (size_t txi = 1; txi < block.txs.size(); ++txi) {
       for (const auto& in : block.txs[txi].inputs) {
         const OutPoint op{in.prev_txid, in.prev_index};
         auto it = utxos.find(op);
         if (it == utxos.end()) continue;
         PubKey32 pub{};
-        if (!is_validator_register_script(it->second.out.script_pubkey, &pub)) continue;
         SlashEvidence ev;
-        if (parse_slash_script_sig(in.script_sig, &ev)) vr.ban(pub);
-        else vr.request_unbond(pub, h);
+        if (is_validator_register_script(it->second.out.script_pubkey, &pub)) {
+          if (parse_slash_script_sig(in.script_sig, &ev)) {
+            vr.ban(pub, h);
+            (void)vr.finalize_withdrawal(pub);
+          } else {
+            vr.request_unbond(pub, h);
+          }
+          continue;
+        }
+        if (is_validator_unbond_script(it->second.out.script_pubkey, &pub)) {
+          if (parse_slash_script_sig(in.script_sig, &ev)) vr.ban(pub, h);
+          (void)vr.finalize_withdrawal(pub);
+        }
       }
     }
     for (const auto& tx : block.txs) {

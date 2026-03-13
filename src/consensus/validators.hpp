@@ -55,7 +55,9 @@ class ValidatorRegistry {
   bool register_bond(const PubKey32& pub, const OutPoint& bond_outpoint, std::uint64_t joined_height, std::uint64_t bond_amount,
                      std::string* err = nullptr);
   bool request_unbond(const PubKey32& pub, std::uint64_t height);
-  void ban(const PubKey32& pub);
+  void ban(const PubKey32& pub, std::uint64_t height = 0);
+  bool finalize_withdrawal(const PubKey32& pub);
+  bool can_withdraw_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t delay_blocks) const;
   void advance_height(std::uint64_t height);
 
   std::vector<PubKey32> active_sorted(std::uint64_t height) const;

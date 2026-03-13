@@ -40,6 +40,7 @@ TEST(test_tx_and_blockheader_roundtrip) {
   h.timestamp = 123456;
   h.merkle_root = tx.txid();
   h.leader_pubkey.fill(9);
+  h.leader_signature.fill(7);
   h.round = 3;
   h.vrf_proof = Bytes(64, 0x42);
   h.vrf_output.fill(0xA1);

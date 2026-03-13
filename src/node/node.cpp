@@ -325,6 +325,19 @@ bool Node::init() {
   if (cfg_.miss_rate_exit_threshold_percent_override.has_value())
     v4_miss_rate_exit_threshold_percent_ = *cfg_.miss_rate_exit_threshold_percent_override;
   if (cfg_.suspend_duration_blocks_override.has_value()) v4_suspend_duration_blocks_ = *cfg_.suspend_duration_blocks_override;
+  mempool_.set_network(cfg_.network);
+  mempool_.set_hashcash_config(policy::HashcashConfig{
+      .enabled = cfg_.hashcash_enabled,
+      .base_bits = cfg_.hashcash_base_bits,
+      .max_bits = cfg_.hashcash_max_bits,
+      .epoch_seconds = cfg_.hashcash_epoch_seconds,
+      .fee_exempt_min = cfg_.hashcash_fee_exempt_min,
+      .pressure_tx_threshold = cfg_.hashcash_pressure_tx_threshold,
+      .pressure_step_txs = cfg_.hashcash_pressure_step_txs,
+      .pressure_bits_per_step = cfg_.hashcash_pressure_bits_per_step,
+      .large_tx_bytes = cfg_.hashcash_large_tx_bytes,
+      .large_tx_extra_bits = cfg_.hashcash_large_tx_extra_bits,
+  });
 
   validators_.set_rules(consensus::ValidatorRules{
       .min_bond = v4_min_bond_,
@@ -1878,7 +1891,10 @@ std::optional<Block> Node::build_proposal_block(std::uint64_t height, std::uint3
   }
 
   b.txs.push_back(coinbase);
-  b.txs.insert(b.txs.end(), picked.begin(), picked.end());
+  for (auto tx : picked) {
+    tx.hashcash.reset();
+    b.txs.push_back(std::move(tx));
+  }
 
   std::vector<Bytes> tx_bytes;
   tx_bytes.reserve(b.txs.size());
@@ -3251,6 +3267,45 @@ std::optional<NodeConfig> parse_args(int argc, char** argv) {
       auto v = next(a);
       if (!v) return std::nullopt;
       cfg.min_relay_fee = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--hashcash-enabled") {
+      cfg.hashcash_enabled = true;
+    } else if (a == "--hashcash-base-bits") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_base_bits = static_cast<std::uint32_t>(std::stoul(*v));
+      cfg.hashcash_enabled = (cfg.hashcash_base_bits != 0);
+    } else if (a == "--hashcash-max-bits") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_max_bits = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--hashcash-epoch-seconds") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_epoch_seconds = std::max<std::uint64_t>(1, std::stoull(*v));
+    } else if (a == "--hashcash-fee-exempt-min") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_fee_exempt_min = static_cast<std::uint64_t>(std::stoull(*v));
+    } else if (a == "--hashcash-pressure-tx-threshold") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_pressure_tx_threshold = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--hashcash-pressure-step-txs") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_pressure_step_txs = std::max<std::size_t>(1, static_cast<std::size_t>(std::stoull(*v)));
+    } else if (a == "--hashcash-pressure-bits-per-step") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_pressure_bits_per_step = static_cast<std::uint32_t>(std::stoul(*v));
+    } else if (a == "--hashcash-large-tx-bytes") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_large_tx_bytes = static_cast<std::size_t>(std::stoull(*v));
+    } else if (a == "--hashcash-large-tx-extra-bits") {
+      auto v = next(a);
+      if (!v) return std::nullopt;
+      cfg.hashcash_large_tx_extra_bits = static_cast<std::uint32_t>(std::stoul(*v));
     } else if (a == "--activation-enabled" || a == "--activation-max-version" || a == "--activation-window-blocks" ||
                a == "--activation-threshold-percent" || a == "--activation-delay-blocks") {
       std::cerr << "activation flags are not supported in fixed-cv7 mode\n";

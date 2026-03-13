@@ -29,6 +29,7 @@
 #include "keystore/validator_keystore.hpp"
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
+#include "policy/hashcash.hpp"
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
 #include "utxo/signing.hpp"
@@ -276,6 +277,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
               << "  selfcoin-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
@@ -1107,6 +1109,58 @@ int main(int argc, char** argv) {
       std::cerr << "create join request tx failed: " << err << "\n";
       return 1;
     }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "hashcash_stamp_tx") {
+    std::string tx_hex;
+    std::string network_name = "mainnet";
+    std::uint32_t bits = 18;
+    std::uint64_t epoch_seconds = 60;
+    std::uint64_t now_unix = static_cast<std::uint64_t>(std::time(nullptr));
+    std::uint64_t max_nonce = 0;
+    for (int i = 2; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (a == "--tx-hex" && i + 1 < argc) tx_hex = argv[++i];
+      else if (a == "--bits" && i + 1 < argc) bits = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--network" && i + 1 < argc) network_name = argv[++i];
+      else if (a == "--epoch-seconds" && i + 1 < argc) epoch_seconds = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--now" && i + 1 < argc) now_unix = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--max-nonce" && i + 1 < argc) max_nonce = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+    if (tx_hex.empty()) {
+      std::cerr << "hashcash_stamp_tx requires --tx-hex\n";
+      return 1;
+    }
+    if (network_name != "mainnet") {
+      std::cerr << "only mainnet network is currently supported\n";
+      return 1;
+    }
+    auto raw = selfcoin::hex_decode(tx_hex);
+    if (!raw.has_value()) {
+      std::cerr << "invalid tx hex\n";
+      return 1;
+    }
+    auto tx = selfcoin::Tx::parse(*raw);
+    if (!tx.has_value()) {
+      std::cerr << "invalid tx bytes\n";
+      return 1;
+    }
+    selfcoin::policy::HashcashConfig cfg;
+    cfg.enabled = true;
+    cfg.base_bits = bits;
+    cfg.max_bits = bits;
+    cfg.epoch_seconds = std::max<std::uint64_t>(1, epoch_seconds);
+    std::string err;
+    if (!selfcoin::policy::apply_hashcash_stamp(&*tx, selfcoin::mainnet_network(), cfg, bits, now_unix, max_nonce, &err)) {
+      std::cerr << "hashcash stamping failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "bits=" << bits << "\n";
+    std::cout << "epoch_bucket=" << tx->hashcash->epoch_bucket << "\n";
+    std::cout << "nonce=" << tx->hashcash->nonce << "\n";
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
     return 0;

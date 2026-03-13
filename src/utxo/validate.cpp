@@ -65,7 +65,7 @@ std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
   }
-  const Hash32 txh = crypto::sha256d(signing.serialize());
+  const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'S', 'I', 'G', '-', 'V', '0'});
@@ -81,7 +81,7 @@ std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_
   for (auto& in : signing.inputs) {
     in.script_sig.clear();
   }
-  const Hash32 txh = crypto::sha256d(signing.serialize());
+  const Hash32 txh = crypto::sha256d(signing.serialize_without_hashcash());
 
   codec::ByteWriter w;
   w.bytes(Bytes{'S', 'C', '-', 'U', 'N', 'B', 'O', 'N', 'D', '-', 'V', '0'});

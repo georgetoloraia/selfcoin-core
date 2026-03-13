@@ -22,6 +22,7 @@
 #include "common/chain_id.hpp"
 #include "common/network.hpp"
 #include "common/paths.hpp"
+#include "consensus/randomness.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "genesis/embedded_mainnet.hpp"
@@ -35,6 +36,10 @@
 #include "utxo/signing.hpp"
 
 namespace {
+
+std::string short_pub_hex(const selfcoin::PubKey32& pub) {
+  return selfcoin::hex_encode(selfcoin::Bytes(pub.begin(), pub.begin() + 4));
+}
 
 std::optional<int> connect_tcp(const std::string& host, std::uint16_t port) {
   addrinfo hints{};
@@ -340,6 +345,21 @@ int main(int argc, char** argv) {
           std::cout << "finality_quorum=" << cert->quorum_threshold << "\n";
           std::cout << "finality_signatures=" << cert->signatures.size() << "\n";
           std::cout << "committee_members=" << cert->committee_members.size() << "\n";
+        }
+        const auto net = selfcoin::mainnet_network();
+        const auto epoch_start =
+            selfcoin::consensus::committee_epoch_start(tip->height + 1, net.vrf_committee_epoch_blocks);
+        const auto snapshot = db.get_committee_epoch_snapshot(epoch_start);
+        if (snapshot) {
+          std::cout << "committee_epoch_start=" << snapshot->epoch_start_height << "\n";
+          std::cout << "committee_epoch_seed=" << selfcoin::hex_encode32(snapshot->epoch_seed) << "\n";
+          std::cout << "committee_epoch_ordered_members=" << snapshot->ordered_members.size() << "\n";
+          std::ostringstream members;
+          for (std::size_t i = 0; i < snapshot->ordered_members.size(); ++i) {
+            if (i) members << ",";
+            members << short_pub_hex(snapshot->ordered_members[i]);
+          }
+          std::cout << "committee_epoch_members_short=" << members.str() << "\n";
         }
       } else {
         std::cout << "height=unknown\n";

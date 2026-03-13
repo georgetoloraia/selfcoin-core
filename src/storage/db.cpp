@@ -242,6 +242,38 @@ std::optional<SlashingRecord> parse_slashing_record(const Bytes& b) {
   return rec;
 }
 
+Bytes serialize_committee_epoch_snapshot(const CommitteeEpochSnapshot& snapshot) {
+  codec::ByteWriter w;
+  w.u64le(snapshot.epoch_start_height);
+  w.bytes_fixed(snapshot.epoch_seed);
+  w.varint(snapshot.ordered_members.size());
+  for (const auto& member : snapshot.ordered_members) w.bytes_fixed(member);
+  return w.take();
+}
+
+std::optional<CommitteeEpochSnapshot> parse_committee_epoch_snapshot(const Bytes& b) {
+  CommitteeEpochSnapshot snapshot;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto epoch_start = r.u64le();
+        auto seed = r.bytes_fixed<32>();
+        auto count = r.varint();
+        if (!epoch_start || !seed || !count) return false;
+        snapshot.epoch_start_height = *epoch_start;
+        snapshot.epoch_seed = *seed;
+        snapshot.ordered_members.clear();
+        snapshot.ordered_members.reserve(*count);
+        for (std::uint64_t i = 0; i < *count; ++i) {
+          auto member = r.bytes_fixed<32>();
+          if (!member) return false;
+          snapshot.ordered_members.push_back(*member);
+        }
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return snapshot;
+}
+
 Bytes u64be_bytes(std::uint64_t v) {
   Bytes out(8);
   for (int i = 7; i >= 0; --i) {
@@ -273,6 +305,11 @@ std::string key_validator_join_request(const Hash32& request_txid) {
 }
 std::string key_slashing_record(const Hash32& record_id) {
   return "SL:" + hex_encode(Bytes(record_id.begin(), record_id.end()));
+}
+std::string key_committee_epoch_snapshot(std::uint64_t epoch_start_height) {
+  codec::ByteWriter w;
+  w.u64le(epoch_start_height);
+  return "CE:" + hex_encode(w.data());
 }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_su_prefix(const Hash32& scripthash) {
@@ -496,6 +533,26 @@ std::map<Hash32, SlashingRecord> DB::load_slashing_records() const {
     auto rec = parse_slashing_record(v);
     if (!rec.has_value()) continue;
     out[rec->record_id] = *rec;
+  }
+  return out;
+}
+
+bool DB::put_committee_epoch_snapshot(const CommitteeEpochSnapshot& snapshot) {
+  return put(key_committee_epoch_snapshot(snapshot.epoch_start_height), serialize_committee_epoch_snapshot(snapshot));
+}
+
+std::optional<CommitteeEpochSnapshot> DB::get_committee_epoch_snapshot(std::uint64_t epoch_start_height) const {
+  auto b = get(key_committee_epoch_snapshot(epoch_start_height));
+  if (!b.has_value()) return std::nullopt;
+  return parse_committee_epoch_snapshot(*b);
+}
+
+std::map<std::uint64_t, CommitteeEpochSnapshot> DB::load_committee_epoch_snapshots() const {
+  std::map<std::uint64_t, CommitteeEpochSnapshot> out;
+  for (const auto& [_, v] : scan_prefix("CE:")) {
+    auto snapshot = parse_committee_epoch_snapshot(v);
+    if (!snapshot.has_value()) continue;
+    out[snapshot->epoch_start_height] = *snapshot;
   }
   return out;
 }

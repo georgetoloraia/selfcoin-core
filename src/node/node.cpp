@@ -675,6 +675,15 @@ bool Node::bootstrap_joiner_ready_locked(const PubKey32& pub) const {
   return false;
 }
 
+bool Node::bootstrap_sync_incomplete_locked(int peer_id) const {
+  if (!bootstrap_template_mode_) return false;
+  if (is_validator_) return false;
+  if (finalized_height_ == 0) return true;
+  const auto it = peer_finalized_tips_.find(peer_id);
+  if (it == peer_finalized_tips_.end()) return false;
+  return it->second.height > finalized_height_ || it->second.hash != finalized_hash_;
+}
+
 void Node::maybe_submit_bootstrap_join() {
   PubKey32 target{};
   bool have_target = false;
@@ -1444,6 +1453,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
                " height=" + std::to_string(p->height) + " round=" + std::to_string(p->round));
       {
         std::lock_guard<std::mutex> lk(mu_);
+        if (bootstrap_sync_incomplete_locked(peer_id)) {
+          log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=PROPOSE reason=bootstrap-sync-incomplete" +
+                   " local_height=" + std::to_string(finalized_height_));
+          return;
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
         if (accepted_propose_payloads_.contains(payload_id)) return;
       }
       if (!handle_propose(*p, true)) {
@@ -1467,6 +1484,14 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
       log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
                " height=" + std::to_string(v->vote.height) + " round=" + std::to_string(v->vote.round) +
                " block=" + short_hash_hex(v->vote.block_id));
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (bootstrap_sync_incomplete_locked(peer_id)) {
+          log_line("defer-consensus peer_id=" + std::to_string(peer_id) + " type=VOTE reason=bootstrap-sync-incomplete" +
+                   " local_height=" + std::to_string(finalized_height_));
+          return;
+        }
+      }
       if (!handle_vote(v->vote, true, peer_id, v->vrf_proof, v->vrf_proof.empty() ? nullptr : &v->vrf_output)) {
         std::lock_guard<std::mutex> lk(mu_);
         invalid_message_payloads_.insert(payload_id);

@@ -20,6 +20,10 @@ from typing import Any
 
 
 RESERVE_MIN_CHANGE = 1000
+RESERVE_MAX_INPUTS = 8
+RESERVE_CONSOLIDATE_UTXO_COUNT = 12
+RESERVE_FRAGMENTATION_ALERT_COUNT = 16
+RESERVE_EXHAUSTION_BUFFER = 10000
 
 
 def sha256_hex(parts: list[str]) -> str:
@@ -611,6 +615,10 @@ def lightserver_broadcast_tx(url: str, tx_hex: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _sum_utxo_values(utxos: list[dict[str, Any]]) -> int:
+    return sum(int(item.get("value", 0)) for item in utxos if isinstance(item, dict))
+
+
 def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
     if not entries:
         return {"dev-operator": hashlib.sha256(b"dev-operator-secret").digest()}
@@ -748,11 +756,36 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                             locked.add((txid, vout))
             return locked
 
+        def _reserve_alerts(self, summary: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+            utxo_count = int(inventory.get("wallet_utxo_count", 0))
+            utxo_value = int(inventory.get("wallet_utxo_value", 0))
+            below_min = int(inventory.get("wallet_fragment_below_min_change", 0))
+            available_reserve = int(summary.get("available_reserve", 0))
+            recommend_consolidation = utxo_count >= RESERVE_CONSOLIDATE_UTXO_COUNT or below_min > 0
+            return {
+                "coin_selection_policy": "smallest-sufficient-non-dust-change",
+                "coin_selection_max_inputs": RESERVE_MAX_INPUTS,
+                "coin_selection_min_change": RESERVE_MIN_CHANGE,
+                "consolidation_threshold_utxos": RESERVE_CONSOLIDATE_UTXO_COUNT,
+                "fragmentation_alert_threshold_utxos": RESERVE_FRAGMENTATION_ALERT_COUNT,
+                "reserve_exhaustion_buffer": RESERVE_EXHAUSTION_BUFFER,
+                "recommend_consolidation": recommend_consolidation,
+                "consolidation_candidate_count": below_min,
+                "alert_max_inputs_pressure": utxo_count > RESERVE_MAX_INPUTS,
+                "alert_fragmentation_threshold_breach": utxo_count >= RESERVE_FRAGMENTATION_ALERT_COUNT,
+                "alert_reserve_exhaustion_risk": available_reserve <= RESERVE_EXHAUSTION_BUFFER or utxo_value <= RESERVE_EXHAUSTION_BUFFER,
+            }
+
         def _reserve_inventory(self) -> dict[str, Any]:
             if not config.lightserver_url or not config.reserve_address:
                 return {
                     "wallet_utxo_count": 0,
                     "wallet_utxo_value": 0,
+                    "wallet_locked_utxo_count": 0,
+                    "wallet_locked_utxo_value": 0,
+                    "wallet_fragment_smallest": 0,
+                    "wallet_fragment_largest": 0,
+                    "wallet_fragment_below_min_change": 0,
                     "wallet_synced_at": int(time.time()),
                 }
             reserve_pkh = decode_selfcoin_address(config.reserve_address)
@@ -796,6 +829,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             selected: list[dict[str, Any]] = []
             total = 0
             for utxo in utxos:
+                if len(selected) >= RESERVE_MAX_INPUTS:
+                    break
                 selected.append(utxo)
                 total += int(utxo.get("value", 0))
                 change = total - amount_needed
@@ -873,7 +908,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
                 summary["reserve_address"] = config.reserve_address
-                summary.update(self._reserve_inventory())
+                inventory = self._reserve_inventory()
+                summary.update(inventory)
+                summary.update(self._reserve_alerts(summary, inventory))
                 write_json(self, HTTPStatus.OK, summary)
                 return
             if self.path == "/accounting/summary":
@@ -883,20 +920,24 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/attestations/reserves":
                 inventory = self._reserve_inventory()
+                payload = state.reserve_attestation(config.mint_id, inventory)
+                payload.update(self._reserve_alerts(payload, inventory))
                 write_json(
                     self,
                     HTTPStatus.OK,
-                    sign_snapshot(attestor, state.reserve_attestation(config.mint_id, inventory), primary_operator_key_id),
+                    sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
                 return
             if self.path == "/audit/export":
                 if not self._require_operator(b""):
                     return
                 inventory = self._reserve_inventory()
+                payload = state.audit_export(config.mint_id, inventory)
+                payload["reserves"].update(self._reserve_alerts(payload["reserves"], inventory))
                 write_json(
                     self,
                     HTTPStatus.OK,
-                    sign_snapshot(attestor, state.audit_export(config.mint_id, inventory), primary_operator_key_id),
+                    sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})

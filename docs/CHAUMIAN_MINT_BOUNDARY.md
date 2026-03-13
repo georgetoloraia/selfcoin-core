@@ -188,12 +188,14 @@ When reserve wallet discovery is configured, it also returns live reserve-wallet
 - `wallet_fragment_below_min_change`
 - `wallet_synced_at`
 
-Broadcasted redemption inputs are treated as locked reserve commitments in the mint service even if the lightserver still reports them as unspent. This keeps reserve reporting conservative during the `broadcast -> finalized` window.
+Broadcasted redemption inputs are removed from spendable reserve inventory. The in-flight commitment is reported explicitly through `pending_spend_commitment_count` and `pending_spend_input_count` during the `broadcast -> finalized` window.
 
 Recommended coin-selection policy for the external mint:
 - smallest sufficient input set
+- explicit max-input budget
 - reject selections that would create change below `min_change`
 - report the chosen policy and resulting `change_value` in audit exports
+- expose reserve exhaustion / fragmentation alerts in reserve and audit views
 
 `GET /accounting/summary` returns:
 - deposit totals

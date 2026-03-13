@@ -55,6 +55,7 @@ class FakeLightserver:
         self.tip_height = 0
         self.tx_heights: dict[str, int] = {}
         self.utxos_by_scripthash: dict[str, list[dict]] = {}
+        self.broadcast_spend_queue: list[list[tuple[str, int]]] = []
         self._server = ThreadingHTTPServer(("127.0.0.1", port), self._make_handler())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -106,6 +107,16 @@ class FakeLightserver:
                     return
                 if method == "broadcast_tx":
                     tx_hex = body.get("tx_hex", "")
+                    if outer.broadcast_spend_queue:
+                        spent = set(outer.broadcast_spend_queue.pop(0))
+                        updated: dict[str, list[dict]] = {}
+                        for scripthash, utxos in outer.utxos_by_scripthash.items():
+                            updated[scripthash] = [
+                                item
+                                for item in utxos
+                                if (str(item.get("txid", "")), int(item.get("vout", -1))) not in spent
+                            ]
+                        outer.utxos_by_scripthash = updated
                     payload = {
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -327,6 +338,13 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(pending_lines["state"], "pending")
                     self.assertEqual(pending_lines["l1_txid"], "")
 
+                    lightserver.broadcast_spend_queue.append(
+                        [
+                            (utxo_txid_a, 0),
+                            (utxo_txid_b, 1),
+                        ]
+                    )
+
                     approve_cmd = [
                         str(CLI),
                         "mint_redeem_approve_broadcast",
@@ -365,8 +383,12 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(reserves["pending_spend_input_count"], 2)
                     self.assertEqual(reserves["wallet_utxo_count"], 0)
                     self.assertEqual(reserves["wallet_utxo_value"], 0)
-                    self.assertEqual(reserves["wallet_locked_utxo_count"], 2)
-                    self.assertEqual(reserves["wallet_locked_utxo_value"], 110000)
+                    self.assertEqual(reserves["wallet_locked_utxo_count"], 0)
+                    self.assertEqual(reserves["wallet_locked_utxo_value"], 0)
+                    self.assertEqual(reserves["coin_selection_max_inputs"], 8)
+                    self.assertFalse(reserves["recommend_consolidation"])
+                    self.assertFalse(reserves["alert_fragmentation_threshold_breach"])
+                    self.assertTrue(reserves["alert_reserve_exhaustion_risk"])
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
@@ -392,6 +414,8 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(len(audit_json["payload"]["issuances"]), 1)
                     self.assertEqual(audit_json["payload"]["reserves"]["pending_spend_commitment_count"], 0)
                     self.assertEqual(audit_json["payload"]["reserves"]["finalized_redemption_amount"], 100000)
+                    self.assertEqual(audit_json["payload"]["reserves"]["coin_selection_max_inputs"], 8)
+                    self.assertTrue(audit_json["payload"]["reserves"]["alert_reserve_exhaustion_risk"])
                     self.assertEqual(audit_json["payload"]["redemptions"][0]["coin_selection_policy"], "smallest-sufficient-non-dust-change")
                     self.assertEqual(audit_json["payload"]["redemptions"][0]["change_value"], 9000)
                     self.assertEqual(len(audit_json["payload"]["redemptions"][0]["selected_utxos"]), 2)
@@ -408,6 +432,7 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(attest_json["payload"]["reserve_balance"], 0)
                     self.assertEqual(attest_json["payload"]["wallet_locked_utxo_count"], 0)
                     self.assertEqual(attest_json["payload"]["finalized_redemption_amount"], 100000)
+                    self.assertTrue(attest_json["payload"]["alert_reserve_exhaustion_risk"])
                     self.assertTrue(attest_json["signature_hex"])
 
                     operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")

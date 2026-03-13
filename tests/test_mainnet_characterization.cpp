@@ -95,7 +95,7 @@ TEST(test_characterize_mainnet_defaults_fixed_deterministic_runtime) {
 TEST(test_characterize_mainnet_default_node_routes_legacy_consensus_paths) {
   auto n = make_node("/tmp/selfcoin_characterize_routes", 0, 4, 3);
 
-  ASSERT_EQ(n->proposer_path_for_next_height_for_test(), std::string("deterministic-leader"));
+  ASSERT_EQ(n->proposer_path_for_next_height_for_test(), std::string("vrf-threshold-proposer"));
   ASSERT_EQ(n->committee_path_for_next_height_for_test(), std::string("deterministic-committee"));
   ASSERT_EQ(n->vote_path_for_next_height_for_test(), std::string("committee-membership"));
 
@@ -107,27 +107,17 @@ TEST(test_characterize_mainnet_default_node_routes_legacy_consensus_paths) {
   ASSERT_EQ(n->quorum_threshold_for_next_height_for_test(), consensus::quorum_threshold(committee.size()));
 }
 
-TEST(test_characterize_mainnet_default_node_builds_deterministic_leader_proposal) {
-  auto probe = make_node("/tmp/selfcoin_characterize_propose_probe", 0, 4, 4);
-  const auto active = probe->active_validators_for_next_height_for_test();
-  const auto status = probe->status();
-  const auto expected_leader = consensus::select_leader(status.tip_hash, status.height + 1, 0, active);
-  ASSERT_TRUE(expected_leader.has_value());
-
-  const auto keys = node::Node::deterministic_test_keypairs();
-  int leader_node_id = -1;
-  for (std::size_t i = 0; i < 4; ++i) {
-    if (keys[i].public_key == *expected_leader) {
-      leader_node_id = static_cast<int>(i);
-      break;
-    }
+TEST(test_characterize_mainnet_default_node_builds_vrf_eligible_proposal) {
+  std::unique_ptr<node::Node> proposer;
+  for (int node_id = 0; node_id < 4 && !proposer; ++node_id) {
+    auto candidate = make_node("/tmp/selfcoin_characterize_propose_" + std::to_string(node_id), node_id, 4, 4);
+    auto block = candidate->build_proposal_for_test(1, 0);
+    if (!block.has_value()) continue;
+    ASSERT_EQ(block->header.leader_pubkey, node::Node::deterministic_test_keypairs()[node_id].public_key);
+    ASSERT_TRUE(!block->header.vrf_proof.empty());
+    proposer = std::move(candidate);
   }
-  ASSERT_TRUE(leader_node_id >= 0);
-
-  auto n = make_node("/tmp/selfcoin_characterize_propose", leader_node_id, 4, 4);
-  auto block = n->build_proposal_for_test(1, 0);
-  ASSERT_TRUE(block.has_value());
-  ASSERT_EQ(block->header.leader_pubkey, *expected_leader);
+  ASSERT_TRUE(proposer != nullptr);
 }
 
 TEST(test_characterize_mainnet_runtime_is_deterministic_routing_with_current_validation_semantics) {

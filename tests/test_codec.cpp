@@ -41,6 +41,8 @@ TEST(test_tx_and_blockheader_roundtrip) {
   h.merkle_root = tx.txid();
   h.leader_pubkey.fill(9);
   h.round = 3;
+  h.vrf_proof = Bytes(64, 0x42);
+  h.vrf_output.fill(0xA1);
 
   auto hser = h.serialize();
   auto hparsed = BlockHeader::parse(hser);

@@ -128,6 +128,10 @@ Bytes BlockHeader::serialize() const {
   w.bytes_fixed(merkle_root);
   w.bytes_fixed(leader_pubkey);
   w.u32le(round);
+  if (!vrf_proof.empty()) {
+    w.varbytes(vrf_proof);
+    w.bytes_fixed(vrf_output);
+  }
   return w.take();
 }
 
@@ -147,6 +151,14 @@ std::optional<BlockHeader> BlockHeader::parse(const Bytes& b) {
         h.merkle_root = *merkle;
         h.leader_pubkey = *leader;
         h.round = *round;
+        if (r.eof()) return true;
+        auto proof = r.varbytes();
+        if (!proof) return false;
+        h.vrf_proof = *proof;
+        if (h.vrf_proof.empty()) return r.eof();
+        auto out = r.bytes_fixed<32>();
+        if (!out) return false;
+        h.vrf_output = *out;
         return true;
       })) {
     return std::nullopt;

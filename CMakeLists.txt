@@ -49,6 +49,7 @@ add_library(selfcoin_core
   src/consensus/monetary.cpp
   src/consensus/state_commitment.cpp
   src/consensus/validators.cpp
+  src/consensus/vrf_sortition.cpp
   src/consensus/votes.cpp
   src/storage/db.cpp
   src/storage/snapshot.cpp

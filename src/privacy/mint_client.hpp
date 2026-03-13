@@ -26,10 +26,14 @@ struct MintDepositRegistrationResponse {
 struct MintBlindIssueRequest {
   std::string mint_deposit_ref;
   std::vector<std::string> blinded_messages;
+  std::vector<std::uint64_t> note_amounts;
 };
 
 struct MintBlindIssueResponse {
+  std::string issuance_id;
   std::vector<std::string> signed_blinds;
+  std::vector<std::string> note_refs;
+  std::vector<std::uint64_t> note_amounts;
   std::uint64_t mint_epoch{0};
 };
 
@@ -47,6 +51,7 @@ struct MintRedemptionResponse {
 struct MintRedemptionStatusResponse {
   std::string state;
   std::string l1_txid;
+  std::uint64_t amount{0};
 };
 
 std::string to_json(const MintDepositRegistrationRequest& req);

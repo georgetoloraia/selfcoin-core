@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -133,7 +135,67 @@ std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
   return out;
 }
 
-std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
+                                          const std::string& bearer_token, std::string* err);
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err);
+std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err);
+std::optional<std::string> http_get_json(const std::string& url, std::string* err);
+using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
+std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
+                                                       const HttpHeaders& headers, std::string* err);
+std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
+                                                      std::string* err);
+
+std::string sha256_hex_string(const std::string& data) {
+  selfcoin::Bytes b(data.begin(), data.end());
+  const auto h = selfcoin::crypto::sha256(b);
+  return selfcoin::hex_encode(selfcoin::Bytes(h.begin(), h.end()));
+}
+
+std::optional<std::string> hmac_sha256_hex(const selfcoin::Bytes& key, const std::string& data) {
+  unsigned int out_len = 0;
+  unsigned char out[EVP_MAX_MD_SIZE];
+  if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+            reinterpret_cast<const unsigned char*>(data.data()), data.size(), out, &out_len)) {
+    return std::nullopt;
+  }
+  return selfcoin::hex_encode(selfcoin::Bytes(out, out + out_len));
+}
+
+std::optional<HttpHeaders> operator_signed_headers_for_url(const std::string& method, const std::string& url,
+                                                           const std::string& body, const std::string& key_id,
+                                                           const std::string& secret_hex, std::string* err) {
+  if (key_id.empty() || secret_hex.empty()) {
+    if (err) *err = "operator auth requires key id and secret";
+    return std::nullopt;
+  }
+  auto parsed = parse_http_url(url);
+  if (!parsed) {
+    if (err) *err = "url must be http://host:port/path";
+    return std::nullopt;
+  }
+  auto secret_opt = selfcoin::hex_decode(secret_hex);
+  if (!secret_opt || secret_opt->size() < 16) {
+    if (err) *err = "operator secret must be at least 16 bytes of hex";
+    return std::nullopt;
+  }
+  const auto timestamp = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const auto body_hash = sha256_hex_string(body);
+  const auto payload = method + "\n" + parsed->path + "\n" + timestamp + "\n" + body_hash;
+  auto sig = hmac_sha256_hex(*secret_opt, payload);
+  if (!sig) {
+    if (err) *err = "failed to sign operator request";
+    return std::nullopt;
+  }
+  return HttpHeaders{
+      {"X-Selfcoin-Operator-Key", key_id},
+      {"X-Selfcoin-Timestamp", timestamp},
+      {"X-Selfcoin-Signature", *sig},
+  };
+}
+
+std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
+                                                       const HttpHeaders& headers, std::string* err) {
   auto parsed = parse_http_url(url);
   if (!parsed) {
     if (err) *err = "url must be http://host:port/path";
@@ -147,7 +209,11 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   const int fd = *fd_opt;
   std::ostringstream req;
   req << "POST " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port
-      << "\r\nContent-Type: application/json\r\nContent-Length: " << body.size()
+      << "\r\nContent-Type: application/json\r\n";
+  for (const auto& [k, v] : headers) {
+    req << k << ": " << v << "\r\n";
+  }
+  req << "Content-Length: " << body.size()
       << "\r\nConnection: close\r\n\r\n" << body;
   const auto req_s = req.str();
   if (!selfcoin::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
@@ -169,6 +235,68 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
     return std::nullopt;
   }
   return resp.substr(pos + 4);
+}
+
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
+                                          const std::string& bearer_token, std::string* err) {
+  HttpHeaders headers;
+  if (!bearer_token.empty()) headers.push_back({"Authorization", "Bearer " + bearer_token});
+  return http_post_json_with_headers(url, body, headers, err);
+}
+
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
+  return http_post_json(url, body, "", err);
+}
+
+std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
+                                                      std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed) {
+    if (err) *err = "url must be http://host:port/path";
+    return std::nullopt;
+  }
+  auto fd_opt = connect_tcp(parsed->host, parsed->port);
+  if (!fd_opt.has_value()) {
+    if (err) *err = "connect failed";
+    return std::nullopt;
+  }
+  const int fd = *fd_opt;
+  std::ostringstream req;
+  req << "GET " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port << "\r\n";
+  for (const auto& [k, v] : headers) {
+    req << k << ": " << v << "\r\n";
+  }
+  req << "Connection: close\r\n\r\n";
+  const auto req_s = req.str();
+  if (!selfcoin::p2p::write_all(fd, reinterpret_cast<const std::uint8_t*>(req_s.data()), req_s.size())) {
+    ::close(fd);
+    if (err) *err = "send failed";
+    return std::nullopt;
+  }
+  std::string resp;
+  std::array<char, 4096> buf{};
+  while (true) {
+    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+    if (n <= 0) break;
+    resp.append(buf.data(), static_cast<std::size_t>(n));
+  }
+  ::close(fd);
+  const auto pos = resp.find("\r\n\r\n");
+  if (pos == std::string::npos) {
+    if (err) *err = "bad http response";
+    return std::nullopt;
+  }
+  return resp.substr(pos + 4);
+}
+
+std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err) {
+  HttpHeaders headers;
+  if (!bearer_token.empty()) headers.push_back({"Authorization", "Bearer " + bearer_token});
+  return http_get_json_with_headers(url, headers, err);
+}
+
+std::optional<std::string> http_get_json(const std::string& url, std::string* err) {
+  return http_get_json(url, "", err);
 }
 
 std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
@@ -310,9 +438,14 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
               << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
-              << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> [--blind <msg> ...]\n"
+              << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> --note-amount <u64> [--blind <msg> --note-amount <u64> ...]\n"
               << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --amount <u64> --note <opaque> [--note <opaque> ...]\n"
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
+              << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
+              << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
+              << "  selfcoin-cli mint_accounting_summary --url http://host:port/path\n"
+              << "  selfcoin-cli mint_attest_reserves --url http://host:port/path\n"
+              << "  selfcoin-cli mint_audit_export --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
@@ -1454,19 +1587,24 @@ int main(int argc, char** argv) {
     std::string url;
     std::string mint_deposit_ref;
     std::vector<std::string> blinds;
+    std::vector<std::uint64_t> note_amounts;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
       else if (a == "--mint-deposit-ref" && i + 1 < argc) mint_deposit_ref = argv[++i];
       else if (a == "--blind" && i + 1 < argc) blinds.push_back(argv[++i]);
+      else if (a == "--note-amount" && i + 1 < argc) {
+        note_amounts.push_back(static_cast<std::uint64_t>(std::stoull(argv[++i])));
+      }
     }
-    if (url.empty() || mint_deposit_ref.empty() || blinds.empty()) {
-      std::cerr << "mint_issue_blinds requires --url, --mint-deposit-ref, and at least one --blind\n";
+    if (url.empty() || mint_deposit_ref.empty() || blinds.empty() || blinds.size() != note_amounts.size()) {
+      std::cerr << "mint_issue_blinds requires --url, --mint-deposit-ref, and matching --blind/--note-amount pairs\n";
       return 1;
     }
     selfcoin::privacy::MintBlindIssueRequest req;
     req.mint_deposit_ref = mint_deposit_ref;
     req.blinded_messages = blinds;
+    req.note_amounts = note_amounts;
 
     std::string err;
     auto body = http_post_json(url, selfcoin::privacy::to_json(req), &err);
@@ -1479,10 +1617,17 @@ int main(int argc, char** argv) {
       std::cerr << "mint_issue_blinds parse failed\n";
       return 1;
     }
+    std::cout << "issuance_id=" << resp->issuance_id << "\n";
     std::cout << "mint_epoch=" << resp->mint_epoch << "\n";
     std::cout << "signed_blinds=" << resp->signed_blinds.size() << "\n";
     for (std::size_t i = 0; i < resp->signed_blinds.size(); ++i) {
       std::cout << "signed_blind[" << i << "]=" << resp->signed_blinds[i] << "\n";
+      if (i < resp->note_refs.size()) {
+        std::cout << "note_ref[" << i << "]=" << resp->note_refs[i] << "\n";
+      }
+      if (i < resp->note_amounts.size()) {
+        std::cout << "note_amount[" << i << "]=" << resp->note_amounts[i] << "\n";
+      }
     }
     return 0;
   }
@@ -1553,6 +1698,135 @@ int main(int argc, char** argv) {
     }
     std::cout << "state=" << resp->state << "\n";
     std::cout << "l1_txid=" << resp->l1_txid << "\n";
+    std::cout << "amount=" << resp->amount << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_redeem_update") {
+    std::string url;
+    std::string batch_id;
+    std::string state;
+    std::string l1_txid;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
+      else if (a == "--state" && i + 1 < argc) state = argv[++i];
+      else if (a == "--l1-txid" && i + 1 < argc) l1_txid = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+    }
+    if (url.empty() || batch_id.empty() || state.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_redeem_update requires --url, --batch-id, --state, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    std::ostringstream body_json;
+    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\",\"state\":\"" << state << "\"";
+    if (!l1_txid.empty()) body_json << ",\"l1_txid\":\"" << l1_txid << "\"";
+    body_json << "}";
+    std::string err;
+    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_redeem_update failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
+    if (!body) {
+      std::cerr << "mint_redeem_update failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_reserves") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_reserves requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_reserves failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_accounting_summary") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_accounting_summary requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_accounting_summary failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_attest_reserves") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_attest_reserves requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_attest_reserves failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_audit_export") {
+    std::string url;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+    }
+    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_audit_export requires --url, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    std::string err;
+    auto headers = operator_signed_headers_for_url("GET", url, "", operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_audit_export failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_get_json_with_headers(url, *headers, &err);
+    if (!body) {
+      std::cerr << "mint_audit_export failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
     return 0;
   }
 
@@ -1568,6 +1842,7 @@ int main(int argc, char** argv) {
     selfcoin::privacy::MintBlindIssueRequest issue_req;
     issue_req.mint_deposit_ref = "example-ref";
     issue_req.blinded_messages = {"blind-msg-1", "blind-msg-2"};
+    issue_req.note_amounts = {40000, 60000};
 
     selfcoin::privacy::MintRedemptionRequest redeem_req;
     redeem_req.notes = {"note-1", "note-2"};

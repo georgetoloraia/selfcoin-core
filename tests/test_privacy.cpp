@@ -32,9 +32,15 @@ TEST(test_mint_client_json_roundtrips) {
   ASSERT_EQ(dep_resp->mint_deposit_ref, "ref-1");
 
   const auto issue_resp =
-      privacy::parse_mint_blind_issue_response("{\"signed_blinds\":[\"aa\",\"bb\"],\"mint_epoch\":7}");
+      privacy::parse_mint_blind_issue_response(
+          "{\"issuance_id\":\"iss-1\",\"signed_blinds\":[\"aa\",\"bb\"],\"note_refs\":[\"n1\",\"n2\"],"
+          "\"note_amounts\":[20000,22000],\"mint_epoch\":7}");
   ASSERT_TRUE(issue_resp.has_value());
+  ASSERT_EQ(issue_resp->issuance_id, "iss-1");
   ASSERT_EQ(issue_resp->signed_blinds.size(), 2u);
+  ASSERT_EQ(issue_resp->note_refs.size(), 2u);
+  ASSERT_EQ(issue_resp->note_amounts.size(), 2u);
+  ASSERT_EQ(issue_resp->note_amounts[0], 20'000u);
   ASSERT_EQ(issue_resp->mint_epoch, 7u);
 
   const auto redeem_resp =
@@ -44,10 +50,12 @@ TEST(test_mint_client_json_roundtrips) {
   ASSERT_EQ(redeem_resp->redemption_batch_id, "batch-9");
 
   const auto status_resp =
-      privacy::parse_mint_redemption_status_response("{\"state\":\"finalized\",\"l1_txid\":\"deadbeef\"}");
+      privacy::parse_mint_redemption_status_response(
+          "{\"state\":\"finalized\",\"l1_txid\":\"deadbeef\",\"amount\":1234}");
   ASSERT_TRUE(status_resp.has_value());
   ASSERT_EQ(status_resp->state, "finalized");
   ASSERT_EQ(status_resp->l1_txid, "deadbeef");
+  ASSERT_EQ(status_resp->amount, 1234u);
 }
 
 void register_privacy_tests() {}

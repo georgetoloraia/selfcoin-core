@@ -58,17 +58,18 @@ class MintStateTests(unittest.TestCase):
                     "mint_deposit_ref": "ref-1",
                 }
             )
+            issuance = state.record_issuance("ref-1", ["aa", "bb"], ["cc", "dd"], [150, 250])
             redemption = {
                 "redemption_batch_id": "batch-1",
-                "notes": ["note-a", "note-b"],
+                "notes": issuance["note_refs"],
                 "redeem_address": "sc1example",
                 "amount": 400,
                 "state": "pending",
                 "l1_txid": "",
             }
             state.create_redemption(redemption)
-            self.assertTrue(state.note_already_spent("note-a"))
-            self.assertTrue(state.note_already_spent("note-b"))
+            self.assertTrue(state.note_already_spent(issuance["note_refs"][0]))
+            self.assertTrue(state.note_already_spent(issuance["note_refs"][1]))
             self.assertFalse(state.note_already_spent("note-c"))
 
     def test_issuance_persists_and_rejects_duplicate_blinds(self) -> None:
@@ -87,15 +88,19 @@ class MintStateTests(unittest.TestCase):
                 }
             )
 
-            issuance = state.record_issuance("ref-1", ["aa", "bb"], ["cc", "dd"])
+            issuance = state.record_issuance("ref-1", ["aa", "bb"], ["cc", "dd"], [400, 600])
             self.assertEqual(issuance["note_count"], 2)
+            self.assertEqual(issuance["note_amounts"], [400, 600])
+            self.assertEqual(len(issuance["note_refs"]), 2)
 
             reloaded = server.MintState(state_path)
             dep = reloaded.get_deposit("ref-1")
             self.assertEqual(dep["issued_blind_count"], 2)
+            self.assertEqual(dep["issued_amount"], 1000)
+            self.assertIsNotNone(reloaded.get_note_record(issuance["note_refs"][0]))
 
             with self.assertRaises(ValueError):
-                reloaded.record_issuance("ref-1", ["aa"], ["ee"])
+                reloaded.record_issuance("ref-1", ["aa"], ["ee"], [100])
 
     def test_rejected_redemption_releases_notes_and_finalized_counts_in_reserves(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -112,24 +117,27 @@ class MintStateTests(unittest.TestCase):
                     "mint_deposit_ref": "ref-1",
                 }
             )
+            issuance = state.record_issuance("ref-1", ["aa", "bb"], ["cc", "dd"], [150, 250])
             state.create_redemption(
                 {
                     "redemption_batch_id": "batch-1",
-                    "notes": ["note-a", "note-b"],
+                    "notes": issuance["note_refs"],
                     "redeem_address": "sc1example",
                     "amount": 400,
                     "state": "pending",
                     "l1_txid": "",
                 }
             )
-            self.assertTrue(state.note_already_spent("note-a"))
+            self.assertTrue(state.note_already_spent(issuance["note_refs"][0]))
             state.update_redemption("batch-1", "rejected")
-            self.assertFalse(state.note_already_spent("note-a"))
+            note = state.get_note_record(issuance["note_refs"][0])
+            self.assertEqual(note["state"], "issued")
 
+            second = state.record_issuance("ref-1", ["cc"], ["ee"], [250])
             state.create_redemption(
                 {
                     "redemption_batch_id": "batch-2",
-                    "notes": ["note-a"],
+                    "notes": second["note_refs"],
                     "redeem_address": "sc1example",
                     "amount": 250,
                     "state": "pending",
@@ -143,6 +151,29 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(reserves["finalized_redemption_amount"], 250)
             self.assertEqual(reserves["available_reserve"], 750)
             self.assertEqual(accounting["active_note_locks"], 1)
+
+    def test_audit_and_attestation_export_cover_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
+            state.record_issuance("ref-1", ["aa"], ["bb"], [1000])
+            audit = state.audit_export("22" * 32)
+            attest = state.reserve_attestation("22" * 32)
+            self.assertEqual(len(audit["deposits"]), 1)
+            self.assertEqual(len(audit["issuances"]), 1)
+            self.assertEqual(attest["mint_id"], "22" * 32)
+            self.assertTrue(attest["state_hash"])
 
     def test_blind_signer_signs_and_verifies(self) -> None:
         signer = server.BlindSigner.from_seed("seed-x", bits=256)

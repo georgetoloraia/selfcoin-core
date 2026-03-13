@@ -12,9 +12,11 @@ It is a narrow scaffold, not a production mint:
 - deterministic RSA blind-signing for development/testing
 - persistent issuance ledger
 - reserve and accounting summary endpoints
-- redemption lifecycle updates (`pending -> broadcast/finalized/rejected`)
+- lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
+- HMAC-signed operator admin requests
+- signed reserve attestations / audit exports
 - no federation
-- no audited custody or reserve attestation
+- no multi-operator quorum custody
 
 ## Endpoints
 
@@ -27,6 +29,9 @@ It is a narrow scaffold, not a production mint:
 - `GET /mint/key`
 - `GET /reserves`
 - `GET /accounting/summary`
+- `GET /operator/key`
+- `GET /attestations/reserves`
+- `GET /audit/export` (operator-signed request required)
 
 ## Run
 
@@ -35,7 +40,9 @@ python3 services/selfcoin-mint/server.py \
   --host 127.0.0.1 \
   --port 8080 \
   --state-file /tmp/selfcoin-mint-state.json \
-  --confirmations-required 1
+  --confirmations-required 1 \
+  --operator-key dev-operator:1111111111111111111111111111111111111111111111111111111111111111 \
+  --lightserver-url http://127.0.0.1:19444/rpc
 ```
 
 ## Example with selfcoin-cli
@@ -60,30 +67,42 @@ python3 services/selfcoin-mint/server.py \
 ./build/selfcoin-cli mint_issue_blinds \
   --url http://127.0.0.1:8080/issuance/blind \
   --mint-deposit-ref <opaque-id> \
-  --blind blind-msg-1 \
-  --blind blind-msg-2
+  --blind blind-msg-1 --note-amount 40000 \
+  --blind blind-msg-2 --note-amount 60000
 ```
 
 ```bash
 ./build/selfcoin-cli mint_redeem_create \
   --url http://127.0.0.1:8080/redemptions/create \
   --redeem-address sc1... \
-  --amount 50000 \
-  --note note-1 \
-  --note note-2
+  --amount 100000 \
+  --note <note-ref-1> \
+  --note <note-ref-2>
 ```
 
 ```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
+curl http://127.0.0.1:8080/operator/key
+curl http://127.0.0.1:8080/attestations/reserves
+./build/selfcoin-cli mint_audit_export \
+  --url http://127.0.0.1:8080/audit/export \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
 ```
 
 ## Notes
 
 - Deposit references are deterministic hashes of `(txid, vout, mint_id)`.
 - Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
-- Redemption batches are created with `state=pending` and can be advanced with `POST /redemptions/update`.
-- Reserve and accounting endpoints are derived from persisted deposits, issuances, and redemption state.
+- Each issuance creates persistent `note_ref` entries with explicit denominations.
+- Redemption batches are created with `state=pending`; operators may only advance them to `broadcast` or `rejected`.
+- `finalized` is derived from observed L1 tx status via the configured lightserver.
+- `POST /redemptions/update` and `GET /audit/export` require signed operator headers:
+  - `X-Selfcoin-Operator-Key`
+  - `X-Selfcoin-Timestamp`
+  - `X-Selfcoin-Signature`
+- Reserve/accounting/attestation endpoints are derived from persisted deposits, issuances, note records, and redemption state.
 
 ## Service tests
 

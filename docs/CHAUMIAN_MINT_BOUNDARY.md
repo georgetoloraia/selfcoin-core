@@ -47,6 +47,9 @@ Suggested example HTTP endpoints:
 - `POST /redemptions/update`
 - `GET /accounting/summary`
 - `GET /reserves`
+- `GET /operator/key`
+- `GET /attestations/reserves`
+- `GET /audit/export`
 
 ### 1. Deposit registration
 
@@ -80,7 +83,8 @@ Request:
 ```json
 {
   "mint_deposit_ref": "opaque-string",
-  "blinded_messages": ["hex", "hex"]
+  "blinded_messages": ["hex", "hex"],
+  "note_amounts": [40000, 60000]
 }
 ```
 
@@ -88,7 +92,10 @@ Response:
 
 ```json
 {
+  "issuance_id": "opaque-string",
   "signed_blinds": ["hex", "hex"],
+  "note_refs": ["opaque-note-ref-1", "opaque-note-ref-2"],
+  "note_amounts": [40000, 60000],
   "mint_epoch": 42
 }
 ```
@@ -132,10 +139,22 @@ Request:
 ```json
 {
   "redemption_batch_id": "opaque-string",
-  "state": "broadcast|finalized|rejected",
+  "state": "broadcast|rejected",
   "l1_txid": "hex32"
 }
 ```
+
+Authentication:
+
+- Signed operator headers:
+  - `X-Selfcoin-Operator-Key`
+  - `X-Selfcoin-Timestamp`
+  - `X-Selfcoin-Signature`
+
+Notes:
+
+- `broadcast` requires `l1_txid`
+- `finalized` is not manually set; it is derived from observed lightserver state
 
 ### 6. Reserve and accounting views
 
@@ -147,7 +166,15 @@ Request:
 - pending/broadcast/finalized redemption totals
 - available reserve estimate
 - active note locks
-```
+
+`GET /attestations/reserves` returns:
+- current reserve summary
+- a timestamped signed reserve snapshot suitable for audit/audit-log export
+
+`GET /operator/key` returns the operator attestation public key used to verify signed reserve and audit snapshots.
+
+`GET /audit/export` returns a full export of deposits, issuances, redemptions, note records, and summary views.
+This should be authenticated with signed operator requests outside development.
 
 ## Core repo scope
 
@@ -187,8 +214,24 @@ selfcoin-cli mint_redeem_status \
 ```
 
 ```bash
+selfcoin-cli mint_redeem_update \
+  --url http://127.0.0.1:8080/redemptions/update \
+  --batch-id <opaque-id> \
+  --state broadcast \
+  --l1-txid <hex32> \
+  --operator-key-id <id> \
+  --operator-secret-hex <hex>
+```
+
+```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
+curl http://127.0.0.1:8080/operator/key
+curl http://127.0.0.1:8080/attestations/reserves
+selfcoin-cli mint_audit_export \
+  --url http://127.0.0.1:8080/audit/export \
+  --operator-key-id <id> \
+  --operator-secret-hex <hex>
 ```
 
 ## Non-goals

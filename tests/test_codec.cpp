@@ -86,4 +86,33 @@ TEST(test_slashing_record_db_roundtrip) {
   ASSERT_EQ(it->second.txid, rec.txid);
 }
 
+TEST(test_committee_epoch_snapshot_db_roundtrip) {
+  const std::string path = "/tmp/selfcoin_test_committee_epoch_snapshot_db";
+  std::filesystem::remove_all(path);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(path));
+
+  storage::CommitteeEpochSnapshot snapshot;
+  snapshot.epoch_start_height = 33;
+  snapshot.epoch_seed.fill(0x44);
+  PubKey32 a{};
+  PubKey32 b{};
+  a.fill(0x11);
+  b.fill(0x22);
+  snapshot.ordered_members = {a, b};
+
+  ASSERT_TRUE(db.put_committee_epoch_snapshot(snapshot));
+  const auto loaded = db.get_committee_epoch_snapshot(snapshot.epoch_start_height);
+  ASSERT_TRUE(loaded.has_value());
+  ASSERT_EQ(loaded->epoch_start_height, snapshot.epoch_start_height);
+  ASSERT_EQ(loaded->epoch_seed, snapshot.epoch_seed);
+  ASSERT_EQ(loaded->ordered_members, snapshot.ordered_members);
+
+  const auto all = db.load_committee_epoch_snapshots();
+  auto it = all.find(snapshot.epoch_start_height);
+  ASSERT_TRUE(it != all.end());
+  ASSERT_EQ(it->second.ordered_members, snapshot.ordered_members);
+}
+
 void register_codec_tests() {}

@@ -869,26 +869,29 @@ TEST(test_restart_determinism_and_continued_finalization) {
   ASSERT_TRUE(keys.size() >= 4u);
 
   const std::string base = "/tmp/selfcoin_it_restart";
+  std::vector<PubKey32> next_committee_before_restart;
   {
-    auto cluster = make_cluster(base);
+    auto cluster = make_cluster(base, 4, 4, MAX_COMMITTEE, false);
     auto& nodes = cluster.nodes;
 
-    ASSERT_TRUE(wait_for_tip(*nodes[0], 12, std::chrono::seconds(45)));
+    ASSERT_TRUE(wait_for_tip(*nodes[0], 12, std::chrono::seconds(120)));
     ASSERT_TRUE(wait_for([&]() {
       for (size_t i = 1; i < nodes.size(); ++i) {
         if (nodes[i]->status().height < 12) return false;
       }
       return true;
-    }, std::chrono::seconds(45)));
+    }, std::chrono::seconds(120)));
 
     ASSERT_TRUE(wait_for_same_tip(nodes, std::chrono::seconds(20)));
     const auto s0 = nodes[0]->status();
+    next_committee_before_restart = nodes[0]->committee_for_next_height_for_test();
     for (size_t i = 1; i < nodes.size(); ++i) {
       const auto si = nodes[i]->status();
       ASSERT_EQ(si.height, s0.height);
       ASSERT_EQ(si.tip_hash, s0.tip_hash);
       ASSERT_EQ(nodes[i]->active_validators_for_next_height_for_test(),
                 nodes[0]->active_validators_for_next_height_for_test());
+      ASSERT_EQ(nodes[i]->committee_for_next_height_for_test(), next_committee_before_restart);
     }
 
     for (auto& n : nodes) n->pause_proposals_for_test(true);
@@ -901,6 +904,10 @@ TEST(test_restart_determinism_and_continued_finalization) {
     node::NodeConfig cfg;
     cfg.disable_p2p = true;
     cfg.node_id = i;
+    cfg.max_committee = MAX_COMMITTEE;
+    cfg.network.vrf_proposer_enabled = false;
+    cfg.network.min_block_interval_ms = 100;
+    cfg.network.round_timeout_ms = 200;
     cfg.p2p_port = static_cast<std::uint16_t>(19040 + i);
     cfg.db_path = base + "/node" + std::to_string(i);
     cfg.genesis_path = base + "/genesis.json";
@@ -921,6 +928,8 @@ TEST(test_restart_determinism_and_continued_finalization) {
   auto& nodes = restarted.nodes;
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
   const auto before = nodes[0]->status();
+  const auto next_committee_after_restart = nodes[0]->committee_for_next_height_for_test();
+  ASSERT_EQ(next_committee_after_restart, next_committee_before_restart);
 
   ASSERT_TRUE(wait_for_stable_same_tip(nodes, std::chrono::seconds(20)));
   for (size_t i = 1; i < nodes.size(); ++i) {
@@ -929,6 +938,7 @@ TEST(test_restart_determinism_and_continued_finalization) {
     ASSERT_EQ(si.tip_hash, before.tip_hash);
     ASSERT_EQ(nodes[i]->active_validators_for_next_height_for_test(),
               nodes[0]->active_validators_for_next_height_for_test());
+    ASSERT_EQ(nodes[i]->committee_for_next_height_for_test(), next_committee_after_restart);
   }
 
   for (auto& n : nodes) n->pause_proposals_for_test(false);

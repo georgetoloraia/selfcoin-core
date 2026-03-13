@@ -35,6 +35,12 @@ struct SlashingRecord {
   Hash32 txid{};
 };
 
+struct CommitteeEpochSnapshot {
+  std::uint64_t epoch_start_height{0};
+  Hash32 epoch_seed{};
+  std::vector<PubKey32> ordered_members;
+};
+
 class DB {
  public:
   DB();
@@ -79,6 +85,9 @@ class DB {
   std::map<Hash32, ValidatorJoinRequest> load_validator_join_requests() const;
   bool put_slashing_record(const SlashingRecord& rec);
   std::map<Hash32, SlashingRecord> load_slashing_records() const;
+  bool put_committee_epoch_snapshot(const CommitteeEpochSnapshot& snapshot);
+  std::optional<CommitteeEpochSnapshot> get_committee_epoch_snapshot(std::uint64_t epoch_start_height) const;
+  std::map<std::uint64_t, CommitteeEpochSnapshot> load_committee_epoch_snapshots() const;
 
   struct TxLocation {
     std::uint64_t height{0};

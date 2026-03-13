@@ -889,6 +889,25 @@ Hash32 Node::committee_epoch_randomness_for_height_locked(std::uint64_t height) 
   if (it != committee_epoch_randomness_cache_.end()) return it->second;
   return consensus::initial_finalized_randomness(cfg_.network, chain_id_);
 }
+
+storage::CommitteeEpochSnapshot Node::build_committee_epoch_snapshot_locked(std::uint64_t epoch_start_height,
+                                                                            const std::vector<PubKey32>& active,
+                                                                            const Hash32& epoch_randomness) const {
+  storage::CommitteeEpochSnapshot snapshot;
+  snapshot.epoch_start_height = epoch_start_height;
+  snapshot.epoch_seed = consensus::committee_epoch_seed(epoch_randomness, epoch_start_height);
+  const auto take = std::min<std::size_t>(cfg_.max_committee, active.size());
+  snapshot.ordered_members = consensus::select_committee_v2(active, snapshot.epoch_seed, take);
+  return snapshot;
+}
+
+void Node::persist_committee_epoch_snapshot_locked(std::uint64_t epoch_start_height,
+                                                   const std::vector<PubKey32>& active,
+                                                   const Hash32& epoch_randomness) {
+  auto snapshot = build_committee_epoch_snapshot_locked(epoch_start_height, active, epoch_randomness);
+  committee_epoch_snapshots_[epoch_start_height] = snapshot;
+  (void)db_.put_committee_epoch_snapshot(snapshot);
+}
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
@@ -1516,6 +1535,8 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             if (consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.vrf_committee_epoch_blocks) ==
                 finalized_height_ + 1) {
               committee_epoch_randomness_cache_[finalized_height_ + 1] = finalized_randomness_;
+              persist_committee_epoch_snapshot_locked(finalized_height_ + 1, validators_.active_sorted(finalized_height_ + 1),
+                                                      finalized_randomness_);
             }
             (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
             (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
@@ -1987,6 +2008,8 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   if (consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.vrf_committee_epoch_blocks) ==
       finalized_height_ + 1) {
     committee_epoch_randomness_cache_[finalized_height_ + 1] = finalized_randomness_;
+    persist_committee_epoch_snapshot_locked(finalized_height_ + 1, validators_.active_sorted(finalized_height_ + 1),
+                                            finalized_randomness_);
   }
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
@@ -2358,7 +2381,11 @@ bool Node::init_mainnet_genesis() {
       ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
   finalized_randomness_ = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
   committee_epoch_randomness_cache_.clear();
+  committee_epoch_snapshots_.clear();
   committee_epoch_randomness_cache_[1] = finalized_randomness_;
+  std::vector<PubKey32> genesis_active = doc->initial_validators;
+  std::sort(genesis_active.begin(), genesis_active.end());
+  persist_committee_epoch_snapshot_locked(1, genesis_active, finalized_randomness_);
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   return db_.flush();
 }
@@ -2380,6 +2407,7 @@ bool Node::load_state() {
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
   validator_join_requests_ = db_.load_validator_join_requests();
   committee_epoch_randomness_cache_.clear();
+  committee_epoch_snapshots_ = db_.load_committee_epoch_snapshots();
   Hash32 replay_randomness = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
   committee_epoch_randomness_cache_[1] = replay_randomness;
   for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
@@ -2398,6 +2426,126 @@ bool Node::load_state() {
   } else {
     finalized_randomness_ = replay_randomness;
     (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
+  }
+
+  if (cfg_.network.vrf_committee_enabled && committee_epoch_snapshots_.empty()) {
+    consensus::ValidatorRegistry replay_validators;
+    std::map<Hash32, ValidatorJoinRequest> replay_join_requests;
+    replay_validators.set_rules(validators_.rules());
+    UtxoSet replay_utxos;
+    if (auto gj = db_.get("G:J"); gj.has_value()) {
+      const std::string js(gj->begin(), gj->end());
+      if (auto gd = genesis::parse_json(js); gd.has_value()) {
+        for (const auto& pub : gd->initial_validators) {
+          consensus::ValidatorInfo vi;
+          vi.status = consensus::ValidatorStatus::ACTIVE;
+          vi.joined_height = 0;
+          vi.has_bond = true;
+          vi.bond_outpoint = OutPoint{zero_hash(), 0};
+          replay_validators.upsert(pub, vi);
+        }
+      }
+    }
+
+    committee_epoch_snapshots_.clear();
+    persist_committee_epoch_snapshot_locked(1, replay_validators.active_sorted(1), replay_randomness);
+
+    auto apply_changes = [&](const Block& block, std::uint64_t h) {
+      for (size_t txi = 1; txi < block.txs.size(); ++txi) {
+        const auto& tx = block.txs[txi];
+        for (const auto& in : tx.inputs) {
+          OutPoint op{in.prev_txid, in.prev_index};
+          auto it = replay_utxos.find(op);
+          if (it == replay_utxos.end()) continue;
+          PubKey32 pub{};
+          SlashEvidence evidence;
+          if (is_validator_register_script(it->second.out.script_pubkey, &pub)) {
+            if (parse_slash_script_sig(in.script_sig, &evidence)) {
+              replay_validators.ban(pub, h);
+              (void)replay_validators.finalize_withdrawal(pub);
+            } else {
+              replay_validators.request_unbond(pub, h);
+            }
+            continue;
+          }
+          if (is_validator_unbond_script(it->second.out.script_pubkey, &pub)) {
+            if (parse_slash_script_sig(in.script_sig, &evidence)) {
+              replay_validators.ban(pub, h);
+            }
+            (void)replay_validators.finalize_withdrawal(pub);
+          }
+        }
+      }
+
+      for (const auto& tx : block.txs) {
+        const Hash32 txid = tx.txid();
+        std::set<PubKey32> requested_in_tx;
+        for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+          const auto& out = tx.outputs[out_i];
+          PubKey32 pub{};
+          PubKey32 payout{};
+          Sig64 pop{};
+          if (!is_validator_join_request_script(out.script_pubkey, &pub, &payout, &pop)) continue;
+          for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+            PubKey32 bond_pub{};
+            if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != pub) continue;
+            ValidatorJoinRequest req;
+            req.request_txid = txid;
+            req.validator_pubkey = pub;
+            req.payout_pubkey = payout;
+            req.bond_outpoint = OutPoint{txid, bond_i};
+            req.bond_amount = tx.outputs[bond_i].value;
+            req.requested_height = h;
+            req.status = ValidatorJoinRequestStatus::REQUESTED;
+            replay_join_requests[txid] = req;
+            requested_in_tx.insert(pub);
+            break;
+          }
+        }
+        for (std::uint32_t out_i = 0; out_i < tx.outputs.size(); ++out_i) {
+          const auto& out = tx.outputs[out_i];
+          PubKey32 pub{};
+          if (is_validator_register_script(out.script_pubkey, &pub) && out.value == BOND_AMOUNT) {
+            if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
+            replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
+            continue;
+          }
+          Hash32 request_txid{};
+          PubKey32 validator_pub{};
+          PubKey32 approver_pub{};
+          Sig64 approval_sig{};
+          if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub,
+                                                &approval_sig)) {
+            auto req_it = replay_join_requests.find(request_txid);
+            if (req_it == replay_join_requests.end()) continue;
+            auto& req = req_it->second;
+            if (req.validator_pubkey != validator_pub) continue;
+            if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
+            req.status = ValidatorJoinRequestStatus::APPROVED;
+            req.approved_height = h;
+            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
+          }
+        }
+      }
+      replay_validators.advance_height(h + 1);
+    };
+
+    Hash32 snapshot_randomness = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
+    for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
+      auto bh = db_.get_height_hash(h);
+      if (!bh.has_value()) continue;
+      auto bb = db_.get_block(*bh);
+      if (!bb.has_value()) continue;
+      auto blk = Block::parse(*bb);
+      if (!blk.has_value()) continue;
+      apply_changes(*blk, h);
+      apply_block_to_utxo(*blk, replay_utxos);
+      snapshot_randomness = consensus::advance_finalized_randomness(snapshot_randomness, blk->header);
+      const auto next_epoch_start = consensus::committee_epoch_start(h + 1, cfg_.network.vrf_committee_epoch_blocks);
+      if (next_epoch_start == h + 1) {
+        persist_committee_epoch_snapshot_locked(next_epoch_start, replay_validators.active_sorted(h + 1), snapshot_randomness);
+      }
+    }
   }
 
   if (auto b = db_.get(kV4JoinWindowStartKey); b.has_value()) {
@@ -2618,10 +2766,15 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
   }
 
   const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.vrf_committee_epoch_blocks);
-  const auto epoch_randomness = committee_epoch_randomness_for_height_locked(height);
-  const auto epoch_seed = consensus::committee_epoch_seed(epoch_randomness, epoch_start);
-  const auto committee_size = consensus::committee_size_for_round_v2(active.size(), cfg_.max_committee, round);
-  return consensus::select_committee_v2(active, epoch_seed, committee_size);
+  auto it = committee_epoch_snapshots_.find(epoch_start);
+  if (it == committee_epoch_snapshots_.end()) {
+    const auto epoch_randomness = committee_epoch_randomness_for_height_locked(height);
+    auto snapshot = build_committee_epoch_snapshot_locked(epoch_start, active, epoch_randomness);
+    it = committee_epoch_snapshots_.emplace(epoch_start, std::move(snapshot)).first;
+  }
+  const auto& ordered = it->second.ordered_members;
+  const auto committee_size = consensus::committee_size_for_round_v2(ordered.size(), cfg_.max_committee, round);
+  return std::vector<PubKey32>(ordered.begin(), ordered.begin() + std::min<std::size_t>(committee_size, ordered.size()));
 }
 
 std::optional<PubKey32> Node::leader_for_height_round(std::uint64_t height, std::uint32_t round) const {

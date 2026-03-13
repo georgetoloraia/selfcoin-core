@@ -21,6 +21,7 @@ struct SpecialValidationContext {
   bool enforce_variable_bond_range{false};
   std::uint64_t min_bond_amount{BOND_AMOUNT};
   std::uint64_t max_bond_amount{BOND_AMOUNT};
+  std::uint64_t unbond_delay_blocks{UNBOND_DELAY_BLOCKS};
   std::function<bool(const PubKey32&, std::uint64_t, std::uint32_t)> is_committee_member;
 };
 

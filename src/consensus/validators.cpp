@@ -72,13 +72,30 @@ bool ValidatorRegistry::request_unbond(const PubKey32& pub, std::uint64_t height
   return true;
 }
 
-void ValidatorRegistry::ban(const PubKey32& pub) {
+void ValidatorRegistry::ban(const PubKey32& pub, std::uint64_t height) {
   auto it = validators_.find(pub);
   if (it != validators_.end()) {
     it->second.status = ValidatorStatus::BANNED;
-    it->second.has_bond = false;
-    it->second.last_exit_height = std::max(it->second.last_exit_height, it->second.unbond_height);
+    if (height != 0) it->second.unbond_height = std::max(it->second.unbond_height, height);
+    it->second.last_exit_height = std::max(it->second.last_exit_height, std::max(height, it->second.unbond_height));
   }
+}
+
+bool ValidatorRegistry::finalize_withdrawal(const PubKey32& pub) {
+  auto it = validators_.find(pub);
+  if (it == validators_.end()) return false;
+  it->second.has_bond = false;
+  it->second.bond_outpoint = OutPoint{};
+  return true;
+}
+
+bool ValidatorRegistry::can_withdraw_bond(const PubKey32& pub, std::uint64_t height, std::uint64_t delay_blocks) const {
+  auto it = validators_.find(pub);
+  if (it == validators_.end()) return false;
+  const auto& info = it->second;
+  if (!info.has_bond) return false;
+  if (info.status == ValidatorStatus::BANNED) return false;
+  return height >= info.unbond_height + delay_blocks;
 }
 
 void ValidatorRegistry::advance_height(std::uint64_t height) {

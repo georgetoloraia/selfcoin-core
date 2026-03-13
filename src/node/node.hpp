@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "consensus/validators.hpp"
+#include "consensus/randomness.hpp"
 #include "consensus/vrf_sortition.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
@@ -193,6 +194,7 @@ class Node {
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
   std::optional<crypto::VrfProof> local_proposer_vrf_locked(std::uint64_t height, std::uint32_t round) const;
   bool verify_block_proposer_locked(const Block& block) const;
+  bool check_and_record_proposer_equivocation_locked(const Block& block);
   std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();
@@ -247,6 +249,7 @@ class Node {
 
   std::uint64_t finalized_height_{0};
   Hash32 finalized_hash_{};
+  Hash32 finalized_randomness_{};
   std::uint32_t current_round_{0};
   std::uint64_t round_started_ms_{0};
 
@@ -291,6 +294,7 @@ class Node {
   std::uint64_t v4_suspend_duration_blocks_{1'000};
   std::size_t last_participation_eligible_signers_{0};
   std::map<Hash32, Block> candidate_blocks_;
+  std::map<std::tuple<std::uint64_t, std::uint32_t, PubKey32>, BlockHeader> observed_proposals_;
   std::map<std::pair<std::uint64_t, std::uint32_t>, bool> proposed_in_round_;
   std::set<std::pair<std::uint64_t, std::uint32_t>> logged_committee_rounds_;
 

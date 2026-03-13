@@ -4,6 +4,8 @@
 #include <stdexcept>
 
 #include "codec/bytes.hpp"
+#include "common/chain_id.hpp"
+#include "consensus/randomness.hpp"
 #include "consensus/vrf_sortition.hpp"
 #include "common/network.hpp"
 #include "crypto/ed25519.hpp"
@@ -122,6 +124,40 @@ TEST(test_proposer_vrf_verify_roundtrip_and_eligibility) {
 
   const bool eligible = consensus::verify_proposer_vrf(mainnet_network(), kp.public_key, prev, 11, 0, *proof, 1, 1, 1);
   ASSERT_TRUE(eligible);
+}
+
+TEST(test_finalized_randomness_accumulator_is_deterministic) {
+  ChainId cid;
+  cid.genesis_hash_hex = hex_encode(Bytes(32, 0x11));
+  auto r0 = consensus::initial_finalized_randomness(mainnet_network(), cid);
+
+  BlockHeader h1;
+  h1.prev_finalized_hash.fill(0x01);
+  h1.height = 1;
+  h1.timestamp = 100;
+  h1.merkle_root.fill(0x02);
+  h1.leader_pubkey.fill(0x03);
+  h1.leader_signature.fill(0x04);
+  h1.round = 0;
+  h1.vrf_output.fill(0x05);
+
+  BlockHeader h2 = h1;
+  h2.height = 2;
+  h2.prev_finalized_hash = h1.block_id();
+  h2.timestamp = 200;
+  h2.merkle_root.fill(0x06);
+  h2.vrf_output.fill(0x07);
+
+  auto a1 = consensus::advance_finalized_randomness(r0, h1);
+  auto a2 = consensus::advance_finalized_randomness(a1, h2);
+
+  auto b1 = consensus::advance_finalized_randomness(
+      consensus::initial_finalized_randomness(mainnet_network(), cid), h1);
+  auto b2 = consensus::advance_finalized_randomness(b1, h2);
+
+  ASSERT_EQ(a1, b1);
+  ASSERT_EQ(a2, b2);
+  ASSERT_TRUE(a2 != r0);
 }
 
 void register_research_vrf_tests() {}

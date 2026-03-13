@@ -277,6 +277,11 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       } else {
         // UNBOND path
         if (tx.outputs.size() != 1) return {false, "unbond tx must have exactly one output", 0};
+        auto info = ctx->validators->get(bond_pub);
+        if (!info.has_value()) return {false, "unknown validator for bond output", 0};
+        if (info->status == consensus::ValidatorStatus::BANNED) {
+          return {false, "banned validator bond must be slashed, not unbonded", 0};
+        }
         PubKey32 out_pub{};
         if (!is_validator_unbond_script(tx.outputs[0].script_pubkey, &out_pub)) {
           return {false, "unbond tx must output SCVALUNB", 0};
@@ -301,7 +306,35 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (!ctx || !ctx->validators) return {false, "unbond spend requires validator context", 0};
       auto info = ctx->validators->get(unbond_pub);
       if (!info.has_value()) return {false, "unknown validator for unbond output", 0};
-      if (ctx->current_height < info->unbond_height + UNBOND_DELAY_BLOCKS) {
+      SlashEvidence evidence;
+      if (parse_slash_script_sig(in.script_sig, &evidence)) {
+        if (tx.outputs.size() != 1) return {false, "slash tx must have exactly one output", 0};
+        Hash32 burn_hash{};
+        if (!is_burn_script(tx.outputs[0].script_pubkey, &burn_hash)) return {false, "slash output must be SCBURN", 0};
+        const Hash32 evh = crypto::sha256d(evidence.raw_blob);
+        if (burn_hash != evh) return {false, "slash evidence hash mismatch", 0};
+        if (evidence.a.height != evidence.b.height || evidence.a.round != evidence.b.round) {
+          return {false, "invalid equivocation evidence height/round", 0};
+        }
+        if (evidence.a.block_id == evidence.b.block_id) return {false, "invalid equivocation evidence block_id", 0};
+        if (evidence.a.validator_pubkey != evidence.b.validator_pubkey) return {false, "evidence pubkey mismatch", 0};
+        if (evidence.a.validator_pubkey != unbond_pub) return {false, "evidence pubkey must match unbond output", 0};
+        Bytes a_bid(evidence.a.block_id.begin(), evidence.a.block_id.end());
+        Bytes b_bid(evidence.b.block_id.begin(), evidence.b.block_id.end());
+        if (!crypto::ed25519_verify(a_bid, evidence.a.signature, evidence.a.validator_pubkey)) {
+          return {false, "invalid evidence signature a", 0};
+        }
+        if (!crypto::ed25519_verify(b_bid, evidence.b.signature, evidence.b.validator_pubkey)) {
+          return {false, "invalid evidence signature b", 0};
+        }
+        if (!ctx->is_committee_member) return {false, "slash spend requires committee context", 0};
+        if (!ctx->is_committee_member(evidence.a.validator_pubkey, evidence.a.height, evidence.a.round)) {
+          return {false, "slash evidence validator not in committee", 0};
+        }
+        in_sum += prev_out.value;
+        continue;
+      }
+      if (!ctx->validators->can_withdraw_bond(unbond_pub, ctx->current_height, ctx->unbond_delay_blocks)) {
         return {false, "unbond delay not reached", 0};
       }
 

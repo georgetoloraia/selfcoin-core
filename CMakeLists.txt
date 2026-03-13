@@ -47,6 +47,7 @@ add_library(selfcoin_core
   src/policy/hashcash.cpp
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
+  src/consensus/randomness.cpp
   src/consensus/state_commitment.cpp
   src/consensus/validators.cpp
   src/consensus/vrf_sortition.cpp

@@ -9,10 +9,9 @@
 
 namespace selfcoin {
 
-std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoint, const TxOut& prev_out,
-                                                      const Bytes& private_key_32,
-                                                      const std::vector<TxOut>& outputs,
-                                                      std::string* err) {
+namespace {
+
+std::optional<crypto::KeyPair> keypair_from_private_key(const Bytes& private_key_32, std::string* err) {
   if (private_key_32.size() != 32) {
     if (err) *err = "private key must be 32 bytes";
     return std::nullopt;
@@ -20,8 +19,18 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoi
   std::array<std::uint8_t, 32> seed{};
   std::copy(private_key_32.begin(), private_key_32.end(), seed.begin());
   auto kp = crypto::keypair_from_seed32(seed);
+  if (!kp.has_value() && err) *err = "failed to derive keypair";
+  return kp;
+}
+
+}  // namespace
+
+std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoint, const TxOut& prev_out,
+                                                      const Bytes& private_key_32,
+                                                      const std::vector<TxOut>& outputs,
+                                                      std::string* err) {
+  auto kp = keypair_from_private_key(private_key_32, err);
   if (!kp.has_value()) {
-    if (err) *err = "failed to derive keypair";
     return std::nullopt;
   }
 
@@ -64,6 +73,65 @@ std::optional<Tx> build_signed_p2pkh_tx_single_input(const OutPoint& prev_outpoi
   return tx;
 }
 
+std::optional<Tx> build_signed_p2pkh_tx_multi_input(const std::vector<std::pair<OutPoint, TxOut>>& prevs,
+                                                    const Bytes& private_key_32,
+                                                    const std::vector<TxOut>& outputs,
+                                                    std::string* err) {
+  if (prevs.empty()) {
+    if (err) *err = "at least one prev output is required";
+    return std::nullopt;
+  }
+  auto kp = keypair_from_private_key(private_key_32, err);
+  if (!kp.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto got_pkh = crypto::h160(Bytes(kp->public_key.begin(), kp->public_key.end()));
+  for (const auto& [prev_outpoint, prev_out] : prevs) {
+    (void)prev_outpoint;
+    std::array<std::uint8_t, 20> expected_pkh{};
+    if (!is_p2pkh_script_pubkey(prev_out.script_pubkey, &expected_pkh)) {
+      if (err) *err = "prev output is not P2PKH";
+      return std::nullopt;
+    }
+    if (!std::equal(got_pkh.begin(), got_pkh.end(), expected_pkh.begin())) {
+      if (err) *err = "private key does not match prev output pubkey hash";
+      return std::nullopt;
+    }
+  }
+
+  Tx tx;
+  tx.version = 1;
+  tx.lock_time = 0;
+  tx.outputs = outputs;
+  tx.inputs.reserve(prevs.size());
+  for (const auto& [prev_outpoint, _] : prevs) {
+    tx.inputs.push_back(TxIn{prev_outpoint.txid, prev_outpoint.index, Bytes{}, 0xFFFFFFFF});
+  }
+
+  for (std::uint32_t i = 0; i < tx.inputs.size(); ++i) {
+    auto msg = signing_message_for_input(tx, i);
+    if (!msg.has_value()) {
+      if (err) *err = "failed to build sighash";
+      return std::nullopt;
+    }
+    auto sig = crypto::ed25519_sign(*msg, private_key_32);
+    if (!sig.has_value()) {
+      if (err) *err = "failed to sign";
+      return std::nullopt;
+    }
+    Bytes script_sig;
+    script_sig.reserve(98);
+    script_sig.push_back(0x40);
+    script_sig.insert(script_sig.end(), sig->begin(), sig->end());
+    script_sig.push_back(0x20);
+    script_sig.insert(script_sig.end(), kp->public_key.begin(), kp->public_key.end());
+    tx.inputs[i].script_sig = script_sig;
+  }
+
+  return tx;
+}
+
 std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32& validator_pubkey,
                                   std::uint64_t bond_value, std::uint64_t fee,
                                   const Bytes& validator_privkey_32, std::string* err) {
@@ -75,9 +143,7 @@ std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32&
     if (err) *err = "private key must be 32 bytes";
     return std::nullopt;
   }
-  std::array<std::uint8_t, 32> seed{};
-  std::copy(validator_privkey_32.begin(), validator_privkey_32.end(), seed.begin());
-  auto kp = crypto::keypair_from_seed32(seed);
+  auto kp = keypair_from_private_key(validator_privkey_32, err);
   if (!kp.has_value() || kp->public_key != validator_pubkey) {
     if (err) *err = "private key/pubkey mismatch";
     return std::nullopt;
@@ -150,15 +216,8 @@ std::optional<Tx> build_validator_join_approval_tx(const OutPoint& prev_outpoint
     if (err) *err = "fee exceeds prev value";
     return std::nullopt;
   }
-  std::array<std::uint8_t, 32> seed{};
-  if (approver_privkey_32.size() != 32) {
-    if (err) *err = "approver private key must be 32 bytes";
-    return std::nullopt;
-  }
-  std::copy(approver_privkey_32.begin(), approver_privkey_32.end(), seed.begin());
-  auto kp = crypto::keypair_from_seed32(seed);
+  auto kp = keypair_from_private_key(approver_privkey_32, err);
   if (!kp.has_value()) {
-    if (err) *err = "failed to derive approver keypair";
     return std::nullopt;
   }
   auto approval_sig = crypto::ed25519_sign(validator_join_approval_message(request_txid, validator_pubkey), approver_privkey_32);

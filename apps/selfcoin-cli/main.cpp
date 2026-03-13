@@ -432,6 +432,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli wallet_import --out <path> --privkey <hex32> [--pass <pass>] [--network mainnet]\n"
               << "  selfcoin-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
               << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
+              << "  selfcoin-cli build_p2pkh_multi_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> [--prev-txid ...] --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
@@ -440,6 +441,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
               << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> --note-amount <u64> [--blind <msg> --note-amount <u64> ...]\n"
               << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --amount <u64> --note <opaque> [--note <opaque> ...]\n"
+              << "  selfcoin-cli mint_redeem_approve_broadcast --url http://host:port/path --batch-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
               << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
@@ -1229,6 +1231,94 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (cmd == "build_p2pkh_multi_tx") {
+    std::vector<std::string> prev_txid_hexes;
+    std::vector<std::uint32_t> prev_indexes;
+    std::vector<std::uint64_t> prev_values;
+    std::string from_priv_hex;
+    std::string to_addr;
+    std::string change_addr;
+    std::uint64_t amount = 0;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hexes.push_back(argv[++i]);
+      else if (a == "--prev-index" && i + 1 < argc) prev_indexes.push_back(static_cast<std::uint32_t>(std::stoul(argv[++i])));
+      else if (a == "--prev-value" && i + 1 < argc) prev_values.push_back(static_cast<std::uint64_t>(std::stoull(argv[++i])));
+      else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
+      else if (a == "--to-address" && i + 1 < argc) to_addr = argv[++i];
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    if (prev_txid_hexes.empty() || prev_txid_hexes.size() != prev_indexes.size() || prev_txid_hexes.size() != prev_values.size()) {
+      std::cerr << "prev inputs must provide matching --prev-txid/--prev-index/--prev-value groups\n";
+      return 1;
+    }
+    auto priv = decode_hex32(from_priv_hex);
+    auto to = selfcoin::address::decode(to_addr);
+    if (!priv.has_value() || !to.has_value()) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+
+    auto kp = selfcoin::crypto::keypair_from_seed32(*priv);
+    if (!kp.has_value()) {
+      std::cerr << "invalid private key\n";
+      return 1;
+    }
+    auto from_pkh = selfcoin::crypto::h160(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end()));
+
+    std::vector<std::pair<selfcoin::OutPoint, selfcoin::TxOut>> prevs;
+    std::uint64_t total_prev_value = 0;
+    prevs.reserve(prev_txid_hexes.size());
+    for (size_t i = 0; i < prev_txid_hexes.size(); ++i) {
+      auto prev_txid = decode_hex32(prev_txid_hexes[i]);
+      if (!prev_txid.has_value()) {
+        std::cerr << "invalid --prev-txid\n";
+        return 1;
+      }
+      prevs.push_back({
+          selfcoin::OutPoint{*prev_txid, prev_indexes[i]},
+          selfcoin::TxOut{prev_values[i], selfcoin::address::p2pkh_script_pubkey(from_pkh)},
+      });
+      total_prev_value += prev_values[i];
+    }
+    if (total_prev_value < amount + fee) {
+      std::cerr << "insufficient prev output value\n";
+      return 1;
+    }
+
+    std::vector<selfcoin::TxOut> outputs;
+    outputs.push_back(selfcoin::TxOut{amount, selfcoin::address::p2pkh_script_pubkey(to->pubkey_hash)});
+    const std::uint64_t change = total_prev_value - amount - fee;
+    if (change > 0) {
+      if (!change_addr.empty()) {
+        auto ch = selfcoin::address::decode(change_addr);
+        if (!ch.has_value()) {
+          std::cerr << "invalid --change-address\n";
+          return 1;
+        }
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash)});
+      } else {
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(from_pkh)});
+      }
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_signed_p2pkh_tx_multi_input(prevs, selfcoin::Bytes(priv->begin(), priv->end()), outputs, &err);
+    if (!tx.has_value()) {
+      std::cerr << "build tx failed: " << err << "\n";
+      return 1;
+    }
+
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
   if (cmd == "create_validator_bond_tx") {
     std::string prev_txid_hex;
     std::uint32_t prev_index = 0;
@@ -1666,6 +1756,39 @@ int main(int argc, char** argv) {
     }
     std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
     std::cout << "redemption_batch_id=" << resp->redemption_batch_id << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_redeem_approve_broadcast") {
+    std::string url;
+    std::string batch_id;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+    }
+    if (url.empty() || batch_id.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_redeem_approve_broadcast requires --url, --batch-id, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    std::ostringstream body_json;
+    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\"}";
+    std::string err;
+    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_redeem_approve_broadcast failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
+    if (!body) {
+      std::cerr << "mint_redeem_approve_broadcast failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
     return 0;
   }
 

@@ -34,7 +34,8 @@ The Chaumian mint service must live outside this repo. It is responsible for:
 - note spend validation
 - double-spend tracking
 - reserve/accounting controls
-- redemption batching back to L1
+- redemption tx construction/broadcast from mint reserve UTXOs
+- redemption status reconciliation against finalized L1 state
 
 ## Suggested service API
 
@@ -43,6 +44,7 @@ Suggested example HTTP endpoints:
 - `POST /deposits/register`
 - `POST /issuance/blind`
 - `POST /redemptions/create`
+- `POST /redemptions/approve_broadcast`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
 - `GET /accounting/summary`
@@ -131,6 +133,7 @@ Response:
   "l1_txid": "hex32",
   "amount": 100000
 }
+```
 
 ### 5. Redemption state update
 
@@ -139,7 +142,7 @@ Request:
 ```json
 {
   "redemption_batch_id": "opaque-string",
-  "state": "broadcast|rejected",
+  "state": "rejected",
   "l1_txid": "hex32"
 }
 ```
@@ -153,12 +156,46 @@ Authentication:
 
 Notes:
 
-- `broadcast` requires `l1_txid`
+- `broadcast` is not manually set through this endpoint
 - `finalized` is not manually set; it is derived from observed lightserver state
+
+### 5a. Automatic redemption settlement
+
+If the external mint is configured with:
+- a reserve wallet private key
+- a reserve wallet address
+- a lightserver RPC URL
+- a path to `selfcoin-cli`
+
+then signed operators can call `POST /redemptions/approve_broadcast` to:
+1. discover reserve UTXOs via lightserver `get_utxos`
+2. build an L1 `build_p2pkh_multi_tx`
+3. broadcast that tx via lightserver `broadcast_tx`
+4. transition the redemption to `broadcast`
+
+Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcast -> finalized` via observed L1 confirmation depth.
 
 ### 6. Reserve and accounting views
 
 `GET /reserves` returns the mint's deposit-backed reserve summary.
+When reserve wallet discovery is configured, it also returns live reserve-wallet inventory:
+- `wallet_utxo_count`
+- `wallet_utxo_value`
+- `wallet_locked_utxo_count`
+- `wallet_locked_utxo_value`
+- `wallet_fragment_smallest`
+- `wallet_fragment_largest`
+- `wallet_fragment_below_min_change`
+- `wallet_synced_at`
+
+Broadcasted redemption inputs are removed from spendable reserve inventory. The in-flight commitment is reported explicitly through `pending_spend_commitment_count` and `pending_spend_input_count` during the `broadcast -> finalized` window.
+
+Recommended coin-selection policy for the external mint:
+- smallest sufficient input set
+- explicit max-input budget
+- reject selections that would create change below `min_change`
+- report the chosen policy and resulting `change_value` in audit exports
+- expose reserve exhaustion / fragmentation alerts in reserve and audit views
 
 `GET /accounting/summary` returns:
 - deposit totals
@@ -214,11 +251,9 @@ selfcoin-cli mint_redeem_status \
 ```
 
 ```bash
-selfcoin-cli mint_redeem_update \
-  --url http://127.0.0.1:8080/redemptions/update \
+selfcoin-cli mint_redeem_approve_broadcast \
+  --url http://127.0.0.1:8080/redemptions/approve_broadcast \
   --batch-id <opaque-id> \
-  --state broadcast \
-  --l1-txid <hex32> \
   --operator-key-id <id> \
   --operator-secret-hex <hex>
 ```

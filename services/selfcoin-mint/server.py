@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import threading
 import time
 import urllib.request
@@ -16,6 +17,13 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+
+RESERVE_MIN_CHANGE = 1000
+RESERVE_MAX_INPUTS = 8
+RESERVE_CONSOLIDATE_UTXO_COUNT = 12
+RESERVE_FRAGMENTATION_ALERT_COUNT = 16
+RESERVE_EXHAUSTION_BUFFER = 10000
 
 
 def sha256_hex(parts: list[str]) -> str:
@@ -65,6 +73,47 @@ class MintConfig:
     mint_id: str
     operator_keys: dict[str, bytes]
     lightserver_url: str
+    reserve_privkey_hex: str
+    reserve_address: str
+    reserve_fee: int
+    cli_path: str
+
+
+_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
+
+
+def decode_selfcoin_address(addr: str) -> bytes | None:
+    if "1" not in addr:
+        return None
+    hrp, body = addr.split("1", 1)
+    if hrp not in {"sc", "tsc"} or not body:
+        return None
+    rev = {c: i for i, c in enumerate(_BASE32_ALPHABET)}
+    out = bytearray()
+    buffer = 0
+    bits = 0
+    for c in body:
+        if c not in rev:
+            return None
+        buffer = (buffer << 5) | rev[c]
+        bits += 5
+        if bits >= 8:
+            out.append((buffer >> (bits - 8)) & 0xFF)
+            bits -= 8
+    if bits > 0 and (buffer & ((1 << bits) - 1)) != 0:
+        return None
+    if len(out) != 25 or out[0] != 0x00:
+        return None
+    payload = bytes(out[:21])
+    chk = hashlib.sha256(hrp.encode("utf-8") + b"\x00" + payload).digest()
+    chk = hashlib.sha256(chk).digest()
+    if bytes(out[21:25]) != chk[:4]:
+        return None
+    return payload[1:21]
+
+
+def p2pkh_script_pubkey(pubkey_hash: bytes) -> bytes:
+    return bytes([0x76, 0xA9, 0x14]) + pubkey_hash + bytes([0x88, 0xAC])
 
 
 def _is_probable_prime(n: int) -> bool:
@@ -332,7 +381,13 @@ class MintState:
                 return False
             return record.get("state") != "issued"
 
-    def update_redemption(self, batch_id: str, new_state: str, l1_txid: str = "") -> dict[str, Any]:
+    def update_redemption(
+        self,
+        batch_id: str,
+        new_state: str,
+        l1_txid: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         allowed = {
             "pending": {"broadcast", "finalized", "rejected"},
             "broadcast": {"finalized", "rejected"},
@@ -351,6 +406,9 @@ class MintState:
             redemption["updated_at"] = now
             if l1_txid:
                 redemption["l1_txid"] = l1_txid
+            if metadata:
+                for key, value in metadata.items():
+                    redemption[key] = value
             if new_state == "rejected":
                 for note in redemption["notes"]:
                     record = self._data["note_records"].get(note)
@@ -381,7 +439,7 @@ class MintState:
         with self._lock:
             return self._reserve_summary_locked()
 
-    def reserve_attestation(self, mint_id: str) -> dict[str, Any]:
+    def reserve_attestation(self, mint_id: str, inventory: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             reserve = self._reserve_summary_locked()
             attested_at = int(time.time())
@@ -393,6 +451,10 @@ class MintState:
                     str(reserve["finalized_redemption_amount"]),
                     str(reserve["reserve_balance"]),
                     str(reserve["available_reserve"]),
+                    str((inventory or {}).get("wallet_utxo_count", 0)),
+                    str((inventory or {}).get("wallet_utxo_value", 0)),
+                    str((inventory or {}).get("wallet_locked_utxo_count", 0)),
+                    str((inventory or {}).get("wallet_locked_utxo_value", 0)),
                     str(len(self._data["deposits"])),
                     str(len(self._data["issuances"])),
                     str(len(self._data["redemptions"])),
@@ -404,9 +466,10 @@ class MintState:
                 "attested_at": attested_at,
                 "state_hash": state_hash,
                 **reserve,
+                **(inventory or {}),
             }
 
-    def audit_export(self, mint_id: str) -> dict[str, Any]:
+    def audit_export(self, mint_id: str, inventory: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             return {
                 "mint_id": mint_id,
@@ -415,7 +478,7 @@ class MintState:
                 "redemptions": list(self._data["redemptions"].values()),
                 "note_records": list(self._data["note_records"].values()),
                 "accounting": self._accounting_summary_locked(),
-                "reserves": self._reserve_summary_locked(),
+                "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
             }
 
     def _total_deposited_locked(self) -> int:
@@ -436,12 +499,19 @@ class MintState:
             if isinstance(item, dict) and item.get("state") == "finalized"
         )
         reserved = self._total_reserved_locked()
+        spend_commitments = [
+            item
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "broadcast"
+        ]
         return {
             "total_deposited": total_deposited,
             "reserved_redemption_amount": reserved,
             "finalized_redemption_amount": finalized,
             "reserve_balance": total_deposited - finalized,
             "available_reserve": total_deposited - reserved,
+            "pending_spend_commitment_count": len(spend_commitments),
+            "pending_spend_input_count": sum(len(item.get("selected_utxos", [])) for item in spend_commitments),
         }
 
     def _accounting_summary_locked(self) -> dict[str, Any]:
@@ -491,7 +561,7 @@ class MintState:
             "rejected_redemption_amount": rejected,
             "reserve_balance": total_deposited - finalized,
             "available_reserve": total_deposited - pending - broadcast - finalized,
-            }
+        }
 
 
 def rpc_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -517,6 +587,36 @@ def lightserver_confirmations(url: str, txid: str) -> tuple[int, int] | None:
         return tx_height, confirmations
     except Exception:
         return None
+
+
+def lightserver_get_utxos(url: str, scripthash_hex: str) -> list[dict[str, Any]]:
+    if not url:
+        return []
+    try:
+        resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "get_utxos", "scripthash_hex": scripthash_hex})
+        if "error" in resp or "result" not in resp or not isinstance(resp["result"], list):
+            return []
+        return [item for item in resp["result"] if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def lightserver_broadcast_tx(url: str, tx_hex: str) -> tuple[bool, str]:
+    if not url:
+        return False, "lightserver url not configured"
+    try:
+        resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "broadcast_tx", "tx_hex": tx_hex})
+        if "error" in resp or "result" not in resp or not isinstance(resp["result"], dict):
+            return False, "broadcast rpc failed"
+        if not bool(resp["result"].get("accepted", False)):
+            return False, str(resp["result"].get("error", "tx rejected"))
+        return True, str(resp["result"].get("txid", ""))
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _sum_utxo_values(utxos: list[dict[str, Any]]) -> int:
+    return sum(int(item.get("value", 0)) for item in utxos if isinstance(item, dict))
 
 
 def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
@@ -550,6 +650,45 @@ def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_i
         "signature_scheme": "rsa-sha256-raw",
         "operator_key_id": operator_key_id,
     }
+
+
+def build_redemption_tx(config: MintConfig, utxos: list[dict[str, Any]], redeem_address: str, amount: int) -> tuple[str, str]:
+    cmd = [
+        config.cli_path,
+        "build_p2pkh_multi_tx",
+        "--from-privkey",
+        config.reserve_privkey_hex,
+        "--to-address",
+        redeem_address,
+        "--amount",
+        str(amount),
+        "--fee",
+        str(config.reserve_fee),
+        "--change-address",
+        config.reserve_address,
+    ]
+    for utxo in utxos:
+        cmd.extend(
+            [
+                "--prev-txid",
+                str(utxo["txid"]),
+                "--prev-index",
+                str(int(utxo["vout"])),
+                "--prev-value",
+                str(int(utxo["value"])),
+            ]
+        )
+    proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    txid = ""
+    tx_hex = ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("txid="):
+            txid = line.split("=", 1)[1]
+        elif line.startswith("tx_hex="):
+            tx_hex = line.split("=", 1)[1]
+    if not txid or not tx_hex:
+        raise RuntimeError("build_p2pkh_tx did not return txid/tx_hex")
+    return txid, tx_hex
 
 
 def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str):
@@ -606,6 +745,137 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 if isinstance(batch_id, str):
                     self._reconcile_redemption(batch_id)
 
+        def _locked_reserve_outpoints(self) -> set[tuple[str, int]]:
+            locked: set[tuple[str, int]] = set()
+            for redemption in state.list_broadcast_redemptions():
+                for utxo in redemption.get("selected_utxos", []):
+                    if isinstance(utxo, dict):
+                        txid = str(utxo.get("txid", ""))
+                        vout = int(utxo.get("vout", -1))
+                        if txid and vout >= 0:
+                            locked.add((txid, vout))
+            return locked
+
+        def _reserve_alerts(self, summary: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
+            utxo_count = int(inventory.get("wallet_utxo_count", 0))
+            utxo_value = int(inventory.get("wallet_utxo_value", 0))
+            below_min = int(inventory.get("wallet_fragment_below_min_change", 0))
+            available_reserve = int(summary.get("available_reserve", 0))
+            recommend_consolidation = utxo_count >= RESERVE_CONSOLIDATE_UTXO_COUNT or below_min > 0
+            return {
+                "coin_selection_policy": "smallest-sufficient-non-dust-change",
+                "coin_selection_max_inputs": RESERVE_MAX_INPUTS,
+                "coin_selection_min_change": RESERVE_MIN_CHANGE,
+                "consolidation_threshold_utxos": RESERVE_CONSOLIDATE_UTXO_COUNT,
+                "fragmentation_alert_threshold_utxos": RESERVE_FRAGMENTATION_ALERT_COUNT,
+                "reserve_exhaustion_buffer": RESERVE_EXHAUSTION_BUFFER,
+                "recommend_consolidation": recommend_consolidation,
+                "consolidation_candidate_count": below_min,
+                "alert_max_inputs_pressure": utxo_count > RESERVE_MAX_INPUTS,
+                "alert_fragmentation_threshold_breach": utxo_count >= RESERVE_FRAGMENTATION_ALERT_COUNT,
+                "alert_reserve_exhaustion_risk": available_reserve <= RESERVE_EXHAUSTION_BUFFER or utxo_value <= RESERVE_EXHAUSTION_BUFFER,
+            }
+
+        def _reserve_inventory(self) -> dict[str, Any]:
+            if not config.lightserver_url or not config.reserve_address:
+                return {
+                    "wallet_utxo_count": 0,
+                    "wallet_utxo_value": 0,
+                    "wallet_locked_utxo_count": 0,
+                    "wallet_locked_utxo_value": 0,
+                    "wallet_fragment_smallest": 0,
+                    "wallet_fragment_largest": 0,
+                    "wallet_fragment_below_min_change": 0,
+                    "wallet_synced_at": int(time.time()),
+                }
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                return {
+                    "wallet_utxo_count": 0,
+                    "wallet_utxo_value": 0,
+                    "wallet_synced_at": int(time.time()),
+                    "wallet_error": "invalid reserve address",
+                }
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            raw_utxos = lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+            locked = self._locked_reserve_outpoints()
+            utxos = [
+                item for item in raw_utxos if (str(item.get("txid", "")), int(item.get("vout", -1))) not in locked
+            ]
+            values = sorted(int(item.get("value", 0)) for item in utxos)
+            return {
+                "wallet_utxo_count": len(utxos),
+                "wallet_utxo_value": sum(values),
+                "wallet_locked_utxo_count": len(raw_utxos) - len(utxos),
+                "wallet_locked_utxo_value": sum(int(item.get("value", 0)) for item in raw_utxos) - sum(values),
+                "wallet_fragment_smallest": values[0] if values else 0,
+                "wallet_fragment_largest": values[-1] if values else 0,
+                "wallet_fragment_below_min_change": sum(1 for value in values if value < RESERVE_MIN_CHANGE),
+                "wallet_synced_at": int(time.time()),
+            }
+
+        def _select_reserve_utxos(self, amount_needed: int) -> list[dict[str, Any]]:
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                raise ValueError("invalid reserve address")
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            utxos = [
+                item
+                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+                if int(item.get("value", 0)) > 0
+                and (str(item.get("txid", "")), int(item.get("vout", -1))) not in self._locked_reserve_outpoints()
+            ]
+            utxos.sort(key=lambda item: int(item.get("value", 0)))
+            selected: list[dict[str, Any]] = []
+            total = 0
+            for utxo in utxos:
+                if len(selected) >= RESERVE_MAX_INPUTS:
+                    break
+                selected.append(utxo)
+                total += int(utxo.get("value", 0))
+                change = total - amount_needed
+                if total == amount_needed or (total > amount_needed and change >= RESERVE_MIN_CHANGE):
+                    return selected
+            return []
+
+        def _maybe_broadcast_redemption(self, batch_id: str) -> dict[str, Any]:
+            redemption = state.get_redemption(batch_id)
+            if not isinstance(redemption, dict):
+                raise KeyError("unknown redemption_batch_id")
+            if redemption.get("state") != "pending":
+                return redemption
+            if not config.lightserver_url or not config.reserve_privkey_hex or not config.reserve_address:
+                return redemption
+            selected = self._select_reserve_utxos(int(redemption["amount"]) + config.reserve_fee)
+            if not selected:
+                return redemption
+            total_input_value = sum(int(item.get("value", 0)) for item in selected)
+            amount_needed = int(redemption["amount"]) + config.reserve_fee
+            change_value = total_input_value - amount_needed
+            txid, tx_hex = build_redemption_tx(config, selected, str(redemption["redeem_address"]), int(redemption["amount"]))
+            ok, err = lightserver_broadcast_tx(config.lightserver_url, tx_hex)
+            if not ok:
+                raise ValueError(err)
+            return state.update_redemption(
+                batch_id,
+                "broadcast",
+                txid,
+                {
+                    "selected_utxos": [
+                        {
+                            "txid": str(item["txid"]),
+                            "vout": int(item["vout"]),
+                            "value": int(item["value"]),
+                        }
+                        for item in selected
+                    ],
+                    "total_input_value": total_input_value,
+                    "change_value": change_value,
+                    "coin_selection_policy": "smallest-sufficient-non-dust-change",
+                    "min_change": RESERVE_MIN_CHANGE,
+                },
+            )
+
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 write_json(self, HTTPStatus.OK, {"ok": True, "mint_id": config.mint_id})
@@ -637,6 +907,10 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if self.path == "/reserves":
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
+                summary["reserve_address"] = config.reserve_address
+                inventory = self._reserve_inventory()
+                summary.update(inventory)
+                summary.update(self._reserve_alerts(summary, inventory))
                 write_json(self, HTTPStatus.OK, summary)
                 return
             if self.path == "/accounting/summary":
@@ -645,19 +919,25 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 write_json(self, HTTPStatus.OK, summary)
                 return
             if self.path == "/attestations/reserves":
+                inventory = self._reserve_inventory()
+                payload = state.reserve_attestation(config.mint_id, inventory)
+                payload.update(self._reserve_alerts(payload, inventory))
                 write_json(
                     self,
                     HTTPStatus.OK,
-                    sign_snapshot(attestor, state.reserve_attestation(config.mint_id), primary_operator_key_id),
+                    sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
                 return
             if self.path == "/audit/export":
                 if not self._require_operator(b""):
                     return
+                inventory = self._reserve_inventory()
+                payload = state.audit_export(config.mint_id, inventory)
+                payload["reserves"].update(self._reserve_alerts(payload["reserves"], inventory))
                 write_json(
                     self,
                     HTTPStatus.OK,
-                    sign_snapshot(attestor, state.audit_export(config.mint_id), primary_operator_key_id),
+                    sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -694,6 +974,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/redemptions/update":
                 self._handle_redemption_update(body, raw_body)
+                return
+            if self.path == "/redemptions/approve_broadcast":
+                self._handle_redemption_approve_broadcast(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -816,7 +1099,16 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             except ValueError as exc:
                 write_json(self, HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
-            write_json(self, HTTPStatus.OK, {"accepted": True, "redemption_batch_id": batch_id})
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "redemption_batch_id": batch_id,
+                    "state": "pending",
+                    "l1_txid": "",
+                },
+            )
 
         def _handle_redemption_status(self, body: dict[str, Any]) -> None:
             batch_id = body.get("redemption_batch_id")
@@ -855,8 +1147,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if l1_txid and not is_hex_of_size(l1_txid, 32):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid l1_txid"})
                 return
-            if new_state == "broadcast" and not l1_txid:
-                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "broadcast state requires l1_txid"})
+            if new_state == "broadcast":
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "broadcast state must use /redemptions/approve_broadcast"})
                 return
             if new_state == "finalized":
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "finalized state is derived from lightserver observation"})
@@ -876,6 +1168,31 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "accepted": True,
                     "state": updated["state"],
                     "l1_txid": updated["l1_txid"],
+                },
+            )
+
+        def _handle_redemption_approve_broadcast(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            batch_id = body.get("redemption_batch_id")
+            if not isinstance(batch_id, str) or not batch_id:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid redemption_batch_id"})
+                return
+            try:
+                updated = self._maybe_broadcast_redemption(batch_id)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown redemption_batch_id"})
+                return
+            except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "state": updated["state"],
+                    "l1_txid": updated.get("l1_txid", ""),
                 },
             )
 
@@ -909,6 +1226,10 @@ def main() -> int:
         default="",
         help="Optional lightserver RPC URL used to reconcile redemption tx finalization.",
     )
+    parser.add_argument("--reserve-privkey", default="", help="Hex-encoded reserve wallet private key for redemption settlement.")
+    parser.add_argument("--reserve-address", default="", help="Reserve wallet address used for change and UTXO discovery.")
+    parser.add_argument("--reserve-fee", type=int, default=1000, help="L1 fee used for redemption settlement transactions.")
+    parser.add_argument("--cli-path", default="./build/selfcoin-cli", help="Path to selfcoin-cli used for tx construction.")
     args = parser.parse_args()
 
     operator_keys = parse_operator_keys(args.operator_key)
@@ -921,6 +1242,10 @@ def main() -> int:
         mint_id=args.mint_id,
         operator_keys=operator_keys,
         lightserver_url=args.lightserver_url,
+        reserve_privkey_hex=args.reserve_privkey,
+        reserve_address=args.reserve_address,
+        reserve_fee=args.reserve_fee,
+        cli_path=args.cli_path,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)

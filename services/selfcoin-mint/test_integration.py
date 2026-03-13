@@ -5,9 +5,12 @@ import math
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -30,180 +33,299 @@ def http_get_json(url: str, headers: dict[str, str] | None = None) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
-    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    merged = {"Content-Type": "application/json"}
-    if headers:
-        merged.update(headers)
-    req = urllib.request.Request(url, data=data, headers=merged)
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def load_server_module():
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("selfcoin_mint_server_integration", SERVER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("failed to load server module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+server_module = load_server_module()
+
+
+class FakeLightserver:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.tip_height = 0
+        self.tx_heights: dict[str, int] = {}
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), self._make_handler())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def _make_handler(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                body = json.loads(raw.decode("utf-8"))
+                method = body.get("method")
+                req_id = body.get("id")
+                if method == "get_status":
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"height": outer.tip_height},
+                    }
+                    self._write_json(HTTPStatus.OK, payload)
+                    return
+                if method == "get_tx":
+                    txid = body.get("txid", "")
+                    if txid not in outer.tx_heights:
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": {"code": -32001, "message": "not found"},
+                        }
+                    else:
+                        payload = {
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {"height": outer.tx_heights[txid], "tx_hex": ""},
+                        }
+                    self._write_json(HTTPStatus.OK, payload)
+                    return
+                self._write_json(
+                    HTTPStatus.OK,
+                    {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "method not found"}},
+                )
+
+            def _write_json(self, status: HTTPStatus, payload: dict) -> None:
+                data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        return Handler
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
 
 
 class MintIntegrationTests(unittest.TestCase):
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()
-        with tempfile.TemporaryDirectory() as td:
-            state_path = Path(td) / "mint-state.json"
-            proc = subprocess.Popen(
-                [
-                    "python3",
-                    str(SERVER),
-                    "--host",
-                    "127.0.0.1",
-                    "--port",
-                    str(port),
-                    "--state-file",
-                    str(state_path),
-                    "--mint-id",
-                    "22" * 32,
-                    "--signing-seed",
-                    "integration-seed",
-                    "--admin-token",
-                    "integration-admin-token",
-                ],
-                cwd=REPO_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            try:
-                for _ in range(50):
-                    try:
-                        health = http_get_json(f"http://127.0.0.1:{port}/healthz")
-                        if health.get("ok"):
-                            break
-                    except Exception:
-                        time.sleep(0.1)
-                else:
-                    self.fail("mint service did not become ready")
-
-                deposit_cmd = [
-                    str(CLI),
-                    "mint_deposit_register",
-                    "--url",
-                    f"http://127.0.0.1:{port}/deposits/register",
-                    "--deposit-txid",
-                    "11" * 32,
-                    "--deposit-vout",
-                    "0",
-                    "--mint-id",
-                    "22" * 32,
-                    "--recipient-address",
-                    "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
-                    "--amount",
-                    "100000",
-                ]
-                dep = subprocess.run(deposit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                lines = dict(line.split("=", 1) for line in dep.stdout.strip().splitlines())
-                mint_deposit_ref = lines["mint_deposit_ref"]
-
-                pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
-                n = int(pubkey["modulus_hex"], 16)
-                e = int(pubkey["public_exponent"])
-                message = 123456789
-                r = 5
-                while math.gcd(r, n) != 1:
-                    r += 2
-                blinded = (message * pow(r, e, n)) % n
-
-                blind_cmd = [
-                    str(CLI),
-                    "mint_issue_blinds",
-                    "--url",
-                    f"http://127.0.0.1:{port}/issuance/blind",
-                    "--mint-deposit-ref",
-                    mint_deposit_ref,
-                    "--blind",
-                    format(blinded, "x"),
-                    "--note-amount",
-                    "100000",
-                ]
-                blind = subprocess.run(blind_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                signed_line = next(line for line in blind.stdout.splitlines() if line.startswith("signed_blind[0]="))
-                note_ref_line = next(line for line in blind.stdout.splitlines() if line.startswith("note_ref[0]="))
-                note_ref = note_ref_line.split("=", 1)[1]
-                signed_blind = int(signed_line.split("=", 1)[1], 16)
-                unblinded = (signed_blind * pow(r, -1, n)) % n
-                self.assertEqual(pow(unblinded, e, n), message)
-                accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
-                self.assertEqual(accounting["total_deposited"], 100000)
-                self.assertEqual(accounting["issued_blind_count"], 1)
-                self.assertEqual(accounting["issued_amount"], 100000)
-
-                redeem_cmd = [
-                    str(CLI),
-                    "mint_redeem_create",
-                    "--url",
-                    f"http://127.0.0.1:{port}/redemptions/create",
-                    "--redeem-address",
-                    "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
-                    "--amount",
-                    "100000",
-                    "--note",
-                    note_ref,
-                ]
-                redeem = subprocess.run(redeem_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                redeem_lines = dict(line.split("=", 1) for line in redeem.stdout.strip().splitlines())
-                batch_id = redeem_lines["redemption_batch_id"]
-
-                status_cmd = [
-                    str(CLI),
-                    "mint_redeem_status",
-                    "--url",
-                    f"http://127.0.0.1:{port}/redemptions/status",
-                    "--batch-id",
-                    batch_id,
-                ]
-                status = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                status_lines = dict(line.split("=", 1) for line in status.stdout.strip().splitlines())
-                self.assertEqual(status_lines["state"], "pending")
-                self.assertEqual(status_lines["l1_txid"], "")
-
-                reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
-                self.assertEqual(reserves["available_reserve"], 0)
-
-                update = http_post_json(
-                    f"http://127.0.0.1:{port}/redemptions/update",
-                    {
-                        "redemption_batch_id": batch_id,
-                        "state": "finalized",
-                        "l1_txid": "44" * 32,
-                    },
-                    headers={"Authorization": "Bearer integration-admin-token"},
+        lightserver_port = free_port()
+        lightserver = FakeLightserver(lightserver_port)
+        lightserver.start()
+        operator_key_id = "integration-operator"
+        operator_secret_hex = "11" * 32
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                state_path = Path(td) / "mint-state.json"
+                proc = subprocess.Popen(
+                    [
+                        "python3",
+                        str(SERVER),
+                        "--host",
+                        "127.0.0.1",
+                        "--port",
+                        str(port),
+                        "--state-file",
+                        str(state_path),
+                        "--mint-id",
+                        "22" * 32,
+                        "--signing-seed",
+                        "integration-seed",
+                        "--operator-key",
+                        f"{operator_key_id}:{operator_secret_hex}",
+                        "--lightserver-url",
+                        f"http://127.0.0.1:{lightserver_port}/rpc",
+                    ],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
-                self.assertTrue(update["accepted"])
-                finalized = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                finalized_lines = dict(line.split("=", 1) for line in finalized.stdout.strip().splitlines())
-                self.assertEqual(finalized_lines["state"], "finalized")
-                self.assertEqual(finalized_lines["l1_txid"], "44" * 32)
-                self.assertEqual(finalized_lines["amount"], "100000")
-
-                unauth = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/audit/export",
-                    headers={},
-                )
-                with self.assertRaises(Exception):
-                    urllib.request.urlopen(unauth, timeout=5)
-
-                audit = http_get_json(
-                    f"http://127.0.0.1:{port}/audit/export",
-                    headers={"Authorization": "Bearer integration-admin-token"},
-                )
-                self.assertEqual(len(audit["issuances"]), 1)
-                attestation = http_get_json(f"http://127.0.0.1:{port}/attestations/reserves")
-                self.assertEqual(attestation["reserve_balance"], 0)
-            finally:
-                proc.terminate()
                 try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                if proc.stdout is not None:
-                    proc.stdout.close()
-                if proc.stderr is not None:
-                    proc.stderr.close()
+                    for _ in range(50):
+                        try:
+                            health = http_get_json(f"http://127.0.0.1:{port}/healthz")
+                            if health.get("ok"):
+                                break
+                        except Exception:
+                            time.sleep(0.1)
+                    else:
+                        self.fail("mint service did not become ready")
+
+                    deposit_cmd = [
+                        str(CLI),
+                        "mint_deposit_register",
+                        "--url",
+                        f"http://127.0.0.1:{port}/deposits/register",
+                        "--deposit-txid",
+                        "11" * 32,
+                        "--deposit-vout",
+                        "0",
+                        "--mint-id",
+                        "22" * 32,
+                        "--recipient-address",
+                        "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
+                        "--amount",
+                        "100000",
+                    ]
+                    dep = subprocess.run(deposit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    lines = dict(line.split("=", 1) for line in dep.stdout.strip().splitlines())
+                    mint_deposit_ref = lines["mint_deposit_ref"]
+
+                    pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
+                    n = int(pubkey["modulus_hex"], 16)
+                    e = int(pubkey["public_exponent"])
+                    message = 123456789
+                    r = 5
+                    while math.gcd(r, n) != 1:
+                        r += 2
+                    blinded = (message * pow(r, e, n)) % n
+
+                    blind_cmd = [
+                        str(CLI),
+                        "mint_issue_blinds",
+                        "--url",
+                        f"http://127.0.0.1:{port}/issuance/blind",
+                        "--mint-deposit-ref",
+                        mint_deposit_ref,
+                        "--blind",
+                        format(blinded, "x"),
+                        "--note-amount",
+                        "100000",
+                    ]
+                    blind = subprocess.run(blind_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    blind_lines = blind.stdout.splitlines()
+                    signed_line = next(line for line in blind_lines if line.startswith("signed_blind[0]="))
+                    note_ref_line = next(line for line in blind_lines if line.startswith("note_ref[0]="))
+                    signed_blind = int(signed_line.split("=", 1)[1], 16)
+                    note_ref = note_ref_line.split("=", 1)[1]
+                    unblinded = (signed_blind * pow(r, -1, n)) % n
+                    self.assertEqual(pow(unblinded, e, n), message)
+
+                    accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
+                    self.assertEqual(accounting["total_deposited"], 100000)
+                    self.assertEqual(accounting["issued_blind_count"], 1)
+                    self.assertEqual(accounting["issued_amount"], 100000)
+
+                    redeem_cmd = [
+                        str(CLI),
+                        "mint_redeem_create",
+                        "--url",
+                        f"http://127.0.0.1:{port}/redemptions/create",
+                        "--redeem-address",
+                        "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
+                        "--amount",
+                        "100000",
+                        "--note",
+                        note_ref,
+                    ]
+                    redeem = subprocess.run(redeem_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    redeem_lines = dict(line.split("=", 1) for line in redeem.stdout.strip().splitlines())
+                    batch_id = redeem_lines["redemption_batch_id"]
+
+                    status_cmd = [
+                        str(CLI),
+                        "mint_redeem_status",
+                        "--url",
+                        f"http://127.0.0.1:{port}/redemptions/status",
+                        "--batch-id",
+                        batch_id,
+                    ]
+                    status = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    status_lines = dict(line.split("=", 1) for line in status.stdout.strip().splitlines())
+                    self.assertEqual(status_lines["state"], "pending")
+                    self.assertEqual(status_lines["l1_txid"], "")
+                    self.assertEqual(status_lines["amount"], "100000")
+
+                    reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                    self.assertEqual(reserves["available_reserve"], 0)
+
+                    l1_txid = "44" * 32
+                    update_cmd = [
+                        str(CLI),
+                        "mint_redeem_update",
+                        "--url",
+                        f"http://127.0.0.1:{port}/redemptions/update",
+                        "--batch-id",
+                        batch_id,
+                        "--state",
+                        "broadcast",
+                        "--l1-txid",
+                        l1_txid,
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    update = subprocess.run(update_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    self.assertIn('"accepted":true', update.stdout)
+
+                    broadcasted = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    broadcast_lines = dict(line.split("=", 1) for line in broadcasted.stdout.strip().splitlines())
+                    self.assertEqual(broadcast_lines["state"], "broadcast")
+
+                    lightserver.tip_height = 20
+                    lightserver.tx_heights[l1_txid] = 20
+
+                    finalized = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    finalized_lines = dict(line.split("=", 1) for line in finalized.stdout.strip().splitlines())
+                    self.assertEqual(finalized_lines["state"], "finalized")
+                    self.assertEqual(finalized_lines["l1_txid"], l1_txid)
+                    self.assertEqual(finalized_lines["amount"], "100000")
+
+                    audit_cmd = [
+                        str(CLI),
+                        "mint_audit_export",
+                        "--url",
+                        f"http://127.0.0.1:{port}/audit/export",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    audit = subprocess.run(audit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    audit_json = json.loads(audit.stdout)
+                    self.assertEqual(len(audit_json["payload"]["issuances"]), 1)
+                    self.assertTrue(audit_json["signature_hex"])
+
+                    attest_cmd = [
+                        str(CLI),
+                        "mint_attest_reserves",
+                        "--url",
+                        f"http://127.0.0.1:{port}/attestations/reserves",
+                    ]
+                    attestation = subprocess.run(attest_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    attest_json = json.loads(attestation.stdout)
+                    self.assertEqual(attest_json["payload"]["reserve_balance"], 0)
+                    self.assertTrue(attest_json["signature_hex"])
+
+                    operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")
+                    self.assertEqual(operator_pub["operator_key_id"], operator_key_id)
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                    if proc.stderr is not None:
+                        proc.stderr.close()
+        finally:
+            lightserver.stop()
 
 
 if __name__ == "__main__":

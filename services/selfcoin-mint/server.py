@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import hashlib
 import json
 import math
@@ -9,6 +10,7 @@ import os
 import random
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +49,10 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.wfile.write(body)
 
 
+def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
 def is_hex_of_size(value: Any, size_bytes: int) -> bool:
     return isinstance(value, str) and len(value) == size_bytes * 2 and all(c in "0123456789abcdefABCDEF" for c in value)
 
@@ -57,7 +63,8 @@ class MintConfig:
     confirmations_required: int
     signing_seed: str
     mint_id: str
-    admin_token: str
+    operator_keys: dict[str, bytes]
+    lightserver_url: str
 
 
 def _is_probable_prime(n: int) -> bool:
@@ -102,6 +109,15 @@ def _next_prime(rng: random.Random, bits: int) -> int:
             return candidate
 
 
+def body_hash_hex(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest()
+
+
+def sign_operator_request(secret: bytes, method: str, path: str, timestamp: str, body_hash: str) -> str:
+    payload = "\n".join([method.upper(), path, timestamp, body_hash]).encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
 @dataclass
 class BlindSigner:
     n: int
@@ -128,6 +144,13 @@ class BlindSigner:
         if blinded <= 0 or blinded >= self.n:
             raise ValueError("blinded message out of range")
         signed = pow(blinded, self.d, self.n)
+        return format(signed, "x")
+
+    def sign_digest_hex(self, digest_hex: str) -> str:
+        digest = int(digest_hex, 16)
+        if digest <= 0 or digest >= self.n:
+            raise ValueError("digest out of range")
+        signed = pow(digest, self.d, self.n)
         return format(signed, "x")
 
 
@@ -293,6 +316,14 @@ class MintState:
         with self._lock:
             item = self._data["redemptions"].get(batch_id)
             return dict(item) if isinstance(item, dict) else None
+
+    def list_broadcast_redemptions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._data["redemptions"].values()
+                if isinstance(item, dict) and item.get("state") == "broadcast"
+            ]
 
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
@@ -460,24 +491,120 @@ class MintState:
             "rejected_redemption_amount": rejected,
             "reserve_balance": total_deposited - finalized,
             "available_reserve": total_deposited - pending - broadcast - finalized,
-        }
+            }
 
 
-def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
+def rpc_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    data = canonical_json_bytes(payload)
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def lightserver_confirmations(url: str, txid: str) -> tuple[int, int] | None:
+    if not url:
+        return None
+    try:
+        tx_resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "get_tx", "txid": txid})
+        if "error" in tx_resp or "result" not in tx_resp:
+            return None
+        tip_resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "get_status"})
+        if "error" in tip_resp or "result" not in tip_resp:
+            return None
+        tx_height = int(tx_resp["result"]["height"])
+        tip_height = int(tip_resp["result"]["height"])
+        confirmations = max(0, tip_height - tx_height + 1)
+        return tx_height, confirmations
+    except Exception:
+        return None
+
+
+def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
+    if not entries:
+        return {"dev-operator": hashlib.sha256(b"dev-operator-secret").digest()}
+    out: dict[str, bytes] = {}
+    for entry in entries:
+        if ":" not in entry:
+            raise ValueError("operator key must be key_id:hex_secret")
+        key_id, secret_hex = entry.split(":", 1)
+        key_id = key_id.strip()
+        if not key_id:
+            raise ValueError("operator key id cannot be empty")
+        try:
+            secret = bytes.fromhex(secret_hex)
+        except ValueError as exc:
+            raise ValueError("operator secret must be hex") from exc
+        if len(secret) < 16:
+            raise ValueError("operator secret must be at least 16 bytes")
+        out[key_id] = secret
+    return out
+
+
+def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_id: str) -> dict[str, Any]:
+    body = canonical_json_bytes(payload)
+    digest_hex = hashlib.sha256(body).hexdigest()
+    return {
+        "payload": payload,
+        "payload_sha256": digest_hex,
+        "signature_hex": attestor.sign_digest_hex(digest_hex),
+        "signature_scheme": "rsa-sha256-raw",
+        "operator_key_id": operator_key_id,
+    }
+
+
+def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str):
     class MintHandler(BaseHTTPRequestHandler):
         server_version = "selfcoin-mint/0.1"
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
-        def _require_admin(self) -> bool:
-            if not config.admin_token:
-                return True
-            header = self.headers.get("Authorization", "")
-            if header == f"Bearer {config.admin_token}":
-                return True
-            write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "admin auth required"})
-            return False
+        def _require_operator(self, raw_body: bytes) -> bool:
+            key_id = self.headers.get("X-Selfcoin-Operator-Key", "")
+            timestamp = self.headers.get("X-Selfcoin-Timestamp", "")
+            signature = self.headers.get("X-Selfcoin-Signature", "")
+            if not key_id or not timestamp or not signature:
+                write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "operator auth required"})
+                return False
+            secret = config.operator_keys.get(key_id)
+            if secret is None:
+                write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "unknown operator key"})
+                return False
+            try:
+                ts = int(timestamp)
+            except ValueError:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid operator timestamp"})
+                return False
+            if abs(int(time.time()) - ts) > 300:
+                write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "stale operator timestamp"})
+                return False
+            expected = sign_operator_request(secret, self.command, self.path, timestamp, body_hash_hex(raw_body))
+            if not hmac.compare_digest(expected, signature):
+                write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "bad operator signature"})
+                return False
+            return True
+
+        def _reconcile_redemption(self, batch_id: str) -> None:
+            redemption = state.get_redemption(batch_id)
+            if not isinstance(redemption, dict):
+                return
+            if redemption.get("state") != "broadcast":
+                return
+            txid = str(redemption.get("l1_txid", ""))
+            if not txid:
+                return
+            observed = lightserver_confirmations(config.lightserver_url, txid)
+            if observed is None:
+                return
+            _, confirmations = observed
+            if confirmations >= config.confirmations_required:
+                state.update_redemption(batch_id, "finalized", txid)
+
+        def _reconcile_all_broadcast(self) -> None:
+            for redemption in state.list_broadcast_redemptions():
+                batch_id = redemption.get("redemption_batch_id")
+                if isinstance(batch_id, str):
+                    self._reconcile_redemption(batch_id)
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
@@ -494,6 +621,19 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                     },
                 )
                 return
+            if self.path == "/operator/key":
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    {
+                        "algorithm": "rsa-sha256-raw",
+                        "operator_key_id": primary_operator_key_id,
+                        "modulus_hex": format(attestor.n, "x"),
+                        "public_exponent": attestor.e,
+                    },
+                )
+                return
+            self._reconcile_all_broadcast()
             if self.path == "/reserves":
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
@@ -505,17 +645,37 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                 write_json(self, HTTPStatus.OK, summary)
                 return
             if self.path == "/attestations/reserves":
-                write_json(self, HTTPStatus.OK, state.reserve_attestation(config.mint_id))
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    sign_snapshot(attestor, state.reserve_attestation(config.mint_id), primary_operator_key_id),
+                )
                 return
             if self.path == "/audit/export":
-                if not self._require_admin():
+                if not self._require_operator(b""):
                     return
-                write_json(self, HTTPStatus.OK, state.audit_export(config.mint_id))
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    sign_snapshot(attestor, state.audit_export(config.mint_id), primary_operator_key_id),
+                )
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:
-            body = read_json_body(self)
+            length = self.headers.get("Content-Length")
+            raw_body = b""
+            if length:
+                try:
+                    raw_body = self.rfile.read(int(length))
+                except Exception:
+                    raw_body = b""
+            try:
+                body = json.loads(raw_body.decode("utf-8")) if raw_body else None
+                if body is not None and not isinstance(body, dict):
+                    body = None
+            except Exception:
+                body = None
             if body is None:
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid json body"})
                 return
@@ -533,7 +693,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                 self._handle_redemption_status(body)
                 return
             if self.path == "/redemptions/update":
-                self._handle_redemption_update(body)
+                self._handle_redemption_update(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -663,10 +823,15 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
             if not isinstance(batch_id, str):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid redemption_batch_id"})
                 return
+            self._reconcile_redemption(batch_id)
             redemption = state.get_redemption(batch_id)
             if redemption is None:
                 write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown redemption_batch_id"})
                 return
+            observed = None
+            if redemption["state"] == "broadcast" and redemption["l1_txid"]:
+                observed = lightserver_confirmations(config.lightserver_url, redemption["l1_txid"])
+            confirmations = observed[1] if observed is not None else 0
             write_json(
                 self,
                 HTTPStatus.OK,
@@ -674,11 +839,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                     "state": redemption["state"],
                     "l1_txid": redemption["l1_txid"],
                     "amount": redemption["amount"],
+                    "confirmations": confirmations,
                 },
             )
 
-        def _handle_redemption_update(self, body: dict[str, Any]) -> None:
-            if not self._require_admin():
+        def _handle_redemption_update(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
                 return
             batch_id = body.get("redemption_batch_id")
             new_state = body.get("state")
@@ -688,6 +854,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                 return
             if l1_txid and not is_hex_of_size(l1_txid, 32):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid l1_txid"})
+                return
+            if new_state == "broadcast" and not l1_txid:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "broadcast state requires l1_txid"})
+                return
+            if new_state == "finalized":
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "finalized state is derived from lightserver observation"})
                 return
             try:
                 updated = state.update_redemption(batch_id, new_state, l1_txid)
@@ -727,22 +899,33 @@ def main() -> int:
         help="Optional 32-byte hex mint id to enforce on /deposits/register.",
     )
     parser.add_argument(
-        "--admin-token",
-        default="dev-admin-token",
-        help="Bearer token required for admin endpoints such as redemption updates and audit export.",
+        "--operator-key",
+        action="append",
+        default=[],
+        help="Operator auth key in key_id:hex_secret form. May be repeated.",
+    )
+    parser.add_argument(
+        "--lightserver-url",
+        default="",
+        help="Optional lightserver RPC URL used to reconcile redemption tx finalization.",
     )
     args = parser.parse_args()
+
+    operator_keys = parse_operator_keys(args.operator_key)
+    primary_operator_key_id = next(iter(operator_keys))
 
     config = MintConfig(
         state_file=Path(args.state_file),
         confirmations_required=args.confirmations_required,
         signing_seed=args.signing_seed,
         mint_id=args.mint_id,
-        admin_token=args.admin_token,
+        operator_keys=operator_keys,
+        lightserver_url=args.lightserver_url,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer))
+    attestor = BlindSigner.from_seed(config.signing_seed + ":attestation")
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer, attestor, primary_operator_key_id))
     print(f"selfcoin-mint listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

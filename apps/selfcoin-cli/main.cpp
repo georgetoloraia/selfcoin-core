@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -138,9 +140,62 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err);
 std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err);
 std::optional<std::string> http_get_json(const std::string& url, std::string* err);
+using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
+std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
+                                                       const HttpHeaders& headers, std::string* err);
+std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
+                                                      std::string* err);
 
-std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
-                                          const std::string& bearer_token, std::string* err) {
+std::string sha256_hex_string(const std::string& data) {
+  selfcoin::Bytes b(data.begin(), data.end());
+  const auto h = selfcoin::crypto::sha256(b);
+  return selfcoin::hex_encode(selfcoin::Bytes(h.begin(), h.end()));
+}
+
+std::optional<std::string> hmac_sha256_hex(const selfcoin::Bytes& key, const std::string& data) {
+  unsigned int out_len = 0;
+  unsigned char out[EVP_MAX_MD_SIZE];
+  if (!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()),
+            reinterpret_cast<const unsigned char*>(data.data()), data.size(), out, &out_len)) {
+    return std::nullopt;
+  }
+  return selfcoin::hex_encode(selfcoin::Bytes(out, out + out_len));
+}
+
+std::optional<HttpHeaders> operator_signed_headers_for_url(const std::string& method, const std::string& url,
+                                                           const std::string& body, const std::string& key_id,
+                                                           const std::string& secret_hex, std::string* err) {
+  if (key_id.empty() || secret_hex.empty()) {
+    if (err) *err = "operator auth requires key id and secret";
+    return std::nullopt;
+  }
+  auto parsed = parse_http_url(url);
+  if (!parsed) {
+    if (err) *err = "url must be http://host:port/path";
+    return std::nullopt;
+  }
+  auto secret_opt = selfcoin::hex_decode(secret_hex);
+  if (!secret_opt || secret_opt->size() < 16) {
+    if (err) *err = "operator secret must be at least 16 bytes of hex";
+    return std::nullopt;
+  }
+  const auto timestamp = std::to_string(static_cast<std::uint64_t>(std::time(nullptr)));
+  const auto body_hash = sha256_hex_string(body);
+  const auto payload = method + "\n" + parsed->path + "\n" + timestamp + "\n" + body_hash;
+  auto sig = hmac_sha256_hex(*secret_opt, payload);
+  if (!sig) {
+    if (err) *err = "failed to sign operator request";
+    return std::nullopt;
+  }
+  return HttpHeaders{
+      {"X-Selfcoin-Operator-Key", key_id},
+      {"X-Selfcoin-Timestamp", timestamp},
+      {"X-Selfcoin-Signature", *sig},
+  };
+}
+
+std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
+                                                       const HttpHeaders& headers, std::string* err) {
   auto parsed = parse_http_url(url);
   if (!parsed) {
     if (err) *err = "url must be http://host:port/path";
@@ -155,8 +210,8 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   std::ostringstream req;
   req << "POST " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port
       << "\r\nContent-Type: application/json\r\n";
-  if (!bearer_token.empty()) {
-    req << "Authorization: Bearer " << bearer_token << "\r\n";
+  for (const auto& [k, v] : headers) {
+    req << k << ": " << v << "\r\n";
   }
   req << "Content-Length: " << body.size()
       << "\r\nConnection: close\r\n\r\n" << body;
@@ -182,11 +237,19 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
   return resp.substr(pos + 4);
 }
 
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body,
+                                          const std::string& bearer_token, std::string* err) {
+  HttpHeaders headers;
+  if (!bearer_token.empty()) headers.push_back({"Authorization", "Bearer " + bearer_token});
+  return http_post_json_with_headers(url, body, headers, err);
+}
+
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
   return http_post_json(url, body, "", err);
 }
 
-std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err) {
+std::optional<std::string> http_get_json_with_headers(const std::string& url, const HttpHeaders& headers,
+                                                      std::string* err) {
   auto parsed = parse_http_url(url);
   if (!parsed) {
     if (err) *err = "url must be http://host:port/path";
@@ -200,8 +263,8 @@ std::optional<std::string> http_get_json(const std::string& url, const std::stri
   const int fd = *fd_opt;
   std::ostringstream req;
   req << "GET " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port << "\r\n";
-  if (!bearer_token.empty()) {
-    req << "Authorization: Bearer " << bearer_token << "\r\n";
+  for (const auto& [k, v] : headers) {
+    req << k << ": " << v << "\r\n";
   }
   req << "Connection: close\r\n\r\n";
   const auto req_s = req.str();
@@ -224,6 +287,12 @@ std::optional<std::string> http_get_json(const std::string& url, const std::stri
     return std::nullopt;
   }
   return resp.substr(pos + 4);
+}
+
+std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err) {
+  HttpHeaders headers;
+  if (!bearer_token.empty()) headers.push_back({"Authorization", "Bearer " + bearer_token});
+  return http_get_json_with_headers(url, headers, err);
 }
 
 std::optional<std::string> http_get_json(const std::string& url, std::string* err) {
@@ -372,10 +441,11 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> --note-amount <u64> [--blind <msg> --note-amount <u64> ...]\n"
               << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --amount <u64> --note <opaque> [--note <opaque> ...]\n"
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
-              << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <pending|broadcast|finalized|rejected> [--l1-txid <hex32>] --admin-token <token>\n"
+              << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
               << "  selfcoin-cli mint_accounting_summary --url http://host:port/path\n"
-              << "  selfcoin-cli mint_audit_export --url http://host:port/path --admin-token <token>\n"
+              << "  selfcoin-cli mint_attest_reserves --url http://host:port/path\n"
+              << "  selfcoin-cli mint_audit_export --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
@@ -1637,17 +1707,19 @@ int main(int argc, char** argv) {
     std::string batch_id;
     std::string state;
     std::string l1_txid;
-    std::string admin_token;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
       else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
       else if (a == "--state" && i + 1 < argc) state = argv[++i];
       else if (a == "--l1-txid" && i + 1 < argc) l1_txid = argv[++i];
-      else if (a == "--admin-token" && i + 1 < argc) admin_token = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
     }
-    if (url.empty() || batch_id.empty() || state.empty() || admin_token.empty()) {
-      std::cerr << "mint_redeem_update requires --url, --batch-id, --state, and --admin-token\n";
+    if (url.empty() || batch_id.empty() || state.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_redeem_update requires --url, --batch-id, --state, --operator-key-id, and --operator-secret-hex\n";
       return 1;
     }
     std::ostringstream body_json;
@@ -1655,7 +1727,12 @@ int main(int argc, char** argv) {
     if (!l1_txid.empty()) body_json << ",\"l1_txid\":\"" << l1_txid << "\"";
     body_json << "}";
     std::string err;
-    auto body = http_post_json(url, body_json.str(), admin_token, &err);
+    auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_redeem_update failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
     if (!body) {
       std::cerr << "mint_redeem_update failed: " << err << "\n";
       return 1;
@@ -1704,20 +1781,47 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (cmd == "mint_audit_export") {
+  if (cmd == "mint_attest_reserves") {
     std::string url;
-    std::string admin_token;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
-      else if (a == "--admin-token" && i + 1 < argc) admin_token = argv[++i];
     }
-    if (url.empty() || admin_token.empty()) {
-      std::cerr << "mint_audit_export requires --url and --admin-token\n";
+    if (url.empty()) {
+      std::cerr << "mint_attest_reserves requires --url\n";
       return 1;
     }
     std::string err;
-    auto body = http_get_json(url, admin_token, &err);
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_attest_reserves failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_audit_export") {
+    std::string url;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+    }
+    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_audit_export requires --url, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    std::string err;
+    auto headers = operator_signed_headers_for_url("GET", url, "", operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_audit_export failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_get_json_with_headers(url, *headers, &err);
     if (!body) {
       std::cerr << "mint_audit_export failed: " << err << "\n";
       return 1;

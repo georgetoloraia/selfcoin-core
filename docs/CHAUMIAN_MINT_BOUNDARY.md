@@ -80,7 +80,8 @@ Request:
 ```json
 {
   "mint_deposit_ref": "opaque-string",
-  "blinded_messages": ["hex", "hex"]
+  "blinded_messages": ["hex", "hex"],
+  "note_amounts": [40000, 60000]
 }
 ```
 
@@ -88,7 +89,10 @@ Response:
 
 ```json
 {
+  "issuance_id": "opaque-string",
   "signed_blinds": ["hex", "hex"],
+  "note_refs": ["opaque-note-ref-1", "opaque-note-ref-2"],
+  "note_amounts": [40000, 60000],
   "mint_epoch": 42
 }
 ```
@@ -147,6 +151,13 @@ Request:
 - pending/broadcast/finalized redemption totals
 - available reserve estimate
 - active note locks
+
+`GET /attestations/reserves` returns:
+- current reserve summary
+- a timestamped `state_hash` suitable for audit/audit-log export
+
+`GET /audit/export` returns a full export of deposits, issuances, redemptions, note records, and summary views.
+This should be authenticated outside development.
 ```
 
 ## Core repo scope
@@ -187,8 +198,19 @@ selfcoin-cli mint_redeem_status \
 ```
 
 ```bash
+selfcoin-cli mint_redeem_update \
+  --url http://127.0.0.1:8080/redemptions/update \
+  --batch-id <opaque-id> \
+  --state finalized \
+  --l1-txid <hex32> \
+  --admin-token <token>
+```
+
+```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
+curl http://127.0.0.1:8080/attestations/reserves
+curl -H 'Authorization: Bearer <token>' http://127.0.0.1:8080/audit/export
 ```
 
 ## Non-goals

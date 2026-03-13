@@ -27,6 +27,8 @@ It is a narrow scaffold, not a production mint:
 - `GET /mint/key`
 - `GET /reserves`
 - `GET /accounting/summary`
+- `GET /attestations/reserves`
+- `GET /audit/export` (admin token required)
 
 ## Run
 
@@ -35,7 +37,8 @@ python3 services/selfcoin-mint/server.py \
   --host 127.0.0.1 \
   --port 8080 \
   --state-file /tmp/selfcoin-mint-state.json \
-  --confirmations-required 1
+  --confirmations-required 1 \
+  --admin-token dev-admin-token
 ```
 
 ## Example with selfcoin-cli
@@ -60,30 +63,34 @@ python3 services/selfcoin-mint/server.py \
 ./build/selfcoin-cli mint_issue_blinds \
   --url http://127.0.0.1:8080/issuance/blind \
   --mint-deposit-ref <opaque-id> \
-  --blind blind-msg-1 \
-  --blind blind-msg-2
+  --blind blind-msg-1 --note-amount 40000 \
+  --blind blind-msg-2 --note-amount 60000
 ```
 
 ```bash
 ./build/selfcoin-cli mint_redeem_create \
   --url http://127.0.0.1:8080/redemptions/create \
   --redeem-address sc1... \
-  --amount 50000 \
-  --note note-1 \
-  --note note-2
+  --amount 100000 \
+  --note <note-ref-1> \
+  --note <note-ref-2>
 ```
 
 ```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
+curl http://127.0.0.1:8080/attestations/reserves
+curl -H 'Authorization: Bearer dev-admin-token' http://127.0.0.1:8080/audit/export
 ```
 
 ## Notes
 
 - Deposit references are deterministic hashes of `(txid, vout, mint_id)`.
 - Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
+- Each issuance creates persistent `note_ref` entries with explicit denominations.
 - Redemption batches are created with `state=pending` and can be advanced with `POST /redemptions/update`.
-- Reserve and accounting endpoints are derived from persisted deposits, issuances, and redemption state.
+- `POST /redemptions/update` and `GET /audit/export` require `Authorization: Bearer <admin-token>`.
+- Reserve/accounting/attestation endpoints are derived from persisted deposits, issuances, note records, and redemption state.
 
 ## Service tests
 

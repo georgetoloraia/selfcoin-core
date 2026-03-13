@@ -57,6 +57,7 @@ class MintConfig:
     confirmations_required: int
     signing_seed: str
     mint_id: str
+    admin_token: str
 
 
 def _is_probable_prime(n: int) -> bool:
@@ -186,13 +187,28 @@ class MintState:
             dep = self._data["deposits"].get(mint_deposit_ref)
             return dict(dep) if isinstance(dep, dict) else None
 
-    def record_issuance(self, mint_deposit_ref: str, blinded_messages: list[str], signed_blinds: list[str]) -> dict[str, Any]:
+    def get_note_record(self, note_ref: str) -> dict[str, Any] | None:
+        with self._lock:
+            item = self._data["note_records"].get(note_ref)
+            return dict(item) if isinstance(item, dict) else None
+
+    def record_issuance(
+        self,
+        mint_deposit_ref: str,
+        blinded_messages: list[str],
+        signed_blinds: list[str],
+        note_amounts: list[int],
+    ) -> dict[str, Any]:
         blinded_hashes = [hashlib.sha256(msg.encode("utf-8")).hexdigest() for msg in blinded_messages]
         issued_at = int(time.time())
         with self._lock:
             deposit = self._data["deposits"].get(mint_deposit_ref)
             if not isinstance(deposit, dict):
                 raise KeyError("unknown mint_deposit_ref")
+            if len(blinded_messages) != len(note_amounts):
+                raise ValueError("note_amounts must match blinded_messages")
+            if any(int(amount) <= 0 for amount in note_amounts):
+                raise ValueError("note amounts must be positive")
             existing = set()
             for issuance_id in deposit.get("issuance_ids", []):
                 issuance = self._data["issuances"].get(issuance_id)
@@ -201,19 +217,45 @@ class MintState:
             overlap = existing.intersection(blinded_hashes)
             if overlap:
                 raise ValueError("duplicate blinded message")
+            remaining = int(deposit["amount"]) - int(deposit.get("issued_amount", 0))
+            requested = sum(int(amount) for amount in note_amounts)
+            if requested > remaining:
+                raise ValueError("issuance exceeds deposited amount")
             issuance_id = sha256_hex([mint_deposit_ref, *blinded_hashes])
+            note_refs = []
+            note_entries = []
+            for i, amount in enumerate(note_amounts):
+                note_ref = sha256_hex([issuance_id, str(i), blinded_hashes[i]])
+                note_refs.append(note_ref)
+                note_entries.append(
+                    {
+                        "note_ref": note_ref,
+                        "mint_deposit_ref": mint_deposit_ref,
+                        "issuance_id": issuance_id,
+                        "amount": int(amount),
+                        "state": "issued",
+                        "created_at": issued_at,
+                        "updated_at": issued_at,
+                    }
+                )
             issuance = {
                 "issuance_id": issuance_id,
                 "mint_deposit_ref": mint_deposit_ref,
                 "blinded_hashes": blinded_hashes,
                 "signed_blinds": list(signed_blinds),
+                "note_refs": note_refs,
+                "note_amounts": [int(amount) for amount in note_amounts],
                 "created_at": issued_at,
                 "note_count": len(blinded_messages),
+                "issued_amount": requested,
             }
             self._data["issuances"][issuance_id] = issuance
             deposit["issuance_ids"] = list(deposit.get("issuance_ids", [])) + [issuance_id]
             deposit["issued_blind_count"] = int(deposit.get("issued_blind_count", 0)) + len(blinded_messages)
+            deposit["issued_amount"] = int(deposit.get("issued_amount", 0)) + requested
             self._data["deposits"][mint_deposit_ref] = deposit
+            for entry in note_entries:
+                self._data["note_records"][entry["note_ref"]] = entry
             self._flush()
             return dict(issuance)
 
@@ -226,15 +268,24 @@ class MintState:
             redemption = dict(redemption)
             redemption.setdefault("created_at", now)
             redemption["updated_at"] = now
+            note_total = 0
+            for note in redemption["notes"]:
+                record = self._data["note_records"].get(note)
+                if not isinstance(record, dict):
+                    raise ValueError("unknown note")
+                if record.get("state") != "issued":
+                    raise ValueError("note not spendable")
+                note_total += int(record.get("amount", 0))
+            if note_total != int(redemption["amount"]):
+                raise ValueError("redemption amount does not match note denominations")
             self._data["redemptions"][redemption["redemption_batch_id"]] = redemption
             for note in redemption["notes"]:
-                self._data["note_records"][note] = {
-                    "state": redemption["state"],
-                    "redemption_batch_id": redemption["redemption_batch_id"],
-                    "redeem_address": redemption["redeem_address"],
-                    "amount": int(redemption["amount"]),
-                    "updated_at": now,
-                }
+                record = dict(self._data["note_records"][note])
+                record["state"] = redemption["state"]
+                record["redemption_batch_id"] = redemption["redemption_batch_id"]
+                record["redeem_address"] = redemption["redeem_address"]
+                record["updated_at"] = now
+                self._data["note_records"][note] = record
             self._flush()
             return dict(redemption)
 
@@ -245,7 +296,10 @@ class MintState:
 
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
-            return note in self._data["note_records"]
+            record = self._data["note_records"].get(note)
+            if not isinstance(record, dict):
+                return False
+            return record.get("state") != "issued"
 
     def update_redemption(self, batch_id: str, new_state: str, l1_txid: str = "") -> dict[str, Any]:
         allowed = {
@@ -268,62 +322,69 @@ class MintState:
                 redemption["l1_txid"] = l1_txid
             if new_state == "rejected":
                 for note in redemption["notes"]:
-                    self._data["note_records"].pop(note, None)
+                    record = self._data["note_records"].get(note)
+                    if isinstance(record, dict):
+                        record = dict(record)
+                        record["state"] = "issued"
+                        record.pop("redemption_batch_id", None)
+                        record.pop("redeem_address", None)
+                        record["updated_at"] = now
+                        self._data["note_records"][note] = record
             else:
                 for note in redemption["notes"]:
-                    self._data["note_records"][note] = {
-                        "state": new_state,
-                        "redemption_batch_id": batch_id,
-                        "redeem_address": redemption["redeem_address"],
-                        "amount": int(redemption["amount"]),
-                        "updated_at": now,
-                    }
+                    record = dict(self._data["note_records"][note])
+                    record["state"] = new_state
+                    record["redemption_batch_id"] = batch_id
+                    record["redeem_address"] = redemption["redeem_address"]
+                    record["updated_at"] = now
+                    self._data["note_records"][note] = record
             self._data["redemptions"][batch_id] = redemption
             self._flush()
             return dict(redemption)
 
     def accounting_summary(self) -> dict[str, Any]:
         with self._lock:
-            total_deposited = self._total_deposited_locked()
-            pending = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
-                          if isinstance(item, dict) and item.get("state") == "pending")
-            broadcast = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
-                            if isinstance(item, dict) and item.get("state") == "broadcast")
-            finalized = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
-                            if isinstance(item, dict) and item.get("state") == "finalized")
-            rejected = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
-                           if isinstance(item, dict) and item.get("state") == "rejected")
-            issuance_count = len(self._data["issuances"])
-            blind_count = sum(int(item.get("note_count", 0)) for item in self._data["issuances"].values()
-                              if isinstance(item, dict))
-            return {
-                "mint_id": None,
-                "deposit_count": len(self._data["deposits"]),
-                "issuance_count": issuance_count,
-                "issued_blind_count": blind_count,
-                "redemption_count": len(self._data["redemptions"]),
-                "active_note_locks": len(self._data["note_records"]),
-                "total_deposited": total_deposited,
-                "pending_redemption_amount": pending,
-                "broadcast_redemption_amount": broadcast,
-                "finalized_redemption_amount": finalized,
-                "rejected_redemption_amount": rejected,
-                "reserve_balance": total_deposited - finalized,
-                "available_reserve": total_deposited - pending - broadcast - finalized,
-            }
+            return self._accounting_summary_locked()
 
     def reserve_summary(self) -> dict[str, Any]:
         with self._lock:
-            total_deposited = self._total_deposited_locked()
-            finalized = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
-                            if isinstance(item, dict) and item.get("state") == "finalized")
-            reserved = self._total_reserved_locked()
+            return self._reserve_summary_locked()
+
+    def reserve_attestation(self, mint_id: str) -> dict[str, Any]:
+        with self._lock:
+            reserve = self._reserve_summary_locked()
+            attested_at = int(time.time())
+            state_hash = sha256_hex(
+                [
+                    mint_id,
+                    str(reserve["total_deposited"]),
+                    str(reserve["reserved_redemption_amount"]),
+                    str(reserve["finalized_redemption_amount"]),
+                    str(reserve["reserve_balance"]),
+                    str(reserve["available_reserve"]),
+                    str(len(self._data["deposits"])),
+                    str(len(self._data["issuances"])),
+                    str(len(self._data["redemptions"])),
+                    str(attested_at),
+                ]
+            )
             return {
-                "total_deposited": total_deposited,
-                "reserved_redemption_amount": reserved,
-                "finalized_redemption_amount": finalized,
-                "reserve_balance": total_deposited - finalized,
-                "available_reserve": total_deposited - reserved,
+                "mint_id": mint_id,
+                "attested_at": attested_at,
+                "state_hash": state_hash,
+                **reserve,
+            }
+
+    def audit_export(self, mint_id: str) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "mint_id": mint_id,
+                "deposits": list(self._data["deposits"].values()),
+                "issuances": list(self._data["issuances"].values()),
+                "redemptions": list(self._data["redemptions"].values()),
+                "note_records": list(self._data["note_records"].values()),
+                "accounting": self._accounting_summary_locked(),
+                "reserves": self._reserve_summary_locked(),
             }
 
     def _total_deposited_locked(self) -> int:
@@ -336,6 +397,71 @@ class MintState:
             if isinstance(item, dict) and item.get("state") in {"pending", "broadcast", "finalized"}
         )
 
+    def _reserve_summary_locked(self) -> dict[str, Any]:
+        total_deposited = self._total_deposited_locked()
+        finalized = sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "finalized"
+        )
+        reserved = self._total_reserved_locked()
+        return {
+            "total_deposited": total_deposited,
+            "reserved_redemption_amount": reserved,
+            "finalized_redemption_amount": finalized,
+            "reserve_balance": total_deposited - finalized,
+            "available_reserve": total_deposited - reserved,
+        }
+
+    def _accounting_summary_locked(self) -> dict[str, Any]:
+        total_deposited = self._total_deposited_locked()
+        pending = sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "pending"
+        )
+        broadcast = sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "broadcast"
+        )
+        finalized = sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "finalized"
+        )
+        rejected = sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") == "rejected"
+        )
+        issuance_count = len(self._data["issuances"])
+        blind_count = sum(
+            int(item.get("note_count", 0)) for item in self._data["issuances"].values() if isinstance(item, dict)
+        )
+        return {
+            "mint_id": None,
+            "deposit_count": len(self._data["deposits"]),
+            "issuance_count": issuance_count,
+            "issued_blind_count": blind_count,
+            "issued_amount": sum(
+                int(item.get("issued_amount", 0)) for item in self._data["issuances"].values() if isinstance(item, dict)
+            ),
+            "redemption_count": len(self._data["redemptions"]),
+            "active_note_locks": sum(
+                1
+                for item in self._data["note_records"].values()
+                if isinstance(item, dict) and item.get("state") in {"pending", "broadcast", "finalized", "legacy-spent"}
+            ),
+            "total_deposited": total_deposited,
+            "pending_redemption_amount": pending,
+            "broadcast_redemption_amount": broadcast,
+            "finalized_redemption_amount": finalized,
+            "rejected_redemption_amount": rejected,
+            "reserve_balance": total_deposited - finalized,
+            "available_reserve": total_deposited - pending - broadcast - finalized,
+        }
+
 
 def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
     class MintHandler(BaseHTTPRequestHandler):
@@ -343,6 +469,15 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
+
+        def _require_admin(self) -> bool:
+            if not config.admin_token:
+                return True
+            header = self.headers.get("Authorization", "")
+            if header == f"Bearer {config.admin_token}":
+                return True
+            write_json(self, HTTPStatus.UNAUTHORIZED, {"error": "admin auth required"})
+            return False
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
@@ -368,6 +503,14 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                 summary = state.accounting_summary()
                 summary["mint_id"] = config.mint_id
                 write_json(self, HTTPStatus.OK, summary)
+                return
+            if self.path == "/attestations/reserves":
+                write_json(self, HTTPStatus.OK, state.reserve_attestation(config.mint_id))
+                return
+            if self.path == "/audit/export":
+                if not self._require_admin():
+                    return
+                write_json(self, HTTPStatus.OK, state.audit_export(config.mint_id))
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -442,7 +585,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
         def _handle_blind_issue(self, body: dict[str, Any]) -> None:
             mint_deposit_ref = body.get("mint_deposit_ref")
             blinded_messages = body.get("blinded_messages")
-            if not isinstance(mint_deposit_ref, str) or not isinstance(blinded_messages, list):
+            note_amounts = body.get("note_amounts")
+            if not isinstance(mint_deposit_ref, str) or not isinstance(blinded_messages, list) or not isinstance(note_amounts, list):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid fields"})
                 return
             deposit = state.get_deposit(mint_deposit_ref)
@@ -456,7 +600,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                     if not isinstance(msg, str) or not msg:
                         raise ValueError("blinded message must be a non-empty hex string")
                     signed_blinds.append(signer.sign_blinded_hex(msg))
-                issuance = state.record_issuance(mint_deposit_ref, blinded_messages, signed_blinds)
+                issuance = state.record_issuance(
+                    mint_deposit_ref,
+                    blinded_messages,
+                    signed_blinds,
+                    [int(v) for v in note_amounts],
+                )
             except ValueError as exc:
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
@@ -470,6 +619,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
                     "signed_blinds": signed_blinds,
                     "mint_epoch": 0,
                     "issuance_id": issuance["issuance_id"],
+                    "note_refs": issuance["note_refs"],
+                    "note_amounts": issuance["note_amounts"],
                 },
             )
 
@@ -527,6 +678,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
             )
 
         def _handle_redemption_update(self, body: dict[str, Any]) -> None:
+            if not self._require_admin():
+                return
             batch_id = body.get("redemption_batch_id")
             new_state = body.get("state")
             l1_txid = body.get("l1_txid", "")
@@ -573,6 +726,11 @@ def main() -> int:
         default="",
         help="Optional 32-byte hex mint id to enforce on /deposits/register.",
     )
+    parser.add_argument(
+        "--admin-token",
+        default="dev-admin-token",
+        help="Bearer token required for admin endpoints such as redemption updates and audit export.",
+    )
     args = parser.parse_args()
 
     config = MintConfig(
@@ -580,6 +738,7 @@ def main() -> int:
         confirmations_required=args.confirmations_required,
         signing_seed=args.signing_seed,
         mint_id=args.mint_id,
+        admin_token=args.admin_token,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)

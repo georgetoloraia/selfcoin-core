@@ -62,12 +62,36 @@ std::vector<std::string> find_json_string_array(const std::string& json, const s
   return out;
 }
 
+std::vector<std::uint64_t> find_json_u64_array(const std::string& json, const std::string& key) {
+  std::regex re("\"" + key + "\"\\s*:\\s*\\[(.*?)\\]");
+  std::smatch m;
+  if (!std::regex_search(json, m, re)) return {};
+  std::vector<std::uint64_t> out;
+  std::regex item_re("([0-9]+)");
+  std::string body = m[1].str();
+  auto begin = std::sregex_iterator(body.begin(), body.end(), item_re);
+  auto end = std::sregex_iterator();
+  for (auto it = begin; it != end; ++it) out.push_back(static_cast<std::uint64_t>(std::stoull((*it)[1].str())));
+  return out;
+}
+
 std::string json_string_array(const std::vector<std::string>& items) {
   std::ostringstream oss;
   oss << "[";
   for (std::size_t i = 0; i < items.size(); ++i) {
     if (i) oss << ",";
     oss << "\"" << json_escape(items[i]) << "\"";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+std::string json_u64_array(const std::vector<std::uint64_t>& items) {
+  std::ostringstream oss;
+  oss << "[";
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i) oss << ",";
+    oss << items[i];
   }
   oss << "]";
   return oss.str();
@@ -92,7 +116,8 @@ std::string to_json(const MintBlindIssueRequest& req) {
   std::ostringstream oss;
   oss << "{"
       << "\"mint_deposit_ref\":\"" << json_escape(req.mint_deposit_ref) << "\","
-      << "\"blinded_messages\":" << json_string_array(req.blinded_messages)
+      << "\"blinded_messages\":" << json_string_array(req.blinded_messages) << ","
+      << "\"note_amounts\":" << json_u64_array(req.note_amounts)
       << "}";
   return oss.str();
 }
@@ -121,9 +146,13 @@ std::optional<MintDepositRegistrationResponse> parse_mint_deposit_registration_r
 
 std::optional<MintBlindIssueResponse> parse_mint_blind_issue_response(const std::string& json) {
   auto epoch = find_json_u64(json, "mint_epoch");
+  auto issuance_id = find_json_string(json, "issuance_id");
   if (!epoch) return std::nullopt;
   MintBlindIssueResponse out;
+  out.issuance_id = issuance_id.value_or("");
   out.signed_blinds = find_json_string_array(json, "signed_blinds");
+  out.note_refs = find_json_string_array(json, "note_refs");
+  out.note_amounts = find_json_u64_array(json, "note_amounts");
   out.mint_epoch = *epoch;
   return out;
 }
@@ -141,10 +170,12 @@ std::optional<MintRedemptionResponse> parse_mint_redemption_response(const std::
 std::optional<MintRedemptionStatusResponse> parse_mint_redemption_status_response(const std::string& json) {
   auto state = find_json_string(json, "state");
   auto txid = find_json_string(json, "l1_txid");
-  if (!state || !txid) return std::nullopt;
+  auto amount = find_json_u64(json, "amount");
+  if (!state || !txid || !amount) return std::nullopt;
   MintRedemptionStatusResponse out;
   out.state = *state;
   out.l1_txid = *txid;
+  out.amount = *amount;
   return out;
 }
 

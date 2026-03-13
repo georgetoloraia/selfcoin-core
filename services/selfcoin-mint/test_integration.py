@@ -24,14 +24,18 @@ def free_port() -> int:
     return port
 
 
-def http_get_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=5) as resp:
+def http_get_json(url: str, headers: dict[str, str] | None = None) -> dict:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def http_post_json(url: str, payload: dict) -> dict:
+def http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    merged = {"Content-Type": "application/json"}
+    if headers:
+        merged.update(headers)
+    req = urllib.request.Request(url, data=data, headers=merged)
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -55,6 +59,8 @@ class MintIntegrationTests(unittest.TestCase):
                     "22" * 32,
                     "--signing-seed",
                     "integration-seed",
+                    "--admin-token",
+                    "integration-admin-token",
                 ],
                 cwd=REPO_ROOT,
                 stdout=subprocess.PIPE,
@@ -110,15 +116,20 @@ class MintIntegrationTests(unittest.TestCase):
                     mint_deposit_ref,
                     "--blind",
                     format(blinded, "x"),
+                    "--note-amount",
+                    "100000",
                 ]
                 blind = subprocess.run(blind_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                 signed_line = next(line for line in blind.stdout.splitlines() if line.startswith("signed_blind[0]="))
+                note_ref_line = next(line for line in blind.stdout.splitlines() if line.startswith("note_ref[0]="))
+                note_ref = note_ref_line.split("=", 1)[1]
                 signed_blind = int(signed_line.split("=", 1)[1], 16)
                 unblinded = (signed_blind * pow(r, -1, n)) % n
                 self.assertEqual(pow(unblinded, e, n), message)
                 accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
                 self.assertEqual(accounting["total_deposited"], 100000)
                 self.assertEqual(accounting["issued_blind_count"], 1)
+                self.assertEqual(accounting["issued_amount"], 100000)
 
                 redeem_cmd = [
                     str(CLI),
@@ -128,11 +139,9 @@ class MintIntegrationTests(unittest.TestCase):
                     "--redeem-address",
                     "sc1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaczjbkjy",
                     "--amount",
-                    "60000",
+                    "100000",
                     "--note",
-                    "note-1",
-                    "--note",
-                    "note-2",
+                    note_ref,
                 ]
                 redeem = subprocess.run(redeem_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                 redeem_lines = dict(line.split("=", 1) for line in redeem.stdout.strip().splitlines())
@@ -152,7 +161,7 @@ class MintIntegrationTests(unittest.TestCase):
                 self.assertEqual(status_lines["l1_txid"], "")
 
                 reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
-                self.assertEqual(reserves["available_reserve"], 40000)
+                self.assertEqual(reserves["available_reserve"], 0)
 
                 update = http_post_json(
                     f"http://127.0.0.1:{port}/redemptions/update",
@@ -161,12 +170,29 @@ class MintIntegrationTests(unittest.TestCase):
                         "state": "finalized",
                         "l1_txid": "44" * 32,
                     },
+                    headers={"Authorization": "Bearer integration-admin-token"},
                 )
                 self.assertTrue(update["accepted"])
                 finalized = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                 finalized_lines = dict(line.split("=", 1) for line in finalized.stdout.strip().splitlines())
                 self.assertEqual(finalized_lines["state"], "finalized")
                 self.assertEqual(finalized_lines["l1_txid"], "44" * 32)
+                self.assertEqual(finalized_lines["amount"], "100000")
+
+                unauth = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/audit/export",
+                    headers={},
+                )
+                with self.assertRaises(Exception):
+                    urllib.request.urlopen(unauth, timeout=5)
+
+                audit = http_get_json(
+                    f"http://127.0.0.1:{port}/audit/export",
+                    headers={"Authorization": "Bearer integration-admin-token"},
+                )
+                self.assertEqual(len(audit["issuances"]), 1)
+                attestation = http_get_json(f"http://127.0.0.1:{port}/attestations/reserves")
+                self.assertEqual(attestation["reserve_balance"], 0)
             finally:
                 proc.terminate()
                 try:

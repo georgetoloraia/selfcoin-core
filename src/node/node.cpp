@@ -1080,7 +1080,7 @@ void Node::event_loop() {
           std::max<std::uint64_t>(200, static_cast<std::uint64_t>(cfg_.idle_timeout_ms) / 3);
       for (int peer_id : p2p_.peer_ids()) {
         const auto info = p2p_.get_peer_info(peer_id);
-        if (info.inbound || !info.established()) continue;
+        if (!info.established()) continue;
         auto& last = peer_keepalive_ms_[peer_id];
         if (now_ms >= last + keepalive_interval_ms) {
           keepalive_peers.push_back(peer_id);

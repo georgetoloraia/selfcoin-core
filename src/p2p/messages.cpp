@@ -29,6 +29,8 @@ bool is_known_message_type(std::uint16_t msg_type) {
     case MsgType::TX:
     case MsgType::GETADDR:
     case MsgType::ADDR:
+    case MsgType::PING:
+    case MsgType::PONG:
       return true;
     default:
       return false;
@@ -307,6 +309,23 @@ std::optional<AddrMsg> de_addr(const Bytes& b) {
           e.last_seen_unix = *seen;
           m.entries.push_back(e);
         }
+        return true;
+      })) return std::nullopt;
+  return m;
+}
+
+Bytes ser_ping(const PingMsg& m) {
+  codec::ByteWriter w;
+  w.u64le(m.nonce);
+  return w.take();
+}
+
+std::optional<PingMsg> de_ping(const Bytes& b) {
+  PingMsg m;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto nonce = r.u64le();
+        if (!nonce) return false;
+        m.nonce = *nonce;
         return true;
       })) return std::nullopt;
   return m;

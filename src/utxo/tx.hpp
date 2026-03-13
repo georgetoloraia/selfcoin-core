@@ -21,13 +21,22 @@ struct TxOut {
   Bytes script_pubkey;
 };
 
+struct TxHashcashStamp {
+  std::uint32_t version{1};
+  std::uint64_t epoch_bucket{0};
+  std::uint32_t bits{0};
+  std::uint64_t nonce{0};
+};
+
 struct Tx {
   std::uint32_t version{1};
   std::vector<TxIn> inputs;
   std::vector<TxOut> outputs;
   std::uint32_t lock_time{0};
+  std::optional<TxHashcashStamp> hashcash;
 
   Bytes serialize() const;
+  Bytes serialize_without_hashcash() const;
   static std::optional<Tx> parse(const Bytes& b);
   Hash32 txid() const;
 };

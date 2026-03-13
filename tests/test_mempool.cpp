@@ -1,9 +1,12 @@
 #include "test_framework.hpp"
 
+#include <ctime>
+
 #include "address/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "mempool/mempool.hpp"
+#include "policy/hashcash.hpp"
 #include "utxo/signing.hpp"
 
 using namespace selfcoin;
@@ -125,6 +128,61 @@ TEST(test_mempool_selection_order_fee_then_txid) {
     ASSERT_EQ(selected[1].txid(), t3);
     ASSERT_EQ(selected[2].txid(), t1);
   }
+}
+
+TEST(test_mempool_hashcash_policy_requires_stamp_for_low_fee_txs) {
+  mempool::Mempool mp;
+  mp.set_network(mainnet_network());
+  mp.set_hashcash_config(policy::HashcashConfig{
+      .enabled = true,
+      .base_bits = 10,
+      .max_bits = 10,
+      .epoch_seconds = 60,
+      .fee_exempt_min = 500,
+      .pressure_tx_threshold = 1000,
+      .pressure_step_txs = 500,
+      .pressure_bits_per_step = 1,
+      .large_tx_bytes = 4096,
+      .large_tx_extra_bits = 1,
+  });
+  mempool::UtxoView view;
+
+  const auto k1 = key_from_byte(3);
+  const auto k2 = key_from_byte(4);
+
+  OutPoint op1{};
+  op1.txid.fill(0x31);
+  op1.index = 0;
+  TxOut prev1 = p2pkh_out_for_pub(k1.public_key, 10'000);
+  view[op1] = UtxoEntry{prev1};
+
+  auto tx = spend_one(op1, prev1, k1, k2.public_key, 9'800);  // fee 200, below exempt min
+  ASSERT_TRUE(tx.has_value());
+
+  std::string err;
+  ASSERT_TRUE(!mp.accept_tx(*tx, view, &err));
+  ASSERT_TRUE(err.find("hashcash stamp required") != std::string::npos);
+
+  const auto now_unix = static_cast<std::uint64_t>(std::time(nullptr));
+  ASSERT_TRUE(policy::apply_hashcash_stamp(&*tx, mainnet_network(),
+                                           policy::HashcashConfig{
+                                               .enabled = true,
+                                               .base_bits = 10,
+                                               .max_bits = 10,
+                                               .epoch_seconds = 60,
+                                               .fee_exempt_min = 500,
+                                               .pressure_tx_threshold = 1000,
+                                               .pressure_step_txs = 500,
+                                               .pressure_bits_per_step = 1,
+                                               .large_tx_bytes = 4096,
+                                               .large_tx_extra_bits = 1,
+                                           },
+                                           10, now_unix, 500'000, &err));
+  auto reparsed = Tx::parse(tx->serialize());
+  ASSERT_TRUE(reparsed.has_value());
+  ASSERT_TRUE(reparsed->hashcash.has_value());
+  ASSERT_EQ(reparsed->hashcash->bits, 10u);
+  ASSERT_TRUE(mp.accept_tx(*reparsed, view, &err));
 }
 
 void register_mempool_tests() {}

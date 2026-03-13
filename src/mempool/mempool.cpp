@@ -1,6 +1,7 @@
 #include "mempool/mempool.hpp"
 
 #include <algorithm>
+#include <ctime>
 
 #include "utxo/validate.hpp"
 
@@ -57,6 +58,23 @@ bool Mempool::accept_tx(const Tx& tx, const UtxoView& view, std::string* err, st
   if (vr.fee < min_fee) {
     if (err) *err = "fee below min relay fee";
     return false;
+  }
+
+  const auto required_bits = policy::required_hashcash_bits(hashcash_cfg_, tx, vr.fee, by_txid_.size());
+  if (required_bits != 0) {
+    if (!tx.hashcash.has_value()) {
+      if (err) *err = "hashcash stamp required";
+      return false;
+    }
+    if (!policy::verify_hashcash_stamp(tx, network_, *tx.hashcash, hashcash_cfg_, required_bits,
+                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+      return false;
+    }
+  } else if (tx.hashcash.has_value()) {
+    if (!policy::verify_hashcash_stamp(tx, network_, *tx.hashcash, hashcash_cfg_, 0,
+                                       static_cast<std::uint64_t>(std::time(nullptr)), err)) {
+      return false;
+    }
   }
 
   TxMeta meta;

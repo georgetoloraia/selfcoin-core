@@ -53,6 +53,16 @@ struct NodeConfig {
   int invalid_frame_ban_threshold{3};
   std::uint64_t invalid_frame_window_seconds{60};
   std::uint64_t min_relay_fee{0};
+  bool hashcash_enabled{false};
+  std::uint32_t hashcash_base_bits{18};
+  std::uint32_t hashcash_max_bits{30};
+  std::uint64_t hashcash_epoch_seconds{60};
+  std::uint64_t hashcash_fee_exempt_min{1'000};
+  std::size_t hashcash_pressure_tx_threshold{1'000};
+  std::size_t hashcash_pressure_step_txs{500};
+  std::uint32_t hashcash_pressure_bits_per_step{1};
+  std::size_t hashcash_large_tx_bytes{2'048};
+  std::uint32_t hashcash_large_tx_extra_bits{1};
   std::optional<std::uint64_t> validator_min_bond_override;
   std::optional<std::uint64_t> validator_bond_min_amount_override;
   std::optional<std::uint64_t> validator_bond_max_amount_override;

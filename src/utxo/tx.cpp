@@ -12,7 +12,7 @@ constexpr std::uint64_t kMaxTxOutputs = 10'000;
 constexpr std::size_t kMaxScriptBytes = 256 * 1024;
 }  // namespace
 
-Bytes Tx::serialize() const {
+Bytes Tx::serialize_without_hashcash() const {
   codec::ByteWriter w;
   w.u32le(version);
   w.varint(inputs.size());
@@ -28,6 +28,21 @@ Bytes Tx::serialize() const {
     w.varbytes(out.script_pubkey);
   }
   w.u32le(lock_time);
+  return w.take();
+}
+
+Bytes Tx::serialize() const {
+  codec::ByteWriter w;
+  w.bytes(serialize_without_hashcash());
+  if (!hashcash.has_value()) {
+    w.u8(0);
+    return w.take();
+  }
+  w.u8(1);
+  w.u32le(hashcash->version);
+  w.u64le(hashcash->epoch_bucket);
+  w.u32le(hashcash->bits);
+  w.u64le(hashcash->nonce);
   return w.take();
 }
 
@@ -77,6 +92,22 @@ std::optional<Tx> Tx::parse(const Bytes& b) {
           auto lock = r.u32le();
           if (!lock) return false;
           tx.lock_time = *lock;
+          if (r.eof()) return true;
+          auto has_hashcash = r.u8();
+          if (!has_hashcash) return false;
+          if (*has_hashcash == 0) return r.eof();
+          if (*has_hashcash != 1) return false;
+          auto stamp_version = r.u32le();
+          auto epoch_bucket = r.u64le();
+          auto bits = r.u32le();
+          auto nonce = r.u64le();
+          if (!stamp_version || !epoch_bucket || !bits || !nonce) return false;
+          tx.hashcash = TxHashcashStamp{
+              .version = *stamp_version,
+              .epoch_bucket = *epoch_bucket,
+              .bits = *bits,
+              .nonce = *nonce,
+          };
           return true;
         })) {
       return std::nullopt;
@@ -87,7 +118,7 @@ std::optional<Tx> Tx::parse(const Bytes& b) {
   }
 }
 
-Hash32 Tx::txid() const { return crypto::sha256d(serialize()); }
+Hash32 Tx::txid() const { return crypto::sha256d(serialize_without_hashcash()); }
 
 Bytes BlockHeader::serialize() const {
   codec::ByteWriter w;
@@ -219,7 +250,7 @@ Bytes Block::serialize() const {
   w.bytes(h);
   w.varint(txs.size());
   for (const auto& tx : txs) {
-    w.bytes(tx.serialize());
+    w.bytes(tx.serialize_without_hashcash());
   }
   w.bytes(finality_proof.serialize());
   return w.take();

@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "common/network.hpp"
+#include "policy/hashcash.hpp"
 #include "utxo/validate.hpp"
 #include "utxo/tx.hpp"
 
@@ -34,6 +36,8 @@ class Mempool {
   std::size_t size() const;
   bool contains(const Hash32& txid) const;
   void set_validation_context(SpecialValidationContext ctx) { ctx_ = ctx; }
+  void set_hashcash_config(policy::HashcashConfig cfg) { hashcash_cfg_ = std::move(cfg); }
+  void set_network(NetworkConfig cfg) { network_ = std::move(cfg); }
 
  private:
   struct TxMeta {
@@ -45,6 +49,8 @@ class Mempool {
   std::map<OutPoint, Hash32> spent_outpoints_;
   std::size_t total_bytes_{0};
   std::optional<SpecialValidationContext> ctx_;
+  policy::HashcashConfig hashcash_cfg_{};
+  NetworkConfig network_{mainnet_network()};
 };
 
 }  // namespace selfcoin::mempool

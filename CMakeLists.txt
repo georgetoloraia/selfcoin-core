@@ -44,6 +44,7 @@ add_library(selfcoin_core
   src/utxo/tx.cpp
   src/utxo/validate.cpp
   src/utxo/signing.cpp
+  src/policy/hashcash.cpp
   src/mempool/mempool.cpp
   src/consensus/monetary.cpp
   src/consensus/state_commitment.cpp

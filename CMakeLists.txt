@@ -41,6 +41,7 @@ add_library(selfcoin_core
   src/genesis/embedded_mainnet.cpp
   src/merkle/merkle.cpp
   src/address/address.cpp
+  src/privacy/mint_client.cpp
   src/privacy/mint_scripts.cpp
   src/utxo/tx.cpp
   src/utxo/validate.cpp
@@ -127,6 +128,7 @@ add_executable(selfcoin-tests
   tests/test_mempool.cpp
   tests/test_hardening.cpp
   tests/test_protocol_scope.cpp
+  tests/test_privacy.cpp
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp

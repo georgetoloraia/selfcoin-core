@@ -31,6 +31,7 @@
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "policy/hashcash.hpp"
+#include "privacy/mint_client.hpp"
 #include "privacy/mint_scripts.hpp"
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
@@ -296,6 +297,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
+              << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
@@ -1291,6 +1294,115 @@ int main(int argc, char** argv) {
     }
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_deposit_status") {
+    std::string db_path = "./data/node";
+    std::string mint_id_hex;
+    std::string recipient_addr;
+    std::size_t tail = 20;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
+      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
+      else if (a == "--tail" && i + 1 < argc) tail = static_cast<std::size_t>(std::stoull(argv[++i]));
+    }
+
+    std::optional<selfcoin::Hash32> mint_filter;
+    if (!mint_id_hex.empty()) {
+      auto id = decode_hex32(mint_id_hex);
+      if (!id) {
+        std::cerr << "invalid --mint-id\n";
+        return 1;
+      }
+      mint_filter = *id;
+    }
+    std::optional<std::array<std::uint8_t, 20>> recipient_filter;
+    if (!recipient_addr.empty()) {
+      auto addr = selfcoin::address::decode(recipient_addr);
+      if (!addr) {
+        std::cerr << "invalid --recipient-address\n";
+        return 1;
+      }
+      recipient_filter = addr->pubkey_hash;
+    }
+
+    selfcoin::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+
+    struct MintDepositRow {
+      selfcoin::OutPoint outpoint;
+      selfcoin::Hash32 mint_id{};
+      std::array<std::uint8_t, 20> recipient{};
+      std::uint64_t value{0};
+      std::uint64_t height{0};
+      selfcoin::Hash32 txid{};
+    };
+
+    std::vector<MintDepositRow> rows;
+    const auto utxos = db.load_utxos();
+    for (const auto& [op, entry] : utxos) {
+      selfcoin::Hash32 mint_id{};
+      std::array<std::uint8_t, 20> recipient{};
+      if (!selfcoin::privacy::is_mint_deposit_script(entry.out.script_pubkey, &mint_id, &recipient)) continue;
+      if (mint_filter.has_value() && mint_id != *mint_filter) continue;
+      if (recipient_filter.has_value() && recipient != *recipient_filter) continue;
+      MintDepositRow row;
+      row.outpoint = op;
+      row.mint_id = mint_id;
+      row.recipient = recipient;
+      row.value = entry.out.value;
+      row.txid = op.txid;
+      auto loc = db.get_tx_index(op.txid);
+      if (loc) row.height = loc->height;
+      rows.push_back(row);
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+      if (a.height != b.height) return a.height > b.height;
+      return a.outpoint.index < b.outpoint.index;
+    });
+
+    std::cout << "mint_deposits=" << rows.size() << "\n";
+    const std::size_t limit = std::min<std::size_t>(tail, rows.size());
+    for (std::size_t i = 0; i < limit; ++i) {
+      const auto& row = rows[i];
+      std::cout << "txid=" << selfcoin::hex_encode32(row.txid)
+                << " vout=" << row.outpoint.index
+                << " value=" << row.value
+                << " height=" << row.height
+                << " mint_id=" << selfcoin::hex_encode32(row.mint_id)
+                << " recipient_pkh=" << selfcoin::hex_encode(selfcoin::Bytes(row.recipient.begin(), row.recipient.end()))
+                << "\n";
+    }
+    return 0;
+  }
+
+  if (cmd == "mint_api_example") {
+    selfcoin::privacy::MintDepositRegistrationRequest deposit_req;
+    deposit_req.chain = "mainnet";
+    deposit_req.deposit_txid.fill(0x11);
+    deposit_req.deposit_vout = 0;
+    deposit_req.mint_id.fill(0x22);
+    deposit_req.recipient_pubkey_hash.fill(0x33);
+    deposit_req.amount = 100000;
+
+    selfcoin::privacy::MintBlindIssueRequest issue_req;
+    issue_req.mint_deposit_ref = "example-ref";
+    issue_req.blinded_messages = {"blind-msg-1", "blind-msg-2"};
+
+    selfcoin::privacy::MintRedemptionRequest redeem_req;
+    redeem_req.notes = {"note-1", "note-2"};
+    redeem_req.redeem_address = "sc1example";
+
+    std::cout << "deposit_registration=" << selfcoin::privacy::to_json(deposit_req) << "\n";
+    std::cout << "blind_issue=" << selfcoin::privacy::to_json(issue_req) << "\n";
+    std::cout << "redemption=" << selfcoin::privacy::to_json(redeem_req) << "\n";
     return 0;
   }
 

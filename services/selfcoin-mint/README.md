@@ -24,6 +24,7 @@ It is a narrow scaffold, not a production mint:
 - `POST /deposits/register`
 - `POST /issuance/blind`
 - `POST /redemptions/create`
+- `POST /redemptions/approve_broadcast`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
 - `GET /healthz`
@@ -86,6 +87,14 @@ python3 services/selfcoin-mint/server.py \
 ```
 
 ```bash
+./build/selfcoin-cli mint_redeem_approve_broadcast \
+  --url http://127.0.0.1:8080/redemptions/approve_broadcast \
+  --batch-id <opaque-id> \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+```
+
+```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
 curl http://127.0.0.1:8080/operator/key
@@ -101,9 +110,10 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Deposit references are deterministic hashes of `(txid, vout, mint_id)`.
 - Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
 - Each issuance creates persistent `note_ref` entries with explicit denominations.
-- If a reserve wallet and lightserver are configured, redemption batches are automatically built and broadcast as L1 transactions.
-- Redemption batches that cannot yet be funded stay `pending`; operators may still reject them or manually mark them `broadcast`.
+- If a reserve wallet and lightserver are configured, signed operators can approve pending redemptions for automatic L1 tx construction and broadcast.
+- Redemption batches that cannot yet be funded stay `pending`; operators may reject them, but `broadcast` must go through `/redemptions/approve_broadcast`.
 - `finalized` is derived from observed L1 tx status via the configured lightserver.
+- `/reserves` includes live reserve-wallet UTXO count/value when lightserver + reserve address are configured.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:
   - `X-Selfcoin-Operator-Key`
   - `X-Selfcoin-Timestamp`

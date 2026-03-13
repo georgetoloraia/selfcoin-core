@@ -620,16 +620,10 @@ def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_i
     }
 
 
-def build_redemption_tx(config: MintConfig, utxo: dict[str, Any], redeem_address: str, amount: int) -> tuple[str, str]:
+def build_redemption_tx(config: MintConfig, utxos: list[dict[str, Any]], redeem_address: str, amount: int) -> tuple[str, str]:
     cmd = [
         config.cli_path,
-        "build_p2pkh_tx",
-        "--prev-txid",
-        str(utxo["txid"]),
-        "--prev-index",
-        str(int(utxo["vout"])),
-        "--prev-value",
-        str(int(utxo["value"])),
+        "build_p2pkh_multi_tx",
         "--from-privkey",
         config.reserve_privkey_hex,
         "--to-address",
@@ -641,6 +635,17 @@ def build_redemption_tx(config: MintConfig, utxo: dict[str, Any], redeem_address
         "--change-address",
         config.reserve_address,
     ]
+    for utxo in utxos:
+        cmd.extend(
+            [
+                "--prev-txid",
+                str(utxo["txid"]),
+                "--prev-index",
+                str(int(utxo["vout"])),
+                "--prev-value",
+                str(int(utxo["value"])),
+            ]
+        )
     proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
     txid = ""
     tx_hex = ""
@@ -708,6 +713,49 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 if isinstance(batch_id, str):
                     self._reconcile_redemption(batch_id)
 
+        def _reserve_inventory(self) -> dict[str, Any]:
+            if not config.lightserver_url or not config.reserve_address:
+                return {
+                    "wallet_utxo_count": 0,
+                    "wallet_utxo_value": 0,
+                    "wallet_synced_at": int(time.time()),
+                }
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                return {
+                    "wallet_utxo_count": 0,
+                    "wallet_utxo_value": 0,
+                    "wallet_synced_at": int(time.time()),
+                    "wallet_error": "invalid reserve address",
+                }
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            utxos = lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+            return {
+                "wallet_utxo_count": len(utxos),
+                "wallet_utxo_value": sum(int(item.get("value", 0)) for item in utxos),
+                "wallet_synced_at": int(time.time()),
+            }
+
+        def _select_reserve_utxos(self, amount_needed: int) -> list[dict[str, Any]]:
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                raise ValueError("invalid reserve address")
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            utxos = [
+                item
+                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+                if int(item.get("value", 0)) > 0
+            ]
+            utxos.sort(key=lambda item: int(item.get("value", 0)))
+            selected: list[dict[str, Any]] = []
+            total = 0
+            for utxo in utxos:
+                selected.append(utxo)
+                total += int(utxo.get("value", 0))
+                if total >= amount_needed:
+                    return selected
+            return []
+
         def _maybe_broadcast_redemption(self, batch_id: str) -> dict[str, Any]:
             redemption = state.get_redemption(batch_id)
             if not isinstance(redemption, dict):
@@ -716,19 +764,10 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return redemption
             if not config.lightserver_url or not config.reserve_privkey_hex or not config.reserve_address:
                 return redemption
-            reserve_pkh = decode_selfcoin_address(config.reserve_address)
-            if reserve_pkh is None:
-                raise ValueError("invalid reserve address")
-            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
-            candidates = [
-                item
-                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
-                if int(item.get("value", 0)) >= int(redemption["amount"]) + config.reserve_fee
-            ]
-            if not candidates:
+            selected = self._select_reserve_utxos(int(redemption["amount"]) + config.reserve_fee)
+            if not selected:
                 return redemption
-            candidates.sort(key=lambda item: int(item.get("value", 0)))
-            txid, tx_hex = build_redemption_tx(config, candidates[0], str(redemption["redeem_address"]), int(redemption["amount"]))
+            txid, tx_hex = build_redemption_tx(config, selected, str(redemption["redeem_address"]), int(redemption["amount"]))
             ok, err = lightserver_broadcast_tx(config.lightserver_url, tx_hex)
             if not ok:
                 raise ValueError(err)
@@ -765,6 +804,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if self.path == "/reserves":
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
+                summary["reserve_address"] = config.reserve_address
+                summary.update(self._reserve_inventory())
                 write_json(self, HTTPStatus.OK, summary)
                 return
             if self.path == "/accounting/summary":
@@ -822,6 +863,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/redemptions/update":
                 self._handle_redemption_update(body, raw_body)
+                return
+            if self.path == "/redemptions/approve_broadcast":
+                self._handle_redemption_approve_broadcast(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -941,7 +985,6 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             }
             try:
                 state.create_redemption(redemption)
-                updated = self._maybe_broadcast_redemption(batch_id)
             except ValueError as exc:
                 write_json(self, HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
@@ -951,8 +994,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 {
                     "accepted": True,
                     "redemption_batch_id": batch_id,
-                    "state": updated["state"],
-                    "l1_txid": updated.get("l1_txid", ""),
+                    "state": "pending",
+                    "l1_txid": "",
                 },
             )
 
@@ -993,8 +1036,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if l1_txid and not is_hex_of_size(l1_txid, 32):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid l1_txid"})
                 return
-            if new_state == "broadcast" and not l1_txid:
-                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "broadcast state requires l1_txid"})
+            if new_state == "broadcast":
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "broadcast state must use /redemptions/approve_broadcast"})
                 return
             if new_state == "finalized":
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "finalized state is derived from lightserver observation"})
@@ -1014,6 +1057,31 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "accepted": True,
                     "state": updated["state"],
                     "l1_txid": updated["l1_txid"],
+                },
+            )
+
+        def _handle_redemption_approve_broadcast(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            batch_id = body.get("redemption_batch_id")
+            if not isinstance(batch_id, str) or not batch_id:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid redemption_batch_id"})
+                return
+            try:
+                updated = self._maybe_broadcast_redemption(batch_id)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown redemption_batch_id"})
+                return
+            except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "state": updated["state"],
+                    "l1_txid": updated.get("l1_txid", ""),
                 },
             )
 

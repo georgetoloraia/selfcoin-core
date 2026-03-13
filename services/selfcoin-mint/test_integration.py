@@ -180,16 +180,24 @@ class MintIntegrationTests(unittest.TestCase):
                 reserve_addr_check = subprocess.run(reserve_pkh_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                 self.assertEqual(reserve_addr_check.stdout.strip(), reserve_address)
                 reserve_scripthash = "0000000000000000000000000000000000000000000000000000000000000000"
-                utxo_txid = "66" * 32
+                utxo_txid_a = "66" * 32
+                utxo_txid_b = "77" * 32
                 # P2PKH script hash: sha256(76a914 || pkh || 88ac)
                 reserve_pkh = server_module.decode_selfcoin_address(reserve_address)
                 self.assertIsNotNone(reserve_pkh)
                 reserve_scripthash = __import__("hashlib").sha256(server_module.p2pkh_script_pubkey(reserve_pkh)).hexdigest()
                 lightserver.utxos_by_scripthash[reserve_scripthash] = [
                     {
-                        "txid": utxo_txid,
+                        "txid": utxo_txid_a,
                         "vout": 0,
-                        "value": 150000,
+                        "value": 60000,
+                        "height": 1,
+                        "script_pubkey_hex": "",
+                    },
+                    {
+                        "txid": utxo_txid_b,
+                        "vout": 1,
+                        "value": 50000,
                         "height": 1,
                         "script_pubkey_hex": "",
                     }
@@ -306,6 +314,37 @@ class MintIntegrationTests(unittest.TestCase):
                     redeem_lines = dict(line.split("=", 1) for line in redeem.stdout.strip().splitlines())
                     batch_id = redeem_lines["redemption_batch_id"]
 
+                    pending_status_cmd = [
+                        str(CLI),
+                        "mint_redeem_status",
+                        "--url",
+                        f"http://127.0.0.1:{port}/redemptions/status",
+                        "--batch-id",
+                        batch_id,
+                    ]
+                    pending_status = subprocess.run(pending_status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    pending_lines = dict(line.split("=", 1) for line in pending_status.stdout.strip().splitlines())
+                    self.assertEqual(pending_lines["state"], "pending")
+                    self.assertEqual(pending_lines["l1_txid"], "")
+
+                    approve_cmd = [
+                        str(CLI),
+                        "mint_redeem_approve_broadcast",
+                        "--url",
+                        f"http://127.0.0.1:{port}/redemptions/approve_broadcast",
+                        "--batch-id",
+                        batch_id,
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    approve = subprocess.run(approve_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    approve_json = json.loads(approve.stdout)
+                    self.assertTrue(approve_json["accepted"])
+                    self.assertEqual(approve_json["state"], "broadcast")
+                    self.assertTrue(approve_json["l1_txid"])
+
                     status_cmd = [
                         str(CLI),
                         "mint_redeem_status",
@@ -322,6 +361,8 @@ class MintIntegrationTests(unittest.TestCase):
 
                     reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
                     self.assertEqual(reserves["available_reserve"], 0)
+                    self.assertEqual(reserves["wallet_utxo_count"], 2)
+                    self.assertEqual(reserves["wallet_utxo_value"], 110000)
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20

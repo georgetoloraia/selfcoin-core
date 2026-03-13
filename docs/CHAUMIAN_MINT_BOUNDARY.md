@@ -44,6 +44,7 @@ Suggested example HTTP endpoints:
 - `POST /deposits/register`
 - `POST /issuance/blind`
 - `POST /redemptions/create`
+- `POST /redemptions/approve_broadcast`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
 - `GET /accounting/summary`
@@ -166,9 +167,9 @@ If the external mint is configured with:
 - a lightserver RPC URL
 - a path to `selfcoin-cli`
 
-then `POST /redemptions/create` may immediately:
+then signed operators can call `POST /redemptions/approve_broadcast` to:
 1. discover reserve UTXOs via lightserver `get_utxos`
-2. build an L1 `build_p2pkh_tx`
+2. build an L1 `build_p2pkh_multi_tx`
 3. broadcast that tx via lightserver `broadcast_tx`
 4. transition the redemption to `broadcast`
 
@@ -177,6 +178,10 @@ Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcas
 ### 6. Reserve and accounting views
 
 `GET /reserves` returns the mint's deposit-backed reserve summary.
+When reserve wallet discovery is configured, it also returns live reserve-wallet inventory:
+- `wallet_utxo_count`
+- `wallet_utxo_value`
+- `wallet_synced_at`
 
 `GET /accounting/summary` returns:
 - deposit totals

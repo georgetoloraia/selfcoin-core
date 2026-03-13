@@ -25,7 +25,7 @@ const NetworkConfig kMainnet{
     .lightserver_default_port = 19444,
     .max_committee = MAX_COMMITTEE,
     .round_timeout_ms = ROUND_TIMEOUT_MS,
-    .min_block_interval_ms = 1000,
+    .min_block_interval_ms = 8000,
     .max_payload_len = 8 * 1024 * 1024,
     .bond_amount = BOND_AMOUNT,
     .warmup_blocks = WARMUP_BLOCKS,

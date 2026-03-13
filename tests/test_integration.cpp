@@ -1161,7 +1161,7 @@ TEST(test_proposer_equivocation_bans_validator_on_conflicting_signed_blocks) {
 TEST(test_committee_selection_and_non_member_votes_ignored) {
   const auto keys = node::Node::deterministic_test_keypairs();
   ASSERT_TRUE(keys.size() >= 12u);
-  auto cluster = make_cluster("/tmp/selfcoin_it_committee", 12, 12, 5);
+  auto cluster = make_cluster("/tmp/selfcoin_it_committee", 12, 12, 5, false);
   auto& nodes = cluster.nodes;
 
   ASSERT_TRUE(wait_for([&]() {

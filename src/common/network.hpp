@@ -22,6 +22,8 @@ struct NetworkConfig {
   bool vrf_proposer_enabled{true};
   std::uint32_t vrf_proposer_expected_num{1};
   std::uint32_t vrf_proposer_expected_den{1};
+  bool vrf_committee_enabled{true};
+  std::uint64_t vrf_committee_epoch_blocks{32};
   std::uint32_t round_timeout_ms{10'000};
   std::uint32_t min_block_interval_ms{8000};
   std::size_t max_payload_len{8 * 1024 * 1024};

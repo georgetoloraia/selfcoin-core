@@ -883,6 +883,12 @@ bool Node::observe_propose_for_test(const Block& block) {
   std::lock_guard<std::mutex> lk(mu_);
   return check_and_record_proposer_equivocation_locked(block);
 }
+Hash32 Node::committee_epoch_randomness_for_height_locked(std::uint64_t height) const {
+  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.vrf_committee_epoch_blocks);
+  auto it = committee_epoch_randomness_cache_.find(epoch_start);
+  if (it != committee_epoch_randomness_cache_.end()) return it->second;
+  return consensus::initial_finalized_randomness(cfg_.network, chain_id_);
+}
 bool Node::inject_tx_for_test(const Tx& tx, bool relay) {
   if (relay) return handle_tx(tx, true);
   std::lock_guard<std::mutex> lk(mu_);
@@ -947,7 +953,7 @@ std::string Node::proposer_path_for_next_height_for_test() const {
   return cfg_.network.vrf_proposer_enabled ? "vrf-threshold-proposer" : "deterministic-leader";
 }
 std::string Node::committee_path_for_next_height_for_test() const {
-  return "deterministic-committee";
+  return cfg_.network.vrf_committee_enabled ? "vrf-epoch-committee" : "deterministic-committee";
 }
 std::string Node::vote_path_for_next_height_for_test() const {
   return "committee-membership";
@@ -1507,6 +1513,10 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
             finalized_height_ = blk->header.height;
             finalized_hash_ = bid;
             finalized_randomness_ = consensus::advance_finalized_randomness(finalized_randomness_, blk->header);
+            if (consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.vrf_committee_epoch_blocks) ==
+                finalized_height_ + 1) {
+              committee_epoch_randomness_cache_[finalized_height_ + 1] = finalized_randomness_;
+            }
             (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
             (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
             last_finalized_progress_ms_ = now_unix() * 1000;
@@ -1974,6 +1984,10 @@ bool Node::finalize_if_quorum(const Hash32& block_id, std::uint64_t height, std:
   finalized_height_ = b.header.height;
   finalized_hash_ = block_id;
   finalized_randomness_ = consensus::advance_finalized_randomness(finalized_randomness_, b.header);
+  if (consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.vrf_committee_epoch_blocks) ==
+      finalized_height_ + 1) {
+    committee_epoch_randomness_cache_[finalized_height_ + 1] = finalized_randomness_;
+  }
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
   last_finalized_progress_ms_ = now_unix() * 1000;
@@ -2343,6 +2357,8 @@ bool Node::init_mainnet_genesis() {
   chain_id_ =
       ChainId::from_config_and_db(cfg_.network, db_, std::nullopt, genesis_source_hint_, expected_genesis_hash_);
   finalized_randomness_ = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
+  committee_epoch_randomness_cache_.clear();
+  committee_epoch_randomness_cache_[1] = finalized_randomness_;
   (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   return db_.flush();
 }
@@ -2363,19 +2379,24 @@ bool Node::load_state() {
   const auto vals = db_.load_validators();
   for (const auto& [pub, info] : vals) validators_.upsert(pub, info);
   validator_join_requests_ = db_.load_validator_join_requests();
+  committee_epoch_randomness_cache_.clear();
+  Hash32 replay_randomness = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
+  committee_epoch_randomness_cache_[1] = replay_randomness;
+  for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
+    auto bh = db_.get_height_hash(h);
+    if (!bh.has_value()) continue;
+    auto bb = db_.get_block(*bh);
+    if (!bb.has_value()) continue;
+    auto blk = Block::parse(*bb);
+    if (!blk.has_value()) continue;
+    replay_randomness = consensus::advance_finalized_randomness(replay_randomness, blk->header);
+    const auto next_epoch_start = consensus::committee_epoch_start(h + 1, cfg_.network.vrf_committee_epoch_blocks);
+    if (next_epoch_start == h + 1) committee_epoch_randomness_cache_[next_epoch_start] = replay_randomness;
+  }
   if (auto b = db_.get(kFinalizedRandomnessKey); b.has_value() && b->size() == 32) {
     std::copy(b->begin(), b->end(), finalized_randomness_.begin());
   } else {
-    finalized_randomness_ = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
-    for (std::uint64_t h = 1; h <= finalized_height_; ++h) {
-      auto bh = db_.get_height_hash(h);
-      if (!bh.has_value()) continue;
-      auto bb = db_.get_block(*bh);
-      if (!bb.has_value()) continue;
-      auto blk = Block::parse(*bb);
-      if (!blk.has_value()) continue;
-      finalized_randomness_ = consensus::advance_finalized_randomness(finalized_randomness_, blk->header);
-    }
+    finalized_randomness_ = replay_randomness;
     (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   }
 
@@ -2592,7 +2613,15 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
     active = replay_validators.active_sorted(height);
   }
 
-  return consensus::select_committee(prev_hash, height, active, cfg_.max_committee);
+  if (!cfg_.network.vrf_committee_enabled) {
+    return consensus::select_committee(prev_hash, height, active, cfg_.max_committee);
+  }
+
+  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.vrf_committee_epoch_blocks);
+  const auto epoch_randomness = committee_epoch_randomness_for_height_locked(height);
+  const auto epoch_seed = consensus::committee_epoch_seed(epoch_randomness, epoch_start);
+  const auto committee_size = consensus::committee_size_for_round_v2(active.size(), cfg_.max_committee, round);
+  return consensus::select_committee_v2(active, epoch_seed, committee_size);
 }
 
 std::optional<PubKey32> Node::leader_for_height_round(std::uint64_t height, std::uint32_t round) const {

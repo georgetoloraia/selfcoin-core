@@ -27,6 +27,8 @@ const NetworkConfig kMainnet{
     .vrf_proposer_enabled = true,
     .vrf_proposer_expected_num = 1,
     .vrf_proposer_expected_den = 1,
+    .vrf_committee_enabled = true,
+    .vrf_committee_epoch_blocks = 32,
     .round_timeout_ms = 10'000,
     .min_block_interval_ms = 8000,
     .max_payload_len = 8 * 1024 * 1024,

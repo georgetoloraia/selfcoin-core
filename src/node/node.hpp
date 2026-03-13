@@ -254,6 +254,7 @@ class Node {
   std::map<Hash32, Block> buffered_sync_blocks_;
   std::set<Hash32> requested_sync_blocks_;
   std::map<int, std::string> peer_ip_cache_;
+  std::map<int, std::uint64_t> peer_keepalive_ms_;
   std::map<std::string, std::uint64_t> invalid_frame_log_ms_;
   std::map<std::string, std::uint64_t> addr_drop_log_ms_;
   std::uint64_t rejected_network_id_{0};

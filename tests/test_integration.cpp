@@ -2204,6 +2204,73 @@ TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   n0.stop();
 }
 
+TEST(test_synced_joiner_keeps_outbound_peer_alive_with_short_idle_timeout) {
+  const std::string base = "/tmp/selfcoin_it_joiner_keepalive_short_idle";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg0;
+  cfg0.node_id = 0;
+  cfg0.dns_seeds = false;
+  cfg0.db_path = base + "/node0";
+  cfg0.p2p_port = reserve_test_port();
+  if (cfg0.p2p_port == 0) return;
+  cfg0.genesis_path = gpath;
+  cfg0.allow_unsafe_genesis_override = true;
+  cfg0.idle_timeout_ms = 1200;
+
+  node::Node n0(cfg0);
+  if (!n0.init()) return;
+  n0.start();
+  const auto port0 = n0.p2p_port_for_test();
+  if (port0 == 0) {
+    n0.stop();
+    return;
+  }
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(15)));
+
+  node::NodeConfig cfg1;
+  cfg1.node_id = 1;
+  cfg1.dns_seeds = false;
+  cfg1.db_path = base + "/node1";
+  cfg1.p2p_port = reserve_test_port();
+  if (cfg1.p2p_port == 0) {
+    n0.stop();
+    return;
+  }
+  cfg1.genesis_path = gpath;
+  cfg1.allow_unsafe_genesis_override = true;
+  cfg1.idle_timeout_ms = 1200;
+  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  node::Node n1(cfg1);
+  if (!n1.init()) {
+    n0.stop();
+    return;
+  }
+  n1.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height >= 5 && s1.height >= 5 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(20)));
+
+  std::this_thread::sleep_for(std::chrono::seconds(4));
+
+  const auto s0 = n0.status();
+  const auto s1 = n1.status();
+  ASSERT_TRUE(s0.established_peers >= 1u);
+  ASSERT_TRUE(s1.established_peers >= 1u);
+  ASSERT_TRUE(s0.height >= 5u);
+  ASSERT_TRUE(s1.height >= 5u);
+
+  n1.stop();
+  n0.stop();
+}
+
 TEST(test_out_of_order_block_sync_requests_parents_and_replays_buffered_descendants) {
   const std::string base = "/tmp/selfcoin_it_out_of_order_block_sync";
   std::filesystem::remove_all(base);

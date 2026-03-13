@@ -402,6 +402,7 @@ bool Node::init() {
         {
           std::lock_guard<std::mutex> lk(mu_);
           peer_ip_cache_[peer_id] = endpoint_to_ip(detail);
+          peer_keepalive_ms_[peer_id] = now_ms();
         }
         const auto info = p2p_.get_peer_info(peer_id);
         log_line("peer-connected peer_id=" + std::to_string(peer_id) + " dir=" + (info.inbound ? "inbound" : "outbound") +
@@ -419,6 +420,7 @@ bool Node::init() {
                  " detail=" + detail);
         std::lock_guard<std::mutex> lk(mu_);
         peer_ip_cache_.erase(peer_id);
+        peer_keepalive_ms_.erase(peer_id);
         peer_validator_pubkeys_.erase(peer_id);
         peer_finalized_tips_.erase(peer_id);
         getaddr_requested_peers_.erase(peer_id);
@@ -946,6 +948,7 @@ std::uint64_t Node::v4_liveness_epoch_start_for_test() const {
 void Node::event_loop() {
   while (running_) {
     std::optional<Block> to_propose;
+    std::vector<int> keepalive_peers;
     {
       std::lock_guard<std::mutex> lk(mu_);
       const std::uint64_t h = finalized_height_ + 1;
@@ -1069,6 +1072,18 @@ void Node::event_loop() {
 
       maybe_self_bootstrap_template(now_ms);
 
+      const std::uint64_t keepalive_interval_ms =
+          std::max<std::uint64_t>(200, static_cast<std::uint64_t>(cfg_.idle_timeout_ms) / 3);
+      for (int peer_id : p2p_.peer_ids()) {
+        const auto info = p2p_.get_peer_info(peer_id);
+        if (info.inbound || !info.established()) continue;
+        auto& last = peer_keepalive_ms_[peer_id];
+        if (now_ms >= last + keepalive_interval_ms) {
+          keepalive_peers.push_back(peer_id);
+          last = now_ms;
+        }
+      }
+
       const bool can_propose = leader.has_value() && *leader == local_key_.public_key;
 
       const bool block_interval_elapsed =
@@ -1092,6 +1107,8 @@ void Node::event_loop() {
       broadcast_propose(*to_propose);
       handle_propose(local_msg, false);
     }
+
+    for (int peer_id : keepalive_peers) request_finalized_tip(peer_id);
 
     maybe_submit_bootstrap_join();
 

@@ -498,7 +498,7 @@ StandardError=journal
 SyslogIdentifier=selfcoin-node
 Restart=on-failure
 RestartSec=2
-TimeoutStopSec=90
+TimeoutStopSec=300
 KillSignal=SIGINT
 LimitNOFILE=65535
 

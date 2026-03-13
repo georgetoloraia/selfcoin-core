@@ -116,35 +116,37 @@ std::optional<std::array<std::uint8_t, 64>> decode_hex64(const std::string& hex)
   return out;
 }
 
-std::optional<std::string> parse_http_host(const std::string& url) {
-  std::regex re(R"(^http://([^/:]+):([0-9]+)/rpc$)");
+struct ParsedHttpUrl {
+  std::string host;
+  std::uint16_t port{0};
+  std::string path;
+};
+
+std::optional<ParsedHttpUrl> parse_http_url(const std::string& url) {
+  std::regex re(R"(^http://([^/:]+):([0-9]+)(/[^ ]*)$)");
   std::smatch m;
   if (!std::regex_match(url, m, re)) return std::nullopt;
-  return m[1].str();
+  ParsedHttpUrl out;
+  out.host = m[1].str();
+  out.port = static_cast<std::uint16_t>(std::stoul(m[2].str()));
+  out.path = m[3].str();
+  return out;
 }
 
-std::optional<std::uint16_t> parse_http_port(const std::string& url) {
-  std::regex re(R"(^http://([^/:]+):([0-9]+)/rpc$)");
-  std::smatch m;
-  if (!std::regex_match(url, m, re)) return std::nullopt;
-  return static_cast<std::uint16_t>(std::stoul(m[2].str()));
-}
-
-std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
-  auto host = parse_http_host(url);
-  auto port = parse_http_port(url);
-  if (!host || !port) {
-    if (err) *err = "url must be http://host:port/rpc";
+std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed) {
+    if (err) *err = "url must be http://host:port/path";
     return std::nullopt;
   }
-  auto fd_opt = connect_tcp(*host, *port);
+  auto fd_opt = connect_tcp(parsed->host, parsed->port);
   if (!fd_opt.has_value()) {
     if (err) *err = "connect failed";
     return std::nullopt;
   }
   const int fd = *fd_opt;
   std::ostringstream req;
-  req << "POST /rpc HTTP/1.1\r\nHost: " << *host << ":" << *port
+  req << "POST " << parsed->path << " HTTP/1.1\r\nHost: " << parsed->host << ":" << parsed->port
       << "\r\nContent-Type: application/json\r\nContent-Length: " << body.size()
       << "\r\nConnection: close\r\n\r\n" << body;
   const auto req_s = req.str();
@@ -167,6 +169,15 @@ std::optional<std::string> rpc_http_post(const std::string& url, const std::stri
     return std::nullopt;
   }
   return resp.substr(pos + 4);
+}
+
+std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
+  auto parsed = parse_http_url(url);
+  if (!parsed || parsed->path != "/rpc") {
+    if (err) *err = "url must be http://host:port/rpc";
+    return std::nullopt;
+  }
+  return http_post_json(url, body, err);
 }
 
 std::optional<std::string> find_json_string(const std::string& json, const std::string& key) {
@@ -298,6 +309,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
+              << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
+              << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
               << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
@@ -1380,6 +1393,90 @@ int main(int argc, char** argv) {
                 << " recipient_pkh=" << selfcoin::hex_encode(selfcoin::Bytes(row.recipient.begin(), row.recipient.end()))
                 << "\n";
     }
+    return 0;
+  }
+
+  if (cmd == "mint_deposit_register") {
+    std::string url;
+    std::string chain = "mainnet";
+    std::string deposit_txid_hex;
+    std::uint32_t deposit_vout = 0;
+    std::string mint_id_hex;
+    std::string recipient_addr;
+    std::uint64_t amount = 0;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--chain" && i + 1 < argc) chain = argv[++i];
+      else if (a == "--deposit-txid" && i + 1 < argc) deposit_txid_hex = argv[++i];
+      else if (a == "--deposit-vout" && i + 1 < argc) deposit_vout = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
+      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto deposit_txid = decode_hex32(deposit_txid_hex);
+    auto mint_id = decode_hex32(mint_id_hex);
+    auto recipient = selfcoin::address::decode(recipient_addr);
+    if (url.empty() || !deposit_txid || !mint_id || !recipient) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+
+    selfcoin::privacy::MintDepositRegistrationRequest req;
+    req.chain = chain;
+    req.deposit_txid = *deposit_txid;
+    req.deposit_vout = deposit_vout;
+    req.mint_id = *mint_id;
+    req.recipient_pubkey_hash = recipient->pubkey_hash;
+    req.amount = amount;
+
+    std::string err;
+    auto body = http_post_json(url, selfcoin::privacy::to_json(req), &err);
+    if (!body) {
+      std::cerr << "mint_deposit_register failed: " << err << "\n";
+      return 1;
+    }
+    auto resp = selfcoin::privacy::parse_mint_deposit_registration_response(*body);
+    if (!resp) {
+      std::cerr << "mint_deposit_register parse failed\n";
+      return 1;
+    }
+    std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
+    std::cout << "confirmations_required=" << resp->confirmations_required << "\n";
+    std::cout << "mint_deposit_ref=" << resp->mint_deposit_ref << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_redeem_status") {
+    std::string url;
+    std::string batch_id;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--batch-id" && i + 1 < argc) batch_id = argv[++i];
+    }
+    if (url.empty() || batch_id.empty()) {
+      std::cerr << "mint_redeem_status requires --url and --batch-id\n";
+      return 1;
+    }
+
+    std::ostringstream body_json;
+    body_json << "{\"redemption_batch_id\":\"" << batch_id << "\"}";
+
+    std::string err;
+    auto body = http_post_json(url, body_json.str(), &err);
+    if (!body) {
+      std::cerr << "mint_redeem_status failed: " << err << "\n";
+      return 1;
+    }
+    auto resp = selfcoin::privacy::parse_mint_redemption_status_response(*body);
+    if (!resp) {
+      std::cerr << "mint_redeem_status parse failed\n";
+      return 1;
+    }
+    std::cout << "state=" << resp->state << "\n";
+    std::cout << "l1_txid=" << resp->l1_txid << "\n";
     return 0;
   }
 

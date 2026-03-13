@@ -38,6 +38,13 @@ The Chaumian mint service must live outside this repo. It is responsible for:
 
 ## Suggested service API
 
+Suggested example HTTP endpoints:
+
+- `POST /deposits/register`
+- `POST /issuance/blind`
+- `POST /redemptions/create`
+- `POST /redemptions/status`
+
 ### 1. Deposit registration
 
 Request:
@@ -132,6 +139,24 @@ selfcoin-cli mint_deposit_create \
 ```
 
 This creates a normal signed L1 transaction with one `SCMINTDEP` output.
+
+To call the external mint boundary from this repo:
+
+```bash
+selfcoin-cli mint_deposit_register \
+  --url http://127.0.0.1:8080/deposits/register \
+  --deposit-txid <hex32> \
+  --deposit-vout <u32> \
+  --mint-id <hex32> \
+  --recipient-address <sc...> \
+  --amount <u64>
+```
+
+```bash
+selfcoin-cli mint_redeem_status \
+  --url http://127.0.0.1:8080/redemptions/status \
+  --batch-id <opaque-id>
+```
 
 ## Non-goals
 

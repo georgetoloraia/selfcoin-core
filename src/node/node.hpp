@@ -158,6 +158,7 @@ class Node {
 
   void send_version(int peer_id);
   void maybe_send_verack(int peer_id);
+  void send_ping(int peer_id);
 
   bool handle_propose(const p2p::ProposeMsg& msg, bool from_network);
   bool handle_vote(const Vote& vote, bool from_network, int from_peer_id = 0, const Bytes& vrf_proof = {},

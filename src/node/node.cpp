@@ -75,6 +75,10 @@ const char* msg_type_name(std::uint16_t msg_type) {
       return "GETADDR";
     case p2p::MsgType::ADDR:
       return "ADDR";
+    case p2p::MsgType::PING:
+      return "PING";
+    case p2p::MsgType::PONG:
+      return "PONG";
     default:
       return "UNKNOWN";
   }
@@ -1108,7 +1112,7 @@ void Node::event_loop() {
       handle_propose(local_msg, false);
     }
 
-    for (int peer_id : keepalive_peers) request_finalized_tip(peer_id);
+    for (int peer_id : keepalive_peers) send_ping(peer_id);
 
     maybe_submit_bootstrap_join();
 
@@ -1157,6 +1161,13 @@ void Node::maybe_send_verack(int peer_id) {
   log_line(std::string("send ") + msg_type_name(p2p::MsgType::VERACK) + " peer_id=" + std::to_string(peer_id) +
            " status=" + (ok ? "ok" : "failed"));
   if (ok) p2p_.mark_handshake_tx(peer_id, false, true);
+}
+
+void Node::send_ping(int peer_id) {
+  const p2p::PingMsg ping{now_ms()};
+  const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PING, p2p::ser_ping(ping), true);
+  log_line(std::string("send ") + msg_type_name(p2p::MsgType::PING) + " peer_id=" + std::to_string(peer_id) +
+           " nonce=" + std::to_string(ping.nonce) + " status=" + (ok ? "ok" : "failed"));
 }
 
 void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payload) {
@@ -1609,6 +1620,29 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         }
         addrman_.add_or_update(na, e.last_seen_unix);
       }
+      break;
+    }
+    case p2p::MsgType::PING: {
+      auto ping = p2p::de_ping(payload);
+      if (!ping.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-ping");
+        return;
+      }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " nonce=" + std::to_string(ping->nonce));
+      const bool ok = p2p_.send_to(peer_id, p2p::MsgType::PONG, p2p::ser_ping(*ping), true);
+      log_line(std::string("send ") + msg_type_name(p2p::MsgType::PONG) + " peer_id=" + std::to_string(peer_id) +
+               " nonce=" + std::to_string(ping->nonce) + " status=" + (ok ? "ok" : "failed"));
+      break;
+    }
+    case p2p::MsgType::PONG: {
+      auto pong = p2p::de_ping(payload);
+      if (!pong.has_value()) {
+        score_peer(peer_id, p2p::MisbehaviorReason::INVALID_PAYLOAD, "bad-pong");
+        return;
+      }
+      log_line("recv " + std::string(msg_type_name(msg_type)) + " peer_id=" + std::to_string(peer_id) +
+               " nonce=" + std::to_string(pong->nonce));
       break;
     }
     default:
@@ -3022,6 +3056,10 @@ bool Node::check_rate_limit_locked(int peer_id, std::uint16_t msg_type) {
       return get(msg_type, 4.0, 1.0).consume(1.0, nms);
     case p2p::MsgType::ADDR:
       return get(msg_type, 8.0, 2.0).consume(1.0, nms);
+    case p2p::MsgType::PING:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
+    case p2p::MsgType::PONG:
+      return get(msg_type, 20.0, 10.0).consume(1.0, nms);
     default:
       return true;
   }

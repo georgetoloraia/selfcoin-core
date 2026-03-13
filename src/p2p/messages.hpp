@@ -20,6 +20,8 @@ enum MsgType : std::uint16_t {
   TX = 9,
   GETADDR = 10,
   ADDR = 11,
+  PING = 12,
+  PONG = 13,
 };
 
 struct VersionMsg {
@@ -79,6 +81,10 @@ struct AddrMsg {
   std::vector<AddrEntryMsg> entries;
 };
 
+struct PingMsg {
+  std::uint64_t nonce{0};
+};
+
 bool is_known_message_type(std::uint16_t msg_type);
 
 Bytes ser_version(const VersionMsg& m);
@@ -99,5 +105,7 @@ Bytes ser_getaddr(const GetAddrMsg& m);
 std::optional<GetAddrMsg> de_getaddr(const Bytes& b);
 Bytes ser_addr(const AddrMsg& m);
 std::optional<AddrMsg> de_addr(const Bytes& b);
+Bytes ser_ping(const PingMsg& m);
+std::optional<PingMsg> de_ping(const Bytes& b);
 
 }  // namespace selfcoin::p2p

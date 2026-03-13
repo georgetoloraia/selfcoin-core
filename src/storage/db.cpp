@@ -199,6 +199,49 @@ std::optional<ValidatorJoinRequest> parse_validator_join_request(const Bytes& b)
   return req;
 }
 
+Bytes serialize_slashing_record(const SlashingRecord& rec) {
+  codec::ByteWriter w;
+  w.bytes_fixed(rec.record_id);
+  w.u8(static_cast<std::uint8_t>(rec.kind));
+  w.bytes_fixed(rec.validator_pubkey);
+  w.u64le(rec.height);
+  w.u32le(rec.round);
+  w.u64le(rec.observed_height);
+  w.bytes_fixed(rec.object_a);
+  w.bytes_fixed(rec.object_b);
+  w.bytes_fixed(rec.txid);
+  return w.take();
+}
+
+std::optional<SlashingRecord> parse_slashing_record(const Bytes& b) {
+  SlashingRecord rec;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto rid = r.bytes_fixed<32>();
+        auto kind = r.u8();
+        auto pub = r.bytes_fixed<32>();
+        auto height = r.u64le();
+        auto round = r.u32le();
+        auto observed = r.u64le();
+        auto a = r.bytes_fixed<32>();
+        auto c = r.bytes_fixed<32>();
+        auto txid = r.bytes_fixed<32>();
+        if (!rid || !kind || !pub || !height || !round || !observed || !a || !c || !txid) return false;
+        rec.record_id = *rid;
+        rec.kind = static_cast<SlashingRecordKind>(*kind);
+        rec.validator_pubkey = *pub;
+        rec.height = *height;
+        rec.round = *round;
+        rec.observed_height = *observed;
+        rec.object_a = *a;
+        rec.object_b = *c;
+        rec.txid = *txid;
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return rec;
+}
+
 Bytes u64be_bytes(std::uint64_t v) {
   Bytes out(8);
   for (int i = 7; i >= 0; --i) {
@@ -227,6 +270,9 @@ std::string key_utxo(const OutPoint& op) { return "U:" + hex_encode(serialize_ou
 std::string key_validator(const PubKey32& pub) { return "V:" + hex_encode(Bytes(pub.begin(), pub.end())); }
 std::string key_validator_join_request(const Hash32& request_txid) {
   return "VJR:" + hex_encode(Bytes(request_txid.begin(), request_txid.end()));
+}
+std::string key_slashing_record(const Hash32& record_id) {
+  return "SL:" + hex_encode(Bytes(record_id.begin(), record_id.end()));
 }
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_su_prefix(const Hash32& scripthash) {
@@ -436,6 +482,20 @@ std::map<Hash32, ValidatorJoinRequest> DB::load_validator_join_requests() const 
     Hash32 request_txid{};
     std::copy(b->begin(), b->end(), request_txid.begin());
     out[request_txid] = *req;
+  }
+  return out;
+}
+
+bool DB::put_slashing_record(const SlashingRecord& rec) {
+  return put(key_slashing_record(rec.record_id), serialize_slashing_record(rec));
+}
+
+std::map<Hash32, SlashingRecord> DB::load_slashing_records() const {
+  std::map<Hash32, SlashingRecord> out;
+  for (const auto& [k, v] : scan_prefix("SL:")) {
+    auto rec = parse_slashing_record(v);
+    if (!rec.has_value()) continue;
+    out[rec->record_id] = *rec;
   }
   return out;
 }

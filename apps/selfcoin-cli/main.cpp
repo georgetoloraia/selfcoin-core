@@ -236,6 +236,18 @@ std::string trim_copy(std::string s) {
   return s.substr(start);
 }
 
+std::string slashing_kind_name(selfcoin::storage::SlashingRecordKind kind) {
+  switch (kind) {
+    case selfcoin::storage::SlashingRecordKind::VOTE_EQUIVOCATION:
+      return "vote-equivocation";
+    case selfcoin::storage::SlashingRecordKind::PROPOSER_EQUIVOCATION:
+      return "proposer-equivocation";
+    case selfcoin::storage::SlashingRecordKind::ONCHAIN_SLASH:
+      return "onchain-slash";
+  }
+  return "unknown";
+}
+
 std::vector<std::string> run_command_lines(const std::string& cmd) {
   std::vector<std::string> out;
   FILE* fp = ::popen(cmd.c_str(), "r");
@@ -280,6 +292,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
+              << "  selfcoin-cli slash_records [--db <dir>] [--tail <n>]\n"
               << "  selfcoin-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
               << "  selfcoin-cli genesis_hash --in <genesis.bin>\n"
               << "  selfcoin-cli genesis_verify --json <genesis.json> --bin <genesis.bin>\n"
@@ -405,6 +418,76 @@ int main(int argc, char** argv) {
     }
     if (emitted == 0) {
       std::cout << "no recent security/runtime events found via journalctl\n";
+    }
+
+    print_section("Slashing");
+    if (opened) {
+      auto records = db.load_slashing_records();
+      std::cout << "slashing_records=" << records.size() << "\n";
+      std::vector<selfcoin::storage::SlashingRecord> ordered;
+      ordered.reserve(records.size());
+      for (const auto& [_, rec] : records) ordered.push_back(rec);
+      std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        if (a.observed_height != b.observed_height) return a.observed_height > b.observed_height;
+        return a.record_id > b.record_id;
+      });
+      const std::size_t limit = std::min<std::size_t>(tail, ordered.size());
+      for (std::size_t i = 0; i < limit; ++i) {
+        const auto& rec = ordered[i];
+        std::cout << slashing_kind_name(rec.kind)
+                  << " validator=" << selfcoin::hex_encode(selfcoin::Bytes(rec.validator_pubkey.begin(), rec.validator_pubkey.end()))
+                  << " height=" << rec.height
+                  << " round=" << rec.round
+                  << " observed_height=" << rec.observed_height
+                  << " a=" << selfcoin::hex_encode32(rec.object_a)
+                  << " b=" << selfcoin::hex_encode32(rec.object_b);
+        if (rec.txid != selfcoin::zero_hash()) {
+          std::cout << " txid=" << selfcoin::hex_encode32(rec.txid);
+        }
+        std::cout << "\n";
+      }
+    } else {
+      std::cout << "slashing_records=unknown\n";
+    }
+    return 0;
+  }
+
+  if (cmd == "slash_records") {
+    std::string db_path = "./data/node";
+    std::size_t tail = 20;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--db" && i + 1 < argc) db_path = argv[++i];
+      else if (a == "--tail" && i + 1 < argc) tail = static_cast<std::size_t>(std::stoull(argv[++i]));
+    }
+    selfcoin::storage::DB db;
+    if (!db.open_readonly(db_path) && !db.open(db_path)) {
+      std::cerr << "failed to open db\n";
+      return 1;
+    }
+    auto records = db.load_slashing_records();
+    std::vector<selfcoin::storage::SlashingRecord> ordered;
+    ordered.reserve(records.size());
+    for (const auto& [_, rec] : records) ordered.push_back(rec);
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+      if (a.observed_height != b.observed_height) return a.observed_height > b.observed_height;
+      return a.record_id > b.record_id;
+    });
+    std::cout << "slashing_records=" << ordered.size() << "\n";
+    const std::size_t limit = std::min<std::size_t>(tail, ordered.size());
+    for (std::size_t i = 0; i < limit; ++i) {
+      const auto& rec = ordered[i];
+      std::cout << slashing_kind_name(rec.kind)
+                << " validator=" << selfcoin::hex_encode(selfcoin::Bytes(rec.validator_pubkey.begin(), rec.validator_pubkey.end()))
+                << " height=" << rec.height
+                << " round=" << rec.round
+                << " observed_height=" << rec.observed_height
+                << " a=" << selfcoin::hex_encode32(rec.object_a)
+                << " b=" << selfcoin::hex_encode32(rec.object_b);
+      if (rec.txid != selfcoin::zero_hash()) {
+        std::cout << " txid=" << selfcoin::hex_encode32(rec.txid);
+      }
+      std::cout << "\n";
     }
     return 0;
   }

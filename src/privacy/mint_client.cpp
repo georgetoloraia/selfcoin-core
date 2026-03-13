@@ -101,7 +101,8 @@ std::string to_json(const MintRedemptionRequest& req) {
   std::ostringstream oss;
   oss << "{"
       << "\"notes\":" << json_string_array(req.notes) << ","
-      << "\"redeem_address\":\"" << json_escape(req.redeem_address) << "\""
+      << "\"redeem_address\":\"" << json_escape(req.redeem_address) << "\","
+      << "\"amount\":" << req.amount
       << "}";
   return oss.str();
 }

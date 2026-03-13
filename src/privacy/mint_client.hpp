@@ -36,6 +36,7 @@ struct MintBlindIssueResponse {
 struct MintRedemptionRequest {
   std::vector<std::string> notes;
   std::string redeem_address;
+  std::uint64_t amount{0};
 };
 
 struct MintRedemptionResponse {

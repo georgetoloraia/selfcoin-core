@@ -47,10 +47,22 @@ class MintStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"
             state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
             redemption = {
                 "redemption_batch_id": "batch-1",
                 "notes": ["note-a", "note-b"],
                 "redeem_address": "sc1example",
+                "amount": 400,
                 "state": "pending",
                 "l1_txid": "",
             }
@@ -59,13 +71,91 @@ class MintStateTests(unittest.TestCase):
             self.assertTrue(state.note_already_spent("note-b"))
             self.assertFalse(state.note_already_spent("note-c"))
 
-    def test_deterministic_placeholder_blind_signature(self) -> None:
-        seed = "seed-x"
-        mint_ref = "ref-y"
-        msg = "blind-z"
-        sig1 = server.sha256_hex([seed, mint_ref, "0", msg])
-        sig2 = server.sha256_hex([seed, mint_ref, "0", msg])
-        self.assertEqual(sig1, sig2)
+    def test_issuance_persists_and_rejects_duplicate_blinds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
+
+            issuance = state.record_issuance("ref-1", ["aa", "bb"], ["cc", "dd"])
+            self.assertEqual(issuance["note_count"], 2)
+
+            reloaded = server.MintState(state_path)
+            dep = reloaded.get_deposit("ref-1")
+            self.assertEqual(dep["issued_blind_count"], 2)
+
+            with self.assertRaises(ValueError):
+                reloaded.record_issuance("ref-1", ["aa"], ["ee"])
+
+    def test_rejected_redemption_releases_notes_and_finalized_counts_in_reserves(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
+            state.create_redemption(
+                {
+                    "redemption_batch_id": "batch-1",
+                    "notes": ["note-a", "note-b"],
+                    "redeem_address": "sc1example",
+                    "amount": 400,
+                    "state": "pending",
+                    "l1_txid": "",
+                }
+            )
+            self.assertTrue(state.note_already_spent("note-a"))
+            state.update_redemption("batch-1", "rejected")
+            self.assertFalse(state.note_already_spent("note-a"))
+
+            state.create_redemption(
+                {
+                    "redemption_batch_id": "batch-2",
+                    "notes": ["note-a"],
+                    "redeem_address": "sc1example",
+                    "amount": 250,
+                    "state": "pending",
+                    "l1_txid": "",
+                }
+            )
+            state.update_redemption("batch-2", "finalized", "44" * 32)
+            reserves = state.reserve_summary()
+            accounting = state.accounting_summary()
+            self.assertEqual(reserves["total_deposited"], 1000)
+            self.assertEqual(reserves["finalized_redemption_amount"], 250)
+            self.assertEqual(reserves["available_reserve"], 750)
+            self.assertEqual(accounting["active_note_locks"], 1)
+
+    def test_blind_signer_signs_and_verifies(self) -> None:
+        signer = server.BlindSigner.from_seed("seed-x", bits=256)
+        message = 123456789
+        signature = int(signer.sign_blinded_hex(format(message, "x")), 16)
+        self.assertEqual(pow(signature, signer.e, signer.n), message)
+
+    def test_blind_signer_is_deterministic_for_seed(self) -> None:
+        a = server.BlindSigner.from_seed("seed-a", bits=256)
+        b = server.BlindSigner.from_seed("seed-a", bits=256)
+        self.assertEqual(a.n, b.n)
+        self.assertEqual(a.e, b.e)
+        self.assertEqual(a.d, b.d)
 
 
 if __name__ == "__main__":

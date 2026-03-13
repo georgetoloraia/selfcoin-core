@@ -4,8 +4,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import random
 import threading
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,14 +59,86 @@ class MintConfig:
     mint_id: str
 
 
+def _is_probable_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    for p in small_primes:
+        if n == p:
+            return True
+        if n % p == 0:
+            return False
+
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+
+    for a in [2, 325, 9375, 28178, 450775, 9780504, 1795265022]:
+        if a % n == 0:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        witness = True
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                witness = False
+                break
+        if witness:
+            return False
+    return True
+
+
+def _next_prime(rng: random.Random, bits: int) -> int:
+    while True:
+        candidate = rng.getrandbits(bits)
+        candidate |= (1 << (bits - 1))
+        candidate |= 1
+        if _is_probable_prime(candidate):
+            return candidate
+
+
+@dataclass
+class BlindSigner:
+    n: int
+    e: int
+    d: int
+
+    @classmethod
+    def from_seed(cls, seed: str, bits: int = 512) -> "BlindSigner":
+        rng = random.Random(int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16))
+        e = 65537
+        while True:
+            p = _next_prime(rng, bits)
+            q = _next_prime(rng, bits)
+            if p == q:
+                continue
+            phi = (p - 1) * (q - 1)
+            if math.gcd(e, phi) == 1:
+                n = p * q
+                d = pow(e, -1, phi)
+                return cls(n=n, e=e, d=d)
+
+    def sign_blinded_hex(self, blinded_hex: str) -> str:
+        blinded = int(blinded_hex, 16)
+        if blinded <= 0 or blinded >= self.n:
+            raise ValueError("blinded message out of range")
+        signed = pow(blinded, self.d, self.n)
+        return format(signed, "x")
+
+
 class MintState:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()
         self._data = {
             "deposits": {},
+            "issuances": {},
             "redemptions": {},
-            "spent_notes": {},
+            "note_records": {},
         }
         self._load()
 
@@ -75,6 +150,18 @@ class MintState:
                 data = json.load(f)
             if isinstance(data, dict):
                 self._data.update(data)
+                if "spent_notes" in self._data and "note_records" not in self._data:
+                    self._data["note_records"] = {
+                        note: {
+                            "state": "legacy-spent",
+                            "redemption_batch_id": batch_id,
+                            "redeem_address": "",
+                            "amount": 0,
+                            "updated_at": 0,
+                        }
+                        for note, batch_id in self._data["spent_notes"].items()
+                    }
+                self._data.pop("spent_notes", None)
         except Exception:
             pass
 
@@ -87,6 +174,9 @@ class MintState:
 
     def register_deposit(self, deposit: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            deposit = dict(deposit)
+            deposit.setdefault("issued_blind_count", 0)
+            deposit.setdefault("issuance_ids", [])
             self._data["deposits"][deposit["mint_deposit_ref"]] = deposit
             self._flush()
             return dict(deposit)
@@ -96,11 +186,55 @@ class MintState:
             dep = self._data["deposits"].get(mint_deposit_ref)
             return dict(dep) if isinstance(dep, dict) else None
 
+    def record_issuance(self, mint_deposit_ref: str, blinded_messages: list[str], signed_blinds: list[str]) -> dict[str, Any]:
+        blinded_hashes = [hashlib.sha256(msg.encode("utf-8")).hexdigest() for msg in blinded_messages]
+        issued_at = int(time.time())
+        with self._lock:
+            deposit = self._data["deposits"].get(mint_deposit_ref)
+            if not isinstance(deposit, dict):
+                raise KeyError("unknown mint_deposit_ref")
+            existing = set()
+            for issuance_id in deposit.get("issuance_ids", []):
+                issuance = self._data["issuances"].get(issuance_id)
+                if isinstance(issuance, dict):
+                    existing.update(issuance.get("blinded_hashes", []))
+            overlap = existing.intersection(blinded_hashes)
+            if overlap:
+                raise ValueError("duplicate blinded message")
+            issuance_id = sha256_hex([mint_deposit_ref, *blinded_hashes])
+            issuance = {
+                "issuance_id": issuance_id,
+                "mint_deposit_ref": mint_deposit_ref,
+                "blinded_hashes": blinded_hashes,
+                "signed_blinds": list(signed_blinds),
+                "created_at": issued_at,
+                "note_count": len(blinded_messages),
+            }
+            self._data["issuances"][issuance_id] = issuance
+            deposit["issuance_ids"] = list(deposit.get("issuance_ids", [])) + [issuance_id]
+            deposit["issued_blind_count"] = int(deposit.get("issued_blind_count", 0)) + len(blinded_messages)
+            self._data["deposits"][mint_deposit_ref] = deposit
+            self._flush()
+            return dict(issuance)
+
     def create_redemption(self, redemption: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            outstanding = self._total_deposited_locked() - self._total_reserved_locked()
+            if int(redemption["amount"]) > outstanding:
+                raise ValueError("insufficient reserve")
+            now = int(time.time())
+            redemption = dict(redemption)
+            redemption.setdefault("created_at", now)
+            redemption["updated_at"] = now
             self._data["redemptions"][redemption["redemption_batch_id"]] = redemption
             for note in redemption["notes"]:
-                self._data["spent_notes"][note] = redemption["redemption_batch_id"]
+                self._data["note_records"][note] = {
+                    "state": redemption["state"],
+                    "redemption_batch_id": redemption["redemption_batch_id"],
+                    "redeem_address": redemption["redeem_address"],
+                    "amount": int(redemption["amount"]),
+                    "updated_at": now,
+                }
             self._flush()
             return dict(redemption)
 
@@ -111,10 +245,99 @@ class MintState:
 
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
-            return note in self._data["spent_notes"]
+            return note in self._data["note_records"]
+
+    def update_redemption(self, batch_id: str, new_state: str, l1_txid: str = "") -> dict[str, Any]:
+        allowed = {
+            "pending": {"broadcast", "finalized", "rejected"},
+            "broadcast": {"finalized", "rejected"},
+        }
+        with self._lock:
+            redemption = self._data["redemptions"].get(batch_id)
+            if not isinstance(redemption, dict):
+                raise KeyError("unknown redemption_batch_id")
+            current = str(redemption.get("state", "pending"))
+            if current == new_state:
+                return dict(redemption)
+            if current not in allowed or new_state not in allowed[current]:
+                raise ValueError("invalid redemption state transition")
+            now = int(time.time())
+            redemption["state"] = new_state
+            redemption["updated_at"] = now
+            if l1_txid:
+                redemption["l1_txid"] = l1_txid
+            if new_state == "rejected":
+                for note in redemption["notes"]:
+                    self._data["note_records"].pop(note, None)
+            else:
+                for note in redemption["notes"]:
+                    self._data["note_records"][note] = {
+                        "state": new_state,
+                        "redemption_batch_id": batch_id,
+                        "redeem_address": redemption["redeem_address"],
+                        "amount": int(redemption["amount"]),
+                        "updated_at": now,
+                    }
+            self._data["redemptions"][batch_id] = redemption
+            self._flush()
+            return dict(redemption)
+
+    def accounting_summary(self) -> dict[str, Any]:
+        with self._lock:
+            total_deposited = self._total_deposited_locked()
+            pending = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
+                          if isinstance(item, dict) and item.get("state") == "pending")
+            broadcast = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
+                            if isinstance(item, dict) and item.get("state") == "broadcast")
+            finalized = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
+                            if isinstance(item, dict) and item.get("state") == "finalized")
+            rejected = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
+                           if isinstance(item, dict) and item.get("state") == "rejected")
+            issuance_count = len(self._data["issuances"])
+            blind_count = sum(int(item.get("note_count", 0)) for item in self._data["issuances"].values()
+                              if isinstance(item, dict))
+            return {
+                "mint_id": None,
+                "deposit_count": len(self._data["deposits"]),
+                "issuance_count": issuance_count,
+                "issued_blind_count": blind_count,
+                "redemption_count": len(self._data["redemptions"]),
+                "active_note_locks": len(self._data["note_records"]),
+                "total_deposited": total_deposited,
+                "pending_redemption_amount": pending,
+                "broadcast_redemption_amount": broadcast,
+                "finalized_redemption_amount": finalized,
+                "rejected_redemption_amount": rejected,
+                "reserve_balance": total_deposited - finalized,
+                "available_reserve": total_deposited - pending - broadcast - finalized,
+            }
+
+    def reserve_summary(self) -> dict[str, Any]:
+        with self._lock:
+            total_deposited = self._total_deposited_locked()
+            finalized = sum(int(item.get("amount", 0)) for item in self._data["redemptions"].values()
+                            if isinstance(item, dict) and item.get("state") == "finalized")
+            reserved = self._total_reserved_locked()
+            return {
+                "total_deposited": total_deposited,
+                "reserved_redemption_amount": reserved,
+                "finalized_redemption_amount": finalized,
+                "reserve_balance": total_deposited - finalized,
+                "available_reserve": total_deposited - reserved,
+            }
+
+    def _total_deposited_locked(self) -> int:
+        return sum(int(item.get("amount", 0)) for item in self._data["deposits"].values() if isinstance(item, dict))
+
+    def _total_reserved_locked(self) -> int:
+        return sum(
+            int(item.get("amount", 0))
+            for item in self._data["redemptions"].values()
+            if isinstance(item, dict) and item.get("state") in {"pending", "broadcast", "finalized"}
+        )
 
 
-def make_handler(config: MintConfig, state: MintState):
+def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
     class MintHandler(BaseHTTPRequestHandler):
         server_version = "selfcoin-mint/0.1"
 
@@ -124,6 +347,27 @@ def make_handler(config: MintConfig, state: MintState):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 write_json(self, HTTPStatus.OK, {"ok": True, "mint_id": config.mint_id})
+                return
+            if self.path == "/mint/key":
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    {
+                        "algorithm": "rsa-chaum-blind",
+                        "modulus_hex": format(signer.n, "x"),
+                        "public_exponent": signer.e,
+                    },
+                )
+                return
+            if self.path == "/reserves":
+                summary = state.reserve_summary()
+                summary["mint_id"] = config.mint_id
+                write_json(self, HTTPStatus.OK, summary)
+                return
+            if self.path == "/accounting/summary":
+                summary = state.accounting_summary()
+                summary["mint_id"] = config.mint_id
+                write_json(self, HTTPStatus.OK, summary)
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -144,6 +388,9 @@ def make_handler(config: MintConfig, state: MintState):
                 return
             if self.path == "/redemptions/status":
                 self._handle_redemption_status(body)
+                return
+            if self.path == "/redemptions/update":
+                self._handle_redemption_update(body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -203,24 +450,38 @@ def make_handler(config: MintConfig, state: MintState):
                 write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown mint_deposit_ref"})
                 return
 
-            signed_blinds = [
-                sha256_hex([config.signing_seed, mint_deposit_ref, str(idx), str(msg)])
-                for idx, msg in enumerate(blinded_messages)
-            ]
+            signed_blinds = []
+            try:
+                for msg in blinded_messages:
+                    if not isinstance(msg, str) or not msg:
+                        raise ValueError("blinded message must be a non-empty hex string")
+                    signed_blinds.append(signer.sign_blinded_hex(msg))
+                issuance = state.record_issuance(mint_deposit_ref, blinded_messages, signed_blinds)
+            except ValueError as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown mint_deposit_ref"})
+                return
             write_json(
                 self,
                 HTTPStatus.OK,
                 {
                     "signed_blinds": signed_blinds,
                     "mint_epoch": 0,
+                    "issuance_id": issuance["issuance_id"],
                 },
             )
 
         def _handle_redemption_create(self, body: dict[str, Any]) -> None:
             notes = body.get("notes")
             redeem_address = body.get("redeem_address")
-            if not isinstance(notes, list) or not isinstance(redeem_address, str) or not notes:
+            amount = body.get("amount")
+            if not isinstance(notes, list) or not isinstance(redeem_address, str) or not notes or not isinstance(amount, int):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid fields"})
+                return
+            if amount <= 0:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "amount must be positive"})
                 return
             for note in notes:
                 if not isinstance(note, str):
@@ -235,10 +496,15 @@ def make_handler(config: MintConfig, state: MintState):
                 "redemption_batch_id": batch_id,
                 "notes": list(notes),
                 "redeem_address": redeem_address,
+                "amount": amount,
                 "state": "pending",
                 "l1_txid": "",
             }
-            state.create_redemption(redemption)
+            try:
+                state.create_redemption(redemption)
+            except ValueError as exc:
+                write_json(self, HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
             write_json(self, HTTPStatus.OK, {"accepted": True, "redemption_batch_id": batch_id})
 
         def _handle_redemption_status(self, body: dict[str, Any]) -> None:
@@ -256,6 +522,35 @@ def make_handler(config: MintConfig, state: MintState):
                 {
                     "state": redemption["state"],
                     "l1_txid": redemption["l1_txid"],
+                    "amount": redemption["amount"],
+                },
+            )
+
+        def _handle_redemption_update(self, body: dict[str, Any]) -> None:
+            batch_id = body.get("redemption_batch_id")
+            new_state = body.get("state")
+            l1_txid = body.get("l1_txid", "")
+            if not isinstance(batch_id, str) or not isinstance(new_state, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid fields"})
+                return
+            if l1_txid and not is_hex_of_size(l1_txid, 32):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid l1_txid"})
+                return
+            try:
+                updated = state.update_redemption(batch_id, new_state, l1_txid)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown redemption_batch_id"})
+                return
+            except ValueError as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "state": updated["state"],
+                    "l1_txid": updated["l1_txid"],
                 },
             )
 
@@ -287,7 +582,8 @@ def main() -> int:
         mint_id=args.mint_id,
     )
     state = MintState(config.state_file)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state))
+    signer = BlindSigner.from_seed(config.signing_seed)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer))
     print(f"selfcoin-mint listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

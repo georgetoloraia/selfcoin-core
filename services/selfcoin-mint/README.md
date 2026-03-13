@@ -9,11 +9,12 @@ This service is intentionally outside consensus. It consumes the JSON contracts 
 It is a narrow scaffold, not a production mint:
 
 - file-backed state
-- deterministic placeholder blind-signing
-- simple redemption batch tracking
-- no real reserve management
+- deterministic RSA blind-signing for development/testing
+- persistent issuance ledger
+- reserve and accounting summary endpoints
+- redemption lifecycle updates (`pending -> broadcast/finalized/rejected`)
 - no federation
-- no real Chaumian cryptography yet
+- no audited custody or reserve attestation
 
 ## Endpoints
 
@@ -21,7 +22,11 @@ It is a narrow scaffold, not a production mint:
 - `POST /issuance/blind`
 - `POST /redemptions/create`
 - `POST /redemptions/status`
+- `POST /redemptions/update`
 - `GET /healthz`
+- `GET /mint/key`
+- `GET /reserves`
+- `GET /accounting/summary`
 
 ## Run
 
@@ -63,19 +68,26 @@ python3 services/selfcoin-mint/server.py \
 ./build/selfcoin-cli mint_redeem_create \
   --url http://127.0.0.1:8080/redemptions/create \
   --redeem-address sc1... \
+  --amount 50000 \
   --note note-1 \
   --note note-2
+```
+
+```bash
+curl http://127.0.0.1:8080/accounting/summary
+curl http://127.0.0.1:8080/reserves
 ```
 
 ## Notes
 
 - Deposit references are deterministic hashes of `(txid, vout, mint_id)`.
-- Blind issuance responses are deterministic placeholder signatures derived from a local seed.
-- Redemption batches are created immediately with `state=pending`.
-- You can edit the JSON state file or extend the server to simulate finalization.
+- Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
+- Redemption batches are created with `state=pending` and can be advanced with `POST /redemptions/update`.
+- Reserve and accounting endpoints are derived from persisted deposits, issuances, and redemption state.
 
 ## Service tests
 
 ```bash
 python3 -m unittest services/selfcoin-mint/test_state.py
+python3 -m unittest services/selfcoin-mint/test_integration.py
 ```

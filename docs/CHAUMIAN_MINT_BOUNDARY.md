@@ -44,6 +44,9 @@ Suggested example HTTP endpoints:
 - `POST /issuance/blind`
 - `POST /redemptions/create`
 - `POST /redemptions/status`
+- `POST /redemptions/update`
+- `GET /accounting/summary`
+- `GET /reserves`
 
 ### 1. Deposit registration
 
@@ -97,7 +100,8 @@ Request:
 ```json
 {
   "notes": ["opaque-note-1", "opaque-note-2"],
-  "redeem_address": "sc1..."
+  "redeem_address": "sc1...",
+  "amount": 100000
 }
 ```
 
@@ -117,8 +121,32 @@ Response:
 ```json
 {
   "state": "pending|broadcast|finalized|rejected",
+  "l1_txid": "hex32",
+  "amount": 100000
+}
+
+### 5. Redemption state update
+
+Request:
+
+```json
+{
+  "redemption_batch_id": "opaque-string",
+  "state": "broadcast|finalized|rejected",
   "l1_txid": "hex32"
 }
+```
+
+### 6. Reserve and accounting views
+
+`GET /reserves` returns the mint's deposit-backed reserve summary.
+
+`GET /accounting/summary` returns:
+- deposit totals
+- issuance totals
+- pending/broadcast/finalized redemption totals
+- available reserve estimate
+- active note locks
 ```
 
 ## Core repo scope
@@ -156,6 +184,11 @@ selfcoin-cli mint_deposit_register \
 selfcoin-cli mint_redeem_status \
   --url http://127.0.0.1:8080/redemptions/status \
   --batch-id <opaque-id>
+```
+
+```bash
+curl http://127.0.0.1:8080/accounting/summary
+curl http://127.0.0.1:8080/reserves
 ```
 
 ## Non-goals

@@ -3,6 +3,7 @@
 #include "address/address.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
+#include "privacy/mint_scripts.hpp"
 #include "utxo/validate.hpp"
 
 using namespace selfcoin;
@@ -114,6 +115,41 @@ TEST(test_protocol_scope_allows_settlement_output_scripts) {
   Hash32 h{};
   h.fill(0x42);
   ASSERT_TRUE(is_supported_base_layer_output_script(burn_script(h)));
+
+  Hash32 mint_id{};
+  mint_id.fill(0x33);
+  ASSERT_TRUE(is_supported_base_layer_output_script(privacy::mint_deposit_script_pubkey(mint_id, pkh)));
+}
+
+TEST(test_protocol_scope_allows_mint_deposit_output_in_standard_tx) {
+  const auto kp = key_from_byte(24);
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  OutPoint op{};
+  op.txid.fill(0xA3);
+  op.index = 0;
+  TxOut prev_out{50'000, address::p2pkh_script_pubkey(pkh)};
+  UtxoSet view;
+  view[op] = UtxoEntry{prev_out};
+
+  Hash32 mint_id{};
+  mint_id.fill(0x5A);
+  auto tx = make_spend_tx(op, prev_out, kp, {TxOut{49'000, privacy::mint_deposit_script_pubkey(mint_id, pkh)}});
+  auto r = validate_tx(tx, 1, view, nullptr);
+  ASSERT_TRUE(r.ok);
+}
+
+TEST(test_protocol_scope_roundtrips_mint_deposit_script) {
+  Hash32 mint_id{};
+  mint_id.fill(0x7C);
+  std::array<std::uint8_t, 20> recipient{};
+  recipient.fill(0x19);
+
+  const Bytes spk = privacy::mint_deposit_script_pubkey(mint_id, recipient);
+  Hash32 parsed_mint_id{};
+  std::array<std::uint8_t, 20> parsed_recipient{};
+  ASSERT_TRUE(privacy::is_mint_deposit_script(spk, &parsed_mint_id, &parsed_recipient));
+  ASSERT_TRUE(parsed_mint_id == mint_id);
+  ASSERT_TRUE(parsed_recipient == recipient);
 }
 
 void register_protocol_scope_tests() {}

@@ -310,6 +310,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
               << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
+              << "  selfcoin-cli mint_issue_blinds --url http://host:port/path --mint-deposit-ref <id> --blind <msg> [--blind <msg> ...]\n"
+              << "  selfcoin-cli mint_redeem_create --url http://host:port/path --redeem-address <addr> --note <opaque> [--note <opaque> ...]\n"
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
               << "  selfcoin-cli mint_api_example\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
@@ -1445,6 +1447,77 @@ int main(int argc, char** argv) {
     std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
     std::cout << "confirmations_required=" << resp->confirmations_required << "\n";
     std::cout << "mint_deposit_ref=" << resp->mint_deposit_ref << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_issue_blinds") {
+    std::string url;
+    std::string mint_deposit_ref;
+    std::vector<std::string> blinds;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--mint-deposit-ref" && i + 1 < argc) mint_deposit_ref = argv[++i];
+      else if (a == "--blind" && i + 1 < argc) blinds.push_back(argv[++i]);
+    }
+    if (url.empty() || mint_deposit_ref.empty() || blinds.empty()) {
+      std::cerr << "mint_issue_blinds requires --url, --mint-deposit-ref, and at least one --blind\n";
+      return 1;
+    }
+    selfcoin::privacy::MintBlindIssueRequest req;
+    req.mint_deposit_ref = mint_deposit_ref;
+    req.blinded_messages = blinds;
+
+    std::string err;
+    auto body = http_post_json(url, selfcoin::privacy::to_json(req), &err);
+    if (!body) {
+      std::cerr << "mint_issue_blinds failed: " << err << "\n";
+      return 1;
+    }
+    auto resp = selfcoin::privacy::parse_mint_blind_issue_response(*body);
+    if (!resp) {
+      std::cerr << "mint_issue_blinds parse failed\n";
+      return 1;
+    }
+    std::cout << "mint_epoch=" << resp->mint_epoch << "\n";
+    std::cout << "signed_blinds=" << resp->signed_blinds.size() << "\n";
+    for (std::size_t i = 0; i < resp->signed_blinds.size(); ++i) {
+      std::cout << "signed_blind[" << i << "]=" << resp->signed_blinds[i] << "\n";
+    }
+    return 0;
+  }
+
+  if (cmd == "mint_redeem_create") {
+    std::string url;
+    std::string redeem_address;
+    std::vector<std::string> notes;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--redeem-address" && i + 1 < argc) redeem_address = argv[++i];
+      else if (a == "--note" && i + 1 < argc) notes.push_back(argv[++i]);
+    }
+    if (url.empty() || redeem_address.empty() || notes.empty()) {
+      std::cerr << "mint_redeem_create requires --url, --redeem-address, and at least one --note\n";
+      return 1;
+    }
+    selfcoin::privacy::MintRedemptionRequest req;
+    req.notes = notes;
+    req.redeem_address = redeem_address;
+
+    std::string err;
+    auto body = http_post_json(url, selfcoin::privacy::to_json(req), &err);
+    if (!body) {
+      std::cerr << "mint_redeem_create failed: " << err << "\n";
+      return 1;
+    }
+    auto resp = selfcoin::privacy::parse_mint_redemption_response(*body);
+    if (!resp) {
+      std::cerr << "mint_redeem_create parse failed\n";
+      return 1;
+    }
+    std::cout << "accepted=" << (resp->accepted ? "true" : "false") << "\n";
+    std::cout << "redemption_batch_id=" << resp->redemption_batch_id << "\n";
     return 0;
   }
 

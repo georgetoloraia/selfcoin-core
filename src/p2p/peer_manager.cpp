@@ -326,7 +326,12 @@ void PeerManager::read_loop(int peer_id) {
 
   while (running_) {
     const auto info = get_peer_info(peer_id);
-    const std::uint32_t header_timeout = info.established() ? limits_.idle_timeout_ms : limits_.handshake_timeout_ms;
+    std::uint32_t header_timeout = info.established() ? limits_.idle_timeout_ms : limits_.handshake_timeout_ms;
+    if (info.established() && read_timeout_override_) {
+      if (auto override_timeout = read_timeout_override_(peer_id, info); override_timeout.has_value()) {
+        header_timeout = *override_timeout;
+      }
+    }
     FrameReadError ferr = FrameReadError::NONE;
     FrameFailureInfo finfo;
     auto frame = read_frame_fd_timed(p->fd, max_payload_len_, magic_, proto_version_, header_timeout, limits_.frame_timeout_ms,

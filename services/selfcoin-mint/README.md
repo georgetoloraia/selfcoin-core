@@ -12,6 +12,7 @@ It is a narrow scaffold, not a production mint:
 - deterministic RSA blind-signing for development/testing
 - persistent issuance ledger
 - reserve and accounting summary endpoints
+- reserve wallet inventory / fragmentation reporting
 - automatic redemption settlement using a configured reserve wallet
 - lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
 - HMAC-signed operator admin requests
@@ -111,9 +112,11 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
 - Each issuance creates persistent `note_ref` entries with explicit denominations.
 - If a reserve wallet and lightserver are configured, signed operators can approve pending redemptions for automatic L1 tx construction and broadcast.
+- Broadcasted reserve inputs are treated as locked in service-side inventory and audit views until L1 reconciliation completes.
+- Coin selection uses `smallest-sufficient-non-dust-change` with `min_change=1000`; if no non-dust change set can be formed, the redemption stays `pending`.
 - Redemption batches that cannot yet be funded stay `pending`; operators may reject them, but `broadcast` must go through `/redemptions/approve_broadcast`.
 - `finalized` is derived from observed L1 tx status via the configured lightserver.
-- `/reserves` includes live reserve-wallet UTXO count/value when lightserver + reserve address are configured.
+- `/reserves` includes live reserve-wallet UTXO count/value, locked UTXO count/value, and simple fragmentation metrics when lightserver + reserve address are configured.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:
   - `X-Selfcoin-Operator-Key`
   - `X-Selfcoin-Timestamp`

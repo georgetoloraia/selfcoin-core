@@ -361,8 +361,12 @@ class MintIntegrationTests(unittest.TestCase):
 
                     reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
                     self.assertEqual(reserves["available_reserve"], 0)
-                    self.assertEqual(reserves["wallet_utxo_count"], 2)
-                    self.assertEqual(reserves["wallet_utxo_value"], 110000)
+                    self.assertEqual(reserves["pending_spend_commitment_count"], 1)
+                    self.assertEqual(reserves["pending_spend_input_count"], 2)
+                    self.assertEqual(reserves["wallet_utxo_count"], 0)
+                    self.assertEqual(reserves["wallet_utxo_value"], 0)
+                    self.assertEqual(reserves["wallet_locked_utxo_count"], 2)
+                    self.assertEqual(reserves["wallet_locked_utxo_value"], 110000)
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
@@ -386,6 +390,11 @@ class MintIntegrationTests(unittest.TestCase):
                     audit = subprocess.run(audit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                     audit_json = json.loads(audit.stdout)
                     self.assertEqual(len(audit_json["payload"]["issuances"]), 1)
+                    self.assertEqual(audit_json["payload"]["reserves"]["pending_spend_commitment_count"], 0)
+                    self.assertEqual(audit_json["payload"]["reserves"]["finalized_redemption_amount"], 100000)
+                    self.assertEqual(audit_json["payload"]["redemptions"][0]["coin_selection_policy"], "smallest-sufficient-non-dust-change")
+                    self.assertEqual(audit_json["payload"]["redemptions"][0]["change_value"], 9000)
+                    self.assertEqual(len(audit_json["payload"]["redemptions"][0]["selected_utxos"]), 2)
                     self.assertTrue(audit_json["signature_hex"])
 
                     attest_cmd = [
@@ -397,6 +406,8 @@ class MintIntegrationTests(unittest.TestCase):
                     attestation = subprocess.run(attest_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                     attest_json = json.loads(attestation.stdout)
                     self.assertEqual(attest_json["payload"]["reserve_balance"], 0)
+                    self.assertEqual(attest_json["payload"]["wallet_locked_utxo_count"], 0)
+                    self.assertEqual(attest_json["payload"]["finalized_redemption_amount"], 100000)
                     self.assertTrue(attest_json["signature_hex"])
 
                     operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")

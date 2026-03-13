@@ -142,7 +142,7 @@ Request:
 ```json
 {
   "redemption_batch_id": "opaque-string",
-  "state": "broadcast|rejected",
+  "state": "rejected",
   "l1_txid": "hex32"
 }
 ```
@@ -156,7 +156,7 @@ Authentication:
 
 Notes:
 
-- `broadcast` requires `l1_txid`
+- `broadcast` is not manually set through this endpoint
 - `finalized` is not manually set; it is derived from observed lightserver state
 
 ### 5a. Automatic redemption settlement
@@ -181,7 +181,19 @@ Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcas
 When reserve wallet discovery is configured, it also returns live reserve-wallet inventory:
 - `wallet_utxo_count`
 - `wallet_utxo_value`
+- `wallet_locked_utxo_count`
+- `wallet_locked_utxo_value`
+- `wallet_fragment_smallest`
+- `wallet_fragment_largest`
+- `wallet_fragment_below_min_change`
 - `wallet_synced_at`
+
+Broadcasted redemption inputs are treated as locked reserve commitments in the mint service even if the lightserver still reports them as unspent. This keeps reserve reporting conservative during the `broadcast -> finalized` window.
+
+Recommended coin-selection policy for the external mint:
+- smallest sufficient input set
+- reject selections that would create change below `min_change`
+- report the chosen policy and resulting `change_value` in audit exports
 
 `GET /accounting/summary` returns:
 - deposit totals
@@ -237,11 +249,9 @@ selfcoin-cli mint_redeem_status \
 ```
 
 ```bash
-selfcoin-cli mint_redeem_update \
-  --url http://127.0.0.1:8080/redemptions/update \
+selfcoin-cli mint_redeem_approve_broadcast \
+  --url http://127.0.0.1:8080/redemptions/approve_broadcast \
   --batch-id <opaque-id> \
-  --state broadcast \
-  --l1-txid <hex32> \
   --operator-key-id <id> \
   --operator-secret-hex <hex>
 ```

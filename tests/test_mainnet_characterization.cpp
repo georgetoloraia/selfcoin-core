@@ -96,13 +96,19 @@ TEST(test_characterize_mainnet_default_node_routes_legacy_consensus_paths) {
   auto n = make_node("/tmp/selfcoin_characterize_routes", 0, 4, 3);
 
   ASSERT_EQ(n->proposer_path_for_next_height_for_test(), std::string("vrf-threshold-proposer"));
-  ASSERT_EQ(n->committee_path_for_next_height_for_test(), std::string("deterministic-committee"));
+  ASSERT_EQ(n->committee_path_for_next_height_for_test(), std::string("vrf-epoch-committee"));
   ASSERT_EQ(n->vote_path_for_next_height_for_test(), std::string("committee-membership"));
 
   const auto active = n->active_validators_for_next_height_for_test();
   const auto status = n->status();
   const auto committee = n->committee_for_next_height_for_test();
-  const auto expected = consensus::select_committee(status.tip_hash, status.height + 1, active, 3);
+  ChainId cid;
+  cid.genesis_hash_hex = status.genesis_hash;
+  const auto epoch_randomness = consensus::initial_finalized_randomness(mainnet_network(), cid);
+  const auto epoch_start = consensus::committee_epoch_start(status.height + 1, mainnet_network().vrf_committee_epoch_blocks);
+  const auto epoch_seed = consensus::committee_epoch_seed(epoch_randomness, epoch_start);
+  const auto expected =
+      consensus::select_committee_v2(active, epoch_seed, consensus::committee_size_for_round_v2(active.size(), 3, 0));
   ASSERT_EQ(committee, expected);
   ASSERT_EQ(n->quorum_threshold_for_next_height_for_test(), consensus::quorum_threshold(committee.size()));
 }

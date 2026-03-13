@@ -160,4 +160,17 @@ TEST(test_finalized_randomness_accumulator_is_deterministic) {
   ASSERT_TRUE(a2 != r0);
 }
 
+TEST(test_committee_epoch_helpers_are_deterministic) {
+  ASSERT_EQ(consensus::committee_epoch_start(1, 32), 1u);
+  ASSERT_EQ(consensus::committee_epoch_start(32, 32), 1u);
+  ASSERT_EQ(consensus::committee_epoch_start(33, 32), 33u);
+
+  Hash32 r{};
+  r.fill(0x91);
+  const auto s1 = consensus::committee_epoch_seed(r, 33);
+  const auto s2 = consensus::committee_epoch_seed(r, 33);
+  ASSERT_EQ(s1, s2);
+  ASSERT_TRUE(s1 != consensus::committee_epoch_seed(r, 65));
+}
+
 void register_research_vrf_tests() {}

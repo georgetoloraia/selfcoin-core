@@ -26,4 +26,18 @@ Hash32 advance_finalized_randomness(const Hash32& prev_randomness, const BlockHe
   return crypto::sha256d(w.data());
 }
 
+std::uint64_t committee_epoch_start(std::uint64_t height, std::uint64_t epoch_blocks) {
+  if (height == 0) return 0;
+  if (epoch_blocks == 0) epoch_blocks = 1;
+  return ((height - 1) / epoch_blocks) * epoch_blocks + 1;
+}
+
+Hash32 committee_epoch_seed(const Hash32& epoch_randomness, std::uint64_t epoch_start_height) {
+  codec::ByteWriter w;
+  w.bytes(Bytes{'S', 'C', '-', 'C', 'O', 'M', 'M', '-', 'E', 'P', 'O', 'C', 'H', '-', 'V', '1'});
+  w.bytes_fixed(epoch_randomness);
+  w.u64le(epoch_start_height);
+  return crypto::sha256d(w.data());
+}
+
 }  // namespace selfcoin::consensus

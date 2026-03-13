@@ -196,6 +196,7 @@ class Node {
   std::optional<crypto::VrfProof> local_proposer_vrf_locked(std::uint64_t height, std::uint32_t round) const;
   bool verify_block_proposer_locked(const Block& block) const;
   bool check_and_record_proposer_equivocation_locked(const Block& block);
+  Hash32 committee_epoch_randomness_for_height_locked(std::uint64_t height) const;
   std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();
@@ -251,6 +252,7 @@ class Node {
   std::uint64_t finalized_height_{0};
   Hash32 finalized_hash_{};
   Hash32 finalized_randomness_{};
+  std::map<std::uint64_t, Hash32> committee_epoch_randomness_cache_;
   std::uint32_t current_round_{0};
   std::uint64_t round_started_ms_{0};
 

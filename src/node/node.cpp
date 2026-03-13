@@ -890,6 +890,15 @@ Hash32 Node::committee_epoch_randomness_for_height_locked(std::uint64_t height) 
   return consensus::initial_finalized_randomness(cfg_.network, chain_id_);
 }
 
+std::optional<storage::CommitteeEpochSnapshot> Node::committee_epoch_snapshot_for_height_locked(
+    std::uint64_t height) const {
+  if (!cfg_.network.vrf_committee_enabled || height == 0) return std::nullopt;
+  const auto epoch_start = consensus::committee_epoch_start(height, cfg_.network.vrf_committee_epoch_blocks);
+  auto it = committee_epoch_snapshots_.find(epoch_start);
+  if (it != committee_epoch_snapshots_.end()) return it->second;
+  return db_.get_committee_epoch_snapshot(epoch_start);
+}
+
 storage::CommitteeEpochSnapshot Node::build_committee_epoch_snapshot_locked(std::uint64_t epoch_start_height,
                                                                             const std::vector<PubKey32>& active,
                                                                             const Hash32& epoch_randomness) const {
@@ -1821,7 +1830,25 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, co
     std::lock_guard<std::mutex> lk(mu_);
     if (from_network && !running_) return false;
     if (vote.height != finalized_height_ + 1) return false;
-    if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) return false;
+    if (cfg_.network.vrf_committee_enabled) {
+      auto snapshot = committee_epoch_snapshot_for_height_locked(vote.height);
+      if (!snapshot.has_value()) return false;
+      const auto committee_size =
+          consensus::committee_size_for_round_v2(snapshot->ordered_members.size(), cfg_.max_committee, vote.round);
+      const auto end = std::min<std::size_t>(committee_size, snapshot->ordered_members.size());
+      const auto member_it =
+          std::find(snapshot->ordered_members.begin(), snapshot->ordered_members.begin() + end, vote.validator_pubkey);
+      if (member_it == snapshot->ordered_members.begin() + end) {
+        log_line("vote-reject-snapshot-nonmember validator=" +
+                 hex_encode(Bytes(vote.validator_pubkey.begin(), vote.validator_pubkey.end())) +
+                 " height=" + std::to_string(vote.height) + " round=" + std::to_string(vote.round) +
+                 " epoch_start=" +
+                 std::to_string(consensus::committee_epoch_start(vote.height, cfg_.network.vrf_committee_epoch_blocks)));
+        return false;
+      }
+    } else if (!is_committee_member_for(vote.validator_pubkey, vote.height, vote.round)) {
+      return false;
+    }
 
     const auto nowm = now_ms();
     auto& verify_bucket = vote_verify_buckets_[from_peer_id];

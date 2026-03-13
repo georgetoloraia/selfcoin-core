@@ -197,6 +197,7 @@ class Node {
   bool verify_block_proposer_locked(const Block& block) const;
   bool check_and_record_proposer_equivocation_locked(const Block& block);
   Hash32 committee_epoch_randomness_for_height_locked(std::uint64_t height) const;
+  std::optional<storage::CommitteeEpochSnapshot> committee_epoch_snapshot_for_height_locked(std::uint64_t height) const;
   storage::CommitteeEpochSnapshot build_committee_epoch_snapshot_locked(std::uint64_t epoch_start_height,
                                                                         const std::vector<PubKey32>& active,
                                                                         const Hash32& epoch_randomness) const;

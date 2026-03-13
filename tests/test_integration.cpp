@@ -2157,6 +2157,93 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
   }, std::chrono::seconds(120)));
 }
 
+TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const std::string base = "/tmp/selfcoin_it_mid_epoch_vote_snapshot";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 1));
+
+  node::NodeConfig cfg;
+  cfg.disable_p2p = true;
+  cfg.node_id = 0;
+  cfg.db_path = base + "/node0";
+  cfg.p2p_port = 0;
+  cfg.genesis_path = gpath;
+  cfg.allow_unsafe_genesis_override = true;
+  cfg.network.vrf_proposer_enabled = false;
+  cfg.network.vrf_committee_enabled = true;
+  cfg.network.vrf_committee_epoch_blocks = 64;
+  cfg.network.min_block_interval_ms = 100;
+  cfg.network.round_timeout_ms = 200;
+  cfg.validator_min_bond_override = 1;
+  cfg.validator_bond_min_amount_override = 1;
+  cfg.validator_bond_max_amount_override = 1;
+  cfg.validator_warmup_blocks_override = 1;
+  cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+  cfg.validator_passphrase = "test-pass";
+
+  keystore::ValidatorKey out_key;
+  std::string kerr;
+  ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                  deterministic_seed_for_node_id(0), &out_key, &kerr));
+  node::Node n(cfg);
+  ASSERT_TRUE(n.init());
+  n.start();
+
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 5; }, std::chrono::seconds(30)));
+
+  const auto& new_val = keys[1];
+  auto request_tx = create_join_request_tx_from_validator0(n, keys[0], new_val, 1, 0);
+  ASSERT_TRUE(request_tx.has_value());
+  const auto request_txid = request_tx->txid();
+  ASSERT_TRUE(n.inject_tx_for_test(*request_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto blk = find_block_with_tx(base + "/node0", request_txid, n.status().height);
+    return blk.has_value();
+  }, std::chrono::seconds(30)));
+
+  auto approval_tx = create_join_approval_tx_from_validator0(n, keys[0], request_txid, new_val.public_key, 0);
+  ASSERT_TRUE(approval_tx.has_value());
+  ASSERT_TRUE(n.inject_tx_for_test(*approval_tx, true));
+
+  ASSERT_TRUE(wait_for([&]() {
+    auto info = n.validator_info_for_test(new_val.public_key);
+    if (!info.has_value()) return false;
+    if (info->status != consensus::ValidatorStatus::PENDING &&
+        info->status != consensus::ValidatorStatus::ACTIVE) {
+      return false;
+    }
+    auto active = n.active_validators_for_next_height_for_test();
+    return std::find(active.begin(), active.end(), new_val.public_key) != active.end();
+  }, std::chrono::seconds(30)));
+
+  const auto committee_before_rollover = n.committee_for_next_height_for_test();
+  ASSERT_TRUE(std::find(committee_before_rollover.begin(), committee_before_rollover.end(), new_val.public_key) ==
+              committee_before_rollover.end());
+
+  Vote bad_vote;
+  bad_vote.height = n.status().height + 1;
+  bad_vote.round = 0;
+  bad_vote.block_id.fill(0x5A);
+  bad_vote.validator_pubkey = new_val.public_key;
+  auto bad_sig =
+      crypto::ed25519_sign(Bytes(bad_vote.block_id.begin(), bad_vote.block_id.end()), new_val.private_key);
+  ASSERT_TRUE(bad_sig.has_value());
+  bad_vote.signature = *bad_sig;
+  ASSERT_TRUE(!n.inject_vote_for_test(bad_vote));
+
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 64; }, std::chrono::seconds(30)));
+
+  const auto committee_after_rollover = n.committee_for_next_height_for_test();
+  ASSERT_TRUE(std::find(committee_after_rollover.begin(), committee_after_rollover.end(), new_val.public_key) !=
+              committee_after_rollover.end());
+
+  n.stop();
+}
+
 TEST(test_bootstrap_join_request_without_approval_is_not_auto_approved) {
   const std::string base = "/tmp/selfcoin_it_bootstrap_joiner_no_approval";
   std::filesystem::remove_all(base);

@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import subprocess
 import threading
 import time
 import urllib.request
@@ -65,6 +66,47 @@ class MintConfig:
     mint_id: str
     operator_keys: dict[str, bytes]
     lightserver_url: str
+    reserve_privkey_hex: str
+    reserve_address: str
+    reserve_fee: int
+    cli_path: str
+
+
+_BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
+
+
+def decode_selfcoin_address(addr: str) -> bytes | None:
+    if "1" not in addr:
+        return None
+    hrp, body = addr.split("1", 1)
+    if hrp not in {"sc", "tsc"} or not body:
+        return None
+    rev = {c: i for i, c in enumerate(_BASE32_ALPHABET)}
+    out = bytearray()
+    buffer = 0
+    bits = 0
+    for c in body:
+        if c not in rev:
+            return None
+        buffer = (buffer << 5) | rev[c]
+        bits += 5
+        if bits >= 8:
+            out.append((buffer >> (bits - 8)) & 0xFF)
+            bits -= 8
+    if bits > 0 and (buffer & ((1 << bits) - 1)) != 0:
+        return None
+    if len(out) != 25 or out[0] != 0x00:
+        return None
+    payload = bytes(out[:21])
+    chk = hashlib.sha256(hrp.encode("utf-8") + b"\x00" + payload).digest()
+    chk = hashlib.sha256(chk).digest()
+    if bytes(out[21:25]) != chk[:4]:
+        return None
+    return payload[1:21]
+
+
+def p2pkh_script_pubkey(pubkey_hash: bytes) -> bytes:
+    return bytes([0x76, 0xA9, 0x14]) + pubkey_hash + bytes([0x88, 0xAC])
 
 
 def _is_probable_prime(n: int) -> bool:
@@ -519,6 +561,32 @@ def lightserver_confirmations(url: str, txid: str) -> tuple[int, int] | None:
         return None
 
 
+def lightserver_get_utxos(url: str, scripthash_hex: str) -> list[dict[str, Any]]:
+    if not url:
+        return []
+    try:
+        resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "get_utxos", "scripthash_hex": scripthash_hex})
+        if "error" in resp or "result" not in resp or not isinstance(resp["result"], list):
+            return []
+        return [item for item in resp["result"] if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def lightserver_broadcast_tx(url: str, tx_hex: str) -> tuple[bool, str]:
+    if not url:
+        return False, "lightserver url not configured"
+    try:
+        resp = rpc_post_json(url, {"jsonrpc": "2.0", "id": "mint", "method": "broadcast_tx", "tx_hex": tx_hex})
+        if "error" in resp or "result" not in resp or not isinstance(resp["result"], dict):
+            return False, "broadcast rpc failed"
+        if not bool(resp["result"].get("accepted", False)):
+            return False, str(resp["result"].get("error", "tx rejected"))
+        return True, str(resp["result"].get("txid", ""))
+    except Exception as exc:
+        return False, str(exc)
+
+
 def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
     if not entries:
         return {"dev-operator": hashlib.sha256(b"dev-operator-secret").digest()}
@@ -550,6 +618,40 @@ def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_i
         "signature_scheme": "rsa-sha256-raw",
         "operator_key_id": operator_key_id,
     }
+
+
+def build_redemption_tx(config: MintConfig, utxo: dict[str, Any], redeem_address: str, amount: int) -> tuple[str, str]:
+    cmd = [
+        config.cli_path,
+        "build_p2pkh_tx",
+        "--prev-txid",
+        str(utxo["txid"]),
+        "--prev-index",
+        str(int(utxo["vout"])),
+        "--prev-value",
+        str(int(utxo["value"])),
+        "--from-privkey",
+        config.reserve_privkey_hex,
+        "--to-address",
+        redeem_address,
+        "--amount",
+        str(amount),
+        "--fee",
+        str(config.reserve_fee),
+        "--change-address",
+        config.reserve_address,
+    ]
+    proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    txid = ""
+    tx_hex = ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("txid="):
+            txid = line.split("=", 1)[1]
+        elif line.startswith("tx_hex="):
+            tx_hex = line.split("=", 1)[1]
+    if not txid or not tx_hex:
+        raise RuntimeError("build_p2pkh_tx did not return txid/tx_hex")
+    return txid, tx_hex
 
 
 def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str):
@@ -605,6 +707,32 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 batch_id = redemption.get("redemption_batch_id")
                 if isinstance(batch_id, str):
                     self._reconcile_redemption(batch_id)
+
+        def _maybe_broadcast_redemption(self, batch_id: str) -> dict[str, Any]:
+            redemption = state.get_redemption(batch_id)
+            if not isinstance(redemption, dict):
+                raise KeyError("unknown redemption_batch_id")
+            if redemption.get("state") != "pending":
+                return redemption
+            if not config.lightserver_url or not config.reserve_privkey_hex or not config.reserve_address:
+                return redemption
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                raise ValueError("invalid reserve address")
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            candidates = [
+                item
+                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+                if int(item.get("value", 0)) >= int(redemption["amount"]) + config.reserve_fee
+            ]
+            if not candidates:
+                return redemption
+            candidates.sort(key=lambda item: int(item.get("value", 0)))
+            txid, tx_hex = build_redemption_tx(config, candidates[0], str(redemption["redeem_address"]), int(redemption["amount"]))
+            ok, err = lightserver_broadcast_tx(config.lightserver_url, tx_hex)
+            if not ok:
+                raise ValueError(err)
+            return state.update_redemption(batch_id, "broadcast", txid)
 
         def do_GET(self) -> None:
             if self.path == "/healthz":
@@ -813,10 +941,20 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             }
             try:
                 state.create_redemption(redemption)
+                updated = self._maybe_broadcast_redemption(batch_id)
             except ValueError as exc:
                 write_json(self, HTTPStatus.CONFLICT, {"error": str(exc)})
                 return
-            write_json(self, HTTPStatus.OK, {"accepted": True, "redemption_batch_id": batch_id})
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "redemption_batch_id": batch_id,
+                    "state": updated["state"],
+                    "l1_txid": updated.get("l1_txid", ""),
+                },
+            )
 
         def _handle_redemption_status(self, body: dict[str, Any]) -> None:
             batch_id = body.get("redemption_batch_id")
@@ -909,6 +1047,10 @@ def main() -> int:
         default="",
         help="Optional lightserver RPC URL used to reconcile redemption tx finalization.",
     )
+    parser.add_argument("--reserve-privkey", default="", help="Hex-encoded reserve wallet private key for redemption settlement.")
+    parser.add_argument("--reserve-address", default="", help="Reserve wallet address used for change and UTXO discovery.")
+    parser.add_argument("--reserve-fee", type=int, default=1000, help="L1 fee used for redemption settlement transactions.")
+    parser.add_argument("--cli-path", default="./build/selfcoin-cli", help="Path to selfcoin-cli used for tx construction.")
     args = parser.parse_args()
 
     operator_keys = parse_operator_keys(args.operator_key)
@@ -921,6 +1063,10 @@ def main() -> int:
         mint_id=args.mint_id,
         operator_keys=operator_keys,
         lightserver_url=args.lightserver_url,
+        reserve_privkey_hex=args.reserve_privkey,
+        reserve_address=args.reserve_address,
+        reserve_fee=args.reserve_fee,
+        cli_path=args.cli_path,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)

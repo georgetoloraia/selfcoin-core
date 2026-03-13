@@ -34,7 +34,8 @@ The Chaumian mint service must live outside this repo. It is responsible for:
 - note spend validation
 - double-spend tracking
 - reserve/accounting controls
-- redemption batching back to L1
+- redemption tx construction/broadcast from mint reserve UTXOs
+- redemption status reconciliation against finalized L1 state
 
 ## Suggested service API
 
@@ -131,6 +132,7 @@ Response:
   "l1_txid": "hex32",
   "amount": 100000
 }
+```
 
 ### 5. Redemption state update
 
@@ -155,6 +157,22 @@ Notes:
 
 - `broadcast` requires `l1_txid`
 - `finalized` is not manually set; it is derived from observed lightserver state
+
+### 5a. Automatic redemption settlement
+
+If the external mint is configured with:
+- a reserve wallet private key
+- a reserve wallet address
+- a lightserver RPC URL
+- a path to `selfcoin-cli`
+
+then `POST /redemptions/create` may immediately:
+1. discover reserve UTXOs via lightserver `get_utxos`
+2. build an L1 `build_p2pkh_tx`
+3. broadcast that tx via lightserver `broadcast_tx`
+4. transition the redemption to `broadcast`
+
+Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcast -> finalized` via observed L1 confirmation depth.
 
 ### 6. Reserve and accounting views
 

@@ -54,6 +54,7 @@ class FakeLightserver:
         self.port = port
         self.tip_height = 0
         self.tx_heights: dict[str, int] = {}
+        self.utxos_by_scripthash: dict[str, list[dict]] = {}
         self._server = ThreadingHTTPServer(("127.0.0.1", port), self._make_handler())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -94,6 +95,24 @@ class FakeLightserver:
                         }
                     self._write_json(HTTPStatus.OK, payload)
                     return
+                if method == "get_utxos":
+                    sh = body.get("scripthash_hex", "")
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": outer.utxos_by_scripthash.get(sh, []),
+                    }
+                    self._write_json(HTTPStatus.OK, payload)
+                    return
+                if method == "broadcast_tx":
+                    tx_hex = body.get("tx_hex", "")
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {"accepted": True, "txid": tx_hex[:64] if isinstance(tx_hex, str) else ""},
+                    }
+                    self._write_json(HTTPStatus.OK, payload)
+                    return
                 self._write_json(
                     HTTPStatus.OK,
                     {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "method not found"}},
@@ -129,6 +148,52 @@ class MintIntegrationTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
+                reserve_wallet = Path(td) / "reserve-wallet.json"
+                reserve_privkey = "55" * 32
+                wallet_cmd = [
+                    str(CLI),
+                    "wallet_import",
+                    "--out",
+                    str(reserve_wallet),
+                    "--privkey",
+                    reserve_privkey,
+                ]
+                wallet = subprocess.run(wallet_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                wallet_lines = dict(line.split("=", 1) for line in wallet.stdout.strip().splitlines())
+                reserve_address = wallet_lines["address"]
+
+                address_cmd = [
+                    str(CLI),
+                    "wallet_export",
+                    "--file",
+                    str(reserve_wallet),
+                ]
+                exported = subprocess.run(address_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                exported_lines = dict(line.split("=", 1) for line in exported.stdout.strip().splitlines())
+                reserve_pubkey = exported_lines["pubkey_hex"]
+                reserve_pkh_cmd = [
+                    str(CLI),
+                    "address_from_pubkey",
+                    "--pubkey",
+                    reserve_pubkey,
+                ]
+                reserve_addr_check = subprocess.run(reserve_pkh_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                self.assertEqual(reserve_addr_check.stdout.strip(), reserve_address)
+                reserve_scripthash = "0000000000000000000000000000000000000000000000000000000000000000"
+                utxo_txid = "66" * 32
+                # P2PKH script hash: sha256(76a914 || pkh || 88ac)
+                reserve_pkh = server_module.decode_selfcoin_address(reserve_address)
+                self.assertIsNotNone(reserve_pkh)
+                reserve_scripthash = __import__("hashlib").sha256(server_module.p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+                lightserver.utxos_by_scripthash[reserve_scripthash] = [
+                    {
+                        "txid": utxo_txid,
+                        "vout": 0,
+                        "value": 150000,
+                        "height": 1,
+                        "script_pubkey_hex": "",
+                    }
+                ]
                 proc = subprocess.Popen(
                     [
                         "python3",
@@ -147,6 +212,12 @@ class MintIntegrationTests(unittest.TestCase):
                         f"{operator_key_id}:{operator_secret_hex}",
                         "--lightserver-url",
                         f"http://127.0.0.1:{lightserver_port}/rpc",
+                        "--reserve-privkey",
+                        reserve_privkey,
+                        "--reserve-address",
+                        reserve_address,
+                        "--cli-path",
+                        str(CLI),
                     ],
                     cwd=REPO_ROOT,
                     stdout=subprocess.PIPE,
@@ -245,37 +316,13 @@ class MintIntegrationTests(unittest.TestCase):
                     ]
                     status = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                     status_lines = dict(line.split("=", 1) for line in status.stdout.strip().splitlines())
-                    self.assertEqual(status_lines["state"], "pending")
-                    self.assertEqual(status_lines["l1_txid"], "")
+                    self.assertEqual(status_lines["state"], "broadcast")
+                    self.assertTrue(status_lines["l1_txid"])
                     self.assertEqual(status_lines["amount"], "100000")
 
                     reserves = http_get_json(f"http://127.0.0.1:{port}/reserves")
                     self.assertEqual(reserves["available_reserve"], 0)
-
-                    l1_txid = "44" * 32
-                    update_cmd = [
-                        str(CLI),
-                        "mint_redeem_update",
-                        "--url",
-                        f"http://127.0.0.1:{port}/redemptions/update",
-                        "--batch-id",
-                        batch_id,
-                        "--state",
-                        "broadcast",
-                        "--l1-txid",
-                        l1_txid,
-                        "--operator-key-id",
-                        operator_key_id,
-                        "--operator-secret-hex",
-                        operator_secret_hex,
-                    ]
-                    update = subprocess.run(update_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                    self.assertIn('"accepted":true', update.stdout)
-
-                    broadcasted = subprocess.run(status_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                    broadcast_lines = dict(line.split("=", 1) for line in broadcasted.stdout.strip().splitlines())
-                    self.assertEqual(broadcast_lines["state"], "broadcast")
-
+                    l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
 

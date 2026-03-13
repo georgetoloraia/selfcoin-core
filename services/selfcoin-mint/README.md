@@ -12,6 +12,7 @@ It is a narrow scaffold, not a production mint:
 - deterministic RSA blind-signing for development/testing
 - persistent issuance ledger
 - reserve and accounting summary endpoints
+- automatic redemption settlement using a configured reserve wallet
 - lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
 - HMAC-signed operator admin requests
 - signed reserve attestations / audit exports
@@ -42,7 +43,11 @@ python3 services/selfcoin-mint/server.py \
   --state-file /tmp/selfcoin-mint-state.json \
   --confirmations-required 1 \
   --operator-key dev-operator:1111111111111111111111111111111111111111111111111111111111111111 \
-  --lightserver-url http://127.0.0.1:19444/rpc
+  --lightserver-url http://127.0.0.1:19444/rpc \
+  --reserve-privkey 5555555555555555555555555555555555555555555555555555555555555555 \
+  --reserve-address sc1... \
+  --reserve-fee 1000 \
+  --cli-path ./build/selfcoin-cli
 ```
 
 ## Example with selfcoin-cli
@@ -96,7 +101,8 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Deposit references are deterministic hashes of `(txid, vout, mint_id)`.
 - Blind issuance responses are deterministic RSA blind signatures derived from a local seed.
 - Each issuance creates persistent `note_ref` entries with explicit denominations.
-- Redemption batches are created with `state=pending`; operators may only advance them to `broadcast` or `rejected`.
+- If a reserve wallet and lightserver are configured, redemption batches are automatically built and broadcast as L1 transactions.
+- Redemption batches that cannot yet be funded stay `pending`; operators may still reject them or manually mark them `broadcast`.
 - `finalized` is derived from observed L1 tx status via the configured lightserver.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:
   - `X-Selfcoin-Operator-Key`

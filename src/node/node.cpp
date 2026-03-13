@@ -21,6 +21,7 @@
 #include "consensus/state_commitment.hpp"
 #include "consensus/validators.hpp"
 #include "consensus/monetary.hpp"
+#include "consensus/vrf_sortition.hpp"
 #include "common/paths.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
@@ -864,7 +865,7 @@ bool Node::has_utxo_for_test(const OutPoint& op, TxOut* out) const {
   return true;
 }
 std::string Node::proposer_path_for_next_height_for_test() const {
-  return "deterministic-leader";
+  return cfg_.network.vrf_proposer_enabled ? "vrf-threshold-proposer" : "deterministic-leader";
 }
 std::string Node::committee_path_for_next_height_for_test() const {
   return "deterministic-committee";
@@ -896,7 +897,15 @@ std::optional<consensus::ValidatorInfo> Node::validator_info_for_test(const PubK
 std::uint16_t Node::p2p_port_for_test() const { return cfg_.p2p_port; }
 
 std::optional<Block> Node::build_proposal_for_test(std::uint64_t height, std::uint32_t round) {
-  return build_proposal_block(height, round);
+  std::lock_guard<std::mutex> lk(mu_);
+  auto block = build_proposal_block(height, round);
+  if (!block.has_value()) return std::nullopt;
+  if (!cfg_.network.vrf_proposer_enabled) return block;
+  auto proof = local_proposer_vrf_locked(height, round);
+  if (!proof.has_value()) return std::nullopt;
+  block->header.vrf_proof = proof->proof;
+  block->header.vrf_output = proof->output;
+  return block;
 }
 
 std::pair<std::uint64_t, std::uint32_t> Node::v4_join_window_state_for_test() const {
@@ -929,7 +938,6 @@ void Node::event_loop() {
                 return is_committee_member_for(pub, ch, round);
               }});
       const auto committee = committee_for_height_round(h, current_round_);
-      const auto leader = leader_for_height_round(h, current_round_);
       const std::size_t quorum = consensus::quorum_threshold(committee.size());
 
       const std::uint64_t now_ms = now_unix() * 1000;
@@ -1049,7 +1057,15 @@ void Node::event_loop() {
         }
       }
 
-      const bool can_propose = leader.has_value() && *leader == local_key_.public_key;
+      std::optional<crypto::VrfProof> local_vrf;
+      bool can_propose = false;
+      if (cfg_.network.vrf_proposer_enabled) {
+        local_vrf = local_proposer_vrf_locked(h, current_round_);
+        can_propose = local_vrf.has_value();
+      } else {
+        const auto leader = leader_for_height_round(h, current_round_);
+        can_propose = leader.has_value() && *leader == local_key_.public_key;
+      }
 
       const bool block_interval_elapsed =
           now_ms >= last_finalized_progress_ms_ + static_cast<std::uint64_t>(cfg_.network.min_block_interval_ms);
@@ -1058,6 +1074,10 @@ void Node::event_loop() {
         if (proposed_in_round_.find(key) == proposed_in_round_.end()) {
           auto b = build_proposal_block(h, current_round_);
           if (b.has_value()) {
+            if (cfg_.network.vrf_proposer_enabled && local_vrf.has_value()) {
+              b->header.vrf_proof = local_vrf->proof;
+              b->header.vrf_output = local_vrf->output;
+            }
             proposed_in_round_[key] = true;
             candidate_blocks_[b->header.block_id()] = *b;
             to_propose = *b;
@@ -1358,6 +1378,7 @@ void Node::handle_message(int peer_id, std::uint16_t msg_type, const Bytes& payl
         return;
       }
       if (blk->header.height == finalized_height_ + 1 && blk->header.prev_finalized_hash == finalized_hash_) {
+        if (!verify_block_proposer_locked(*blk)) return;
         if (candidate_blocks_.size() >= kMaxCandidateBlocks ||
             (candidate_block_sizes_.size() >= kMaxCandidateBlocks &&
              candidate_block_sizes_.find(blk->header.block_id()) == candidate_block_sizes_.end())) {
@@ -1623,8 +1644,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto blk = Block::parse(msg.block_bytes);
     if (!blk.has_value()) return false;
     if (blk->header.height != msg.height || blk->header.round != msg.round) return false;
-    auto expected = leader_for_height_round(msg.height, msg.round);
-    if (!expected.has_value() || blk->header.leader_pubkey != *expected) return false;
+    if (!verify_block_proposer_locked(*blk)) return false;
 
     std::vector<Bytes> tx_bytes;
     tx_bytes.reserve(blk->txs.size());
@@ -1660,7 +1680,9 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     // once candidate block is available.
     (void)finalize_if_quorum(bid, msg.height, msg.round);
 
-    if (is_committee_member_for(local_key_.public_key, msg.height, msg.round)) {
+    const auto voters = votes_.participants_for(msg.height, msg.round);
+    if (is_committee_member_for(local_key_.public_key, msg.height, msg.round) &&
+        voters.find(local_key_.public_key) == voters.end()) {
       Bytes b_id(bid.begin(), bid.end());
       auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
       if (!sig.has_value()) return false;
@@ -1724,6 +1746,42 @@ bool Node::handle_vote(const Vote& vote, bool from_network, int from_peer_id, co
 
   if (relay_vote) broadcast_vote(vote, vrf_proof, vrf_output);
   return finalize_ok;
+}
+
+std::optional<crypto::VrfProof> Node::local_proposer_vrf_locked(std::uint64_t height, std::uint32_t round) const {
+  if (!cfg_.network.vrf_proposer_enabled) return std::nullopt;
+  const auto active = validators_.active_sorted(height);
+  if (active.empty()) return std::nullopt;
+
+  const auto transcript = consensus::proposer_vrf_transcript(cfg_.network, finalized_hash_, height, round);
+  auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);
+  if (!proof.has_value()) return std::nullopt;
+  if (!consensus::proposer_vrf_output_is_eligible(proof->output, active.size(), round,
+                                                  cfg_.network.vrf_proposer_expected_num,
+                                                  cfg_.network.vrf_proposer_expected_den)) {
+    return std::nullopt;
+  }
+  return proof;
+}
+
+bool Node::verify_block_proposer_locked(const Block& block) const {
+  if (!cfg_.network.vrf_proposer_enabled) {
+    auto expected = leader_for_height_round(block.header.height, block.header.round);
+    return expected.has_value() && block.header.leader_pubkey == *expected;
+  }
+
+  const auto active = validators_.active_sorted(block.header.height);
+  if (active.empty()) return false;
+  if (std::find(active.begin(), active.end(), block.header.leader_pubkey) == active.end()) return false;
+  if (block.header.vrf_proof.empty()) return false;
+
+  crypto::VrfProof proof;
+  proof.proof = block.header.vrf_proof;
+  proof.output = block.header.vrf_output;
+  return consensus::verify_proposer_vrf(cfg_.network, block.header.leader_pubkey, block.header.prev_finalized_hash,
+                                        block.header.height, block.header.round, proof, active.size(),
+                                        cfg_.network.vrf_proposer_expected_num,
+                                        cfg_.network.vrf_proposer_expected_den);
 }
 
 bool Node::handle_tx(const Tx& tx, bool from_network, int from_peer_id) {
@@ -1915,8 +1973,12 @@ void Node::broadcast_propose(const Block& block, const Bytes& vrf_proof, const H
   p.round = block.header.round;
   p.prev_finalized_hash = block.header.prev_finalized_hash;
   p.block_bytes = block.serialize();
-  p.vrf_proof = vrf_proof;
-  if (vrf_output) p.vrf_output = *vrf_output;
+  p.vrf_proof = !vrf_proof.empty() ? vrf_proof : block.header.vrf_proof;
+  if (vrf_output) {
+    p.vrf_output = *vrf_output;
+  } else if (!block.header.vrf_proof.empty()) {
+    p.vrf_output = block.header.vrf_output;
+  }
   if (cfg_.disable_p2p) {
     if (!running_) return;
     std::vector<Node*> peers;
@@ -2390,6 +2452,7 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
 
 std::optional<PubKey32> Node::leader_for_height_round(std::uint64_t height, std::uint32_t round) const {
   if (height == 0 || height > finalized_height_ + 1) return std::nullopt;
+  if (cfg_.network.vrf_proposer_enabled) return std::nullopt;
   const auto active = (height == finalized_height_ + 1) ? validators_.active_sorted(height) : std::vector<PubKey32>{};
   if (!active.empty()) return consensus::select_leader(finalized_hash_, height, round, active);
 

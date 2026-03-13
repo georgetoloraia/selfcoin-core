@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "consensus/validators.hpp"
+#include "consensus/vrf_sortition.hpp"
 #include "consensus/votes.hpp"
 #include "crypto/ed25519.hpp"
 #include "mempool/mempool.hpp"
@@ -190,6 +191,8 @@ class Node {
   void maybe_self_bootstrap_template(std::uint64_t now_ms);
   bool bootstrap_joiner_ready_locked(const PubKey32& pub) const;
   bool bootstrap_sync_incomplete_locked(int peer_id) const;
+  std::optional<crypto::VrfProof> local_proposer_vrf_locked(std::uint64_t height, std::uint32_t round) const;
+  bool verify_block_proposer_locked(const Block& block) const;
   std::optional<Hash32> pending_join_request_for_validator_locked(const PubKey32& pub) const;
   std::size_t pending_join_request_count_locked() const;
   bool init_mainnet_genesis();

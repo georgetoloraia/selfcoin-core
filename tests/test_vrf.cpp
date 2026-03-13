@@ -4,6 +4,8 @@
 #include <stdexcept>
 
 #include "codec/bytes.hpp"
+#include "consensus/vrf_sortition.hpp"
+#include "common/network.hpp"
 #include "crypto/ed25519.hpp"
 #include "crypto/vrf.hpp"
 
@@ -97,6 +99,29 @@ TEST(test_research_vrf_output_mismatch_fails) {
   auto tampered = *p;
   tampered.output[0] ^= 0x01;
   ASSERT_TRUE(!crypto::vrf_verify(kp.public_key, transcript, tampered));
+}
+
+TEST(test_proposer_vrf_threshold_expands_with_round) {
+  const auto t0 = consensus::proposer_vrf_threshold_u64(8, 0, 1, 1);
+  const auto t1 = consensus::proposer_vrf_threshold_u64(8, 1, 1, 1);
+  const auto t2 = consensus::proposer_vrf_threshold_u64(8, 2, 1, 1);
+  ASSERT_TRUE(t1 > t0);
+  ASSERT_TRUE(t2 > t1);
+}
+
+TEST(test_proposer_vrf_verify_roundtrip_and_eligibility) {
+  auto kp = key_from_byte(14);
+  Hash32 prev{};
+  prev.fill(0x7A);
+  const auto transcript = consensus::proposer_vrf_transcript(mainnet_network(), prev, 11, 0);
+  auto proof = crypto::vrf_prove(kp.private_key, kp.public_key, transcript);
+  ASSERT_TRUE(proof.has_value());
+
+  const bool direct_ok = crypto::vrf_verify(kp.public_key, transcript, *proof);
+  ASSERT_TRUE(direct_ok);
+
+  const bool eligible = consensus::verify_proposer_vrf(mainnet_network(), kp.public_key, prev, 11, 0, *proof, 1, 1, 1);
+  ASSERT_TRUE(eligible);
 }
 
 void register_research_vrf_tests() {}

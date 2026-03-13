@@ -48,6 +48,8 @@ struct BlockHeader {
   Hash32 merkle_root;
   PubKey32 leader_pubkey;
   std::uint32_t round{0};
+  Bytes vrf_proof;
+  Hash32 vrf_output{};
 
   Bytes serialize() const;
   static std::optional<BlockHeader> parse(const Bytes& b);

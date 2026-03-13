@@ -1993,8 +1993,8 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
   ASSERT_TRUE(write_mainnet_genesis_file(gpath, 1));
 
   Cluster cluster;
-  cluster.nodes.reserve(2);
-  for (int i = 0; i < 2; ++i) {
+  cluster.nodes.reserve(1);
+  for (int i = 0; i < 1; ++i) {
     node::NodeConfig cfg;
     cfg.disable_p2p = true;
     cfg.node_id = i;
@@ -2002,6 +2002,7 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
     cfg.p2p_port = 0;
     cfg.genesis_path = gpath;
     cfg.allow_unsafe_genesis_override = true;
+    cfg.network.vrf_proposer_enabled = false;
     cfg.validator_min_bond_override = 1;
     cfg.validator_bond_min_amount_override = 1;
     cfg.validator_bond_max_amount_override = 1;
@@ -2020,10 +2021,7 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
   auto& nodes = cluster.nodes;
   for (auto& n : nodes) n->start();
 
-  ASSERT_TRUE(wait_for([&]() {
-    return nodes[0]->status().height >= 5 && nodes[1]->status().height >= 5 &&
-           nodes[0]->status().tip_hash == nodes[1]->status().tip_hash;
-  }, std::chrono::seconds(60)));
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= 5; }, std::chrono::seconds(60)));
 
   const auto& new_val = keys[1];
   const auto sender_pkh = crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end()));

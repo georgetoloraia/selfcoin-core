@@ -19,7 +19,7 @@ struct NetworkConfig {
   std::uint16_t p2p_default_port{19440};
   std::uint16_t lightserver_default_port{19444};
   std::size_t max_committee{MAX_COMMITTEE};
-  std::uint32_t round_timeout_ms{ROUND_TIMEOUT_MS};
+  std::uint32_t round_timeout_ms{10'000};
   std::uint32_t min_block_interval_ms{8000};
   std::size_t max_payload_len{8 * 1024 * 1024};
   std::uint64_t bond_amount{BOND_AMOUNT};

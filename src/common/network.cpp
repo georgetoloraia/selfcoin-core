@@ -24,7 +24,7 @@ const NetworkConfig kMainnet{
     .p2p_default_port = 19440,
     .lightserver_default_port = 19444,
     .max_committee = MAX_COMMITTEE,
-    .round_timeout_ms = ROUND_TIMEOUT_MS,
+    .round_timeout_ms = 10'000,
     .min_block_interval_ms = 8000,
     .max_payload_len = 8 * 1024 * 1024,
     .bond_amount = BOND_AMOUNT,

@@ -41,6 +41,7 @@ add_library(selfcoin_core
   src/genesis/embedded_mainnet.cpp
   src/merkle/merkle.cpp
   src/address/address.cpp
+  src/privacy/mint_scripts.cpp
   src/utxo/tx.cpp
   src/utxo/validate.cpp
   src/utxo/signing.cpp

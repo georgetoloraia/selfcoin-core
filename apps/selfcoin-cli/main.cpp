@@ -31,6 +31,7 @@
 #include "p2p/framing.hpp"
 #include "p2p/messages.hpp"
 #include "policy/hashcash.hpp"
+#include "privacy/mint_scripts.hpp"
 #include "storage/db.hpp"
 #include "storage/snapshot.hpp"
 #include "utxo/signing.hpp"
@@ -294,6 +295,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli hashcash_stamp_tx --tx-hex <hex> [--bits <n>] [--network mainnet] [--epoch-seconds <n>] [--now <unix>] [--max-nonce <n>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
@@ -1210,6 +1212,81 @@ int main(int argc, char** argv) {
         selfcoin::Bytes(validator_priv->begin(), validator_priv->end()), payout_pub, bond_amount, fee, change_spk, &err);
     if (!tx) {
       std::cerr << "create join request tx failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_deposit_create") {
+    std::string prev_txid_hex;
+    std::uint32_t prev_index = 0;
+    std::uint64_t prev_value = 0;
+    std::string from_priv_hex;
+    std::string mint_id_hex;
+    std::string recipient_addr;
+    std::string change_addr;
+    std::uint64_t amount = 0;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--from-privkey" && i + 1 < argc) from_priv_hex = argv[++i];
+      else if (a == "--mint-id" && i + 1 < argc) mint_id_hex = argv[++i];
+      else if (a == "--recipient-address" && i + 1 < argc) recipient_addr = argv[++i];
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--amount" && i + 1 < argc) amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto prev_txid = decode_hex32(prev_txid_hex);
+    auto priv = decode_hex32(from_priv_hex);
+    auto mint_id = decode_hex32(mint_id_hex);
+    auto recipient = selfcoin::address::decode(recipient_addr);
+    if (!prev_txid.has_value() || !priv.has_value() || !mint_id.has_value() || !recipient.has_value()) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+    if (prev_value < amount + fee) {
+      std::cerr << "insufficient prev output value\n";
+      return 1;
+    }
+
+    auto kp = selfcoin::crypto::keypair_from_seed32(*priv);
+    if (!kp.has_value()) {
+      std::cerr << "invalid private key\n";
+      return 1;
+    }
+    auto from_pkh = selfcoin::crypto::h160(selfcoin::Bytes(kp->public_key.begin(), kp->public_key.end()));
+    selfcoin::OutPoint op{*prev_txid, prev_index};
+    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(from_pkh)};
+
+    std::vector<selfcoin::TxOut> outputs;
+    outputs.push_back(selfcoin::TxOut{
+        amount, selfcoin::privacy::mint_deposit_script_pubkey(*mint_id, recipient->pubkey_hash)});
+
+    const std::uint64_t change = prev_value - amount - fee;
+    if (change > 0) {
+      if (!change_addr.empty()) {
+        auto ch = selfcoin::address::decode(change_addr);
+        if (!ch.has_value()) {
+          std::cerr << "invalid --change-address\n";
+          return 1;
+        }
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash)});
+      } else {
+        outputs.push_back(selfcoin::TxOut{change, selfcoin::address::p2pkh_script_pubkey(from_pkh)});
+      }
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_signed_p2pkh_tx_single_input(op, prev_out, selfcoin::Bytes(priv->begin(), priv->end()), outputs, &err);
+    if (!tx.has_value()) {
+      std::cerr << "mint deposit tx build failed: " << err << "\n";
       return 1;
     }
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";

@@ -8,6 +8,7 @@
 #include "crypto/ed25519.hpp"
 #include "crypto/hash.hpp"
 #include "address/address.hpp"
+#include "privacy/mint_scripts.hpp"
 
 namespace selfcoin {
 
@@ -56,7 +57,7 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
          is_validator_join_approval_script(script_pubkey, nullptr, nullptr, nullptr, nullptr) ||
-         is_burn_script(script_pubkey, nullptr);
+         is_burn_script(script_pubkey, nullptr) || privacy::is_mint_deposit_script(script_pubkey, nullptr, nullptr);
 }
 
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index) {

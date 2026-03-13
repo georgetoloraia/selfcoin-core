@@ -59,13 +59,18 @@ class MintStateTests(unittest.TestCase):
             self.assertTrue(state.note_already_spent("note-b"))
             self.assertFalse(state.note_already_spent("note-c"))
 
-    def test_deterministic_placeholder_blind_signature(self) -> None:
-        seed = "seed-x"
-        mint_ref = "ref-y"
-        msg = "blind-z"
-        sig1 = server.sha256_hex([seed, mint_ref, "0", msg])
-        sig2 = server.sha256_hex([seed, mint_ref, "0", msg])
-        self.assertEqual(sig1, sig2)
+    def test_blind_signer_signs_and_verifies(self) -> None:
+        signer = server.BlindSigner.from_seed("seed-x", bits=256)
+        message = 123456789
+        signature = int(signer.sign_blinded_hex(format(message, "x")), 16)
+        self.assertEqual(pow(signature, signer.e, signer.n), message)
+
+    def test_blind_signer_is_deterministic_for_seed(self) -> None:
+        a = server.BlindSigner.from_seed("seed-a", bits=256)
+        b = server.BlindSigner.from_seed("seed-a", bits=256)
+        self.assertEqual(a.n, b.n)
+        self.assertEqual(a.e, b.e)
+        self.assertEqual(a.d, b.d)
 
 
 if __name__ == "__main__":

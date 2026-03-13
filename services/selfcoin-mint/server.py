@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import random
 import threading
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -54,6 +56,77 @@ class MintConfig:
     confirmations_required: int
     signing_seed: str
     mint_id: str
+
+
+def _is_probable_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+    for p in small_primes:
+        if n == p:
+            return True
+        if n % p == 0:
+            return False
+
+    d = n - 1
+    s = 0
+    while d % 2 == 0:
+        d //= 2
+        s += 1
+
+    for a in [2, 325, 9375, 28178, 450775, 9780504, 1795265022]:
+        if a % n == 0:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        witness = True
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                witness = False
+                break
+        if witness:
+            return False
+    return True
+
+
+def _next_prime(rng: random.Random, bits: int) -> int:
+    while True:
+        candidate = rng.getrandbits(bits)
+        candidate |= (1 << (bits - 1))
+        candidate |= 1
+        if _is_probable_prime(candidate):
+            return candidate
+
+
+@dataclass
+class BlindSigner:
+    n: int
+    e: int
+    d: int
+
+    @classmethod
+    def from_seed(cls, seed: str, bits: int = 512) -> "BlindSigner":
+        rng = random.Random(int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16))
+        e = 65537
+        while True:
+            p = _next_prime(rng, bits)
+            q = _next_prime(rng, bits)
+            if p == q:
+                continue
+            phi = (p - 1) * (q - 1)
+            if math.gcd(e, phi) == 1:
+                n = p * q
+                d = pow(e, -1, phi)
+                return cls(n=n, e=e, d=d)
+
+    def sign_blinded_hex(self, blinded_hex: str) -> str:
+        blinded = int(blinded_hex, 16)
+        if blinded <= 0 or blinded >= self.n:
+            raise ValueError("blinded message out of range")
+        signed = pow(blinded, self.d, self.n)
+        return format(signed, "x")
 
 
 class MintState:
@@ -114,7 +187,7 @@ class MintState:
             return note in self._data["spent_notes"]
 
 
-def make_handler(config: MintConfig, state: MintState):
+def make_handler(config: MintConfig, state: MintState, signer: BlindSigner):
     class MintHandler(BaseHTTPRequestHandler):
         server_version = "selfcoin-mint/0.1"
 
@@ -124,6 +197,17 @@ def make_handler(config: MintConfig, state: MintState):
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 write_json(self, HTTPStatus.OK, {"ok": True, "mint_id": config.mint_id})
+                return
+            if self.path == "/mint/key":
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    {
+                        "algorithm": "rsa-chaum-blind",
+                        "modulus_hex": format(signer.n, "x"),
+                        "public_exponent": signer.e,
+                    },
+                )
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -203,10 +287,15 @@ def make_handler(config: MintConfig, state: MintState):
                 write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown mint_deposit_ref"})
                 return
 
-            signed_blinds = [
-                sha256_hex([config.signing_seed, mint_deposit_ref, str(idx), str(msg)])
-                for idx, msg in enumerate(blinded_messages)
-            ]
+            signed_blinds = []
+            try:
+                for msg in blinded_messages:
+                    if not isinstance(msg, str) or not msg:
+                        raise ValueError("blinded message must be a non-empty hex string")
+                    signed_blinds.append(signer.sign_blinded_hex(msg))
+            except ValueError as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
             write_json(
                 self,
                 HTTPStatus.OK,
@@ -287,7 +376,8 @@ def main() -> int:
         mint_id=args.mint_id,
     )
     state = MintState(config.state_file)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state))
+    signer = BlindSigner.from_seed(config.signing_seed)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer))
     print(f"selfcoin-mint listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

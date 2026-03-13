@@ -22,6 +22,7 @@ It is a narrow scaffold, not a production mint:
 - `POST /redemptions/create`
 - `POST /redemptions/status`
 - `GET /healthz`
+- `GET /mint/key`
 
 ## Run
 
@@ -78,4 +79,5 @@ python3 services/selfcoin-mint/server.py \
 
 ```bash
 python3 -m unittest services/selfcoin-mint/test_state.py
+python3 -m unittest services/selfcoin-mint/test_integration.py
 ```

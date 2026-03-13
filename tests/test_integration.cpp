@@ -198,6 +198,40 @@ std::optional<Tx> create_bond_tx_from_validator0(node::Node& node0, const crypto
   return tx;
 }
 
+std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
+                                                         const crypto::KeyPair& new_validator,
+                                                         std::uint64_t bond_amount = BOND_AMOUNT,
+                                                         std::uint64_t fee = 0) {
+  const auto sender_pkh = crypto::h160(Bytes(validator0.public_key.begin(), validator0.public_key.end()));
+  auto utxos = node0.find_utxos_by_pubkey_hash_for_test(sender_pkh);
+  if (utxos.empty()) return std::nullopt;
+  for (const auto& [op, out] : utxos) {
+    if (out.value < bond_amount + fee) continue;
+    return build_validator_join_request_tx(op, out, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+                                           new_validator.public_key,
+                                           Bytes(new_validator.private_key.begin(), new_validator.private_key.end()),
+                                           new_validator.public_key, bond_amount, fee,
+                                           address::p2pkh_script_pubkey(sender_pkh));
+  }
+  return std::nullopt;
+}
+
+std::optional<Tx> create_join_approval_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
+                                                          const Hash32& request_txid, const PubKey32& validator_pub,
+                                                          std::uint64_t fee = 0) {
+  const auto sender_pkh = crypto::h160(Bytes(validator0.public_key.begin(), validator0.public_key.end()));
+  auto utxos = node0.find_utxos_by_pubkey_hash_for_test(sender_pkh);
+  if (utxos.empty()) return std::nullopt;
+  for (const auto& [op, out] : utxos) {
+    if (out.value < fee) continue;
+    return build_validator_join_approval_tx(op, out, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+                                            request_txid, validator_pub,
+                                            Bytes(validator0.private_key.begin(), validator0.private_key.end()),
+                                            address::p2pkh_script_pubkey(sender_pkh), fee);
+  }
+  return std::nullopt;
+}
+
 struct Cluster {
   std::vector<std::unique_ptr<node::Node>> nodes;
 
@@ -1950,78 +1984,99 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   n0.stop();
 }
 
-TEST(test_second_node_auto_joins_as_validator_on_chain) {
-  const std::string base = "/tmp/selfcoin_it_single_node_validator_join";
+TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
+  const auto keys = node::Node::deterministic_test_keypairs();
+  const std::string base = "/tmp/selfcoin_it_join_request_approval";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
-  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+  ASSERT_TRUE(write_mainnet_genesis_file(gpath, 1));
 
-  node::NodeConfig cfg0;
-  cfg0.node_id = 0;
-  cfg0.dns_seeds = false;
-  cfg0.db_path = base + "/node0";
-  cfg0.p2p_port = reserve_test_port();
-  if (cfg0.p2p_port == 0) return;
-  cfg0.genesis_path = gpath;
-  cfg0.allow_unsafe_genesis_override = true;
+  Cluster cluster;
+  cluster.nodes.reserve(2);
+  for (int i = 0; i < 2; ++i) {
+    node::NodeConfig cfg;
+    cfg.disable_p2p = true;
+    cfg.node_id = i;
+    cfg.db_path = base + "/node" + std::to_string(i);
+    cfg.p2p_port = 0;
+    cfg.genesis_path = gpath;
+    cfg.allow_unsafe_genesis_override = true;
+    cfg.validator_min_bond_override = 1;
+    cfg.validator_bond_min_amount_override = 1;
+    cfg.validator_bond_max_amount_override = 1;
+    cfg.validator_warmup_blocks_override = 1;
+    cfg.validator_key_file = cfg.db_path + "/keystore/validator.json";
+    cfg.validator_passphrase = "test-pass";
 
-  node::Node n0(cfg0);
-  if (!n0.init()) return;
-  n0.start();
-  const auto port0 = n0.p2p_port_for_test();
-  if (port0 == 0) {
-    n0.stop();
-    return;
+    keystore::ValidatorKey out_key;
+    std::string kerr;
+    ASSERT_TRUE(keystore::create_validator_keystore(cfg.validator_key_file, cfg.validator_passphrase, "mainnet", "sc",
+                                                    deterministic_seed_for_node_id(i), &out_key, &kerr));
+    auto n = std::make_unique<node::Node>(cfg);
+    ASSERT_TRUE(n->init());
+    cluster.nodes.push_back(std::move(n));
   }
-  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(12)));
-
-  node::NodeConfig cfg1;
-  cfg1.node_id = 1;
-  cfg1.dns_seeds = false;
-  cfg1.db_path = base + "/node1";
-  cfg1.p2p_port = reserve_test_port();
-  if (cfg1.p2p_port == 0) {
-    n0.stop();
-    return;
-  }
-  cfg1.genesis_path = gpath;
-  cfg1.allow_unsafe_genesis_override = true;
-  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
-
-  node::Node n1(cfg1);
-  if (!n1.init()) {
-    n0.stop();
-    return;
-  }
-  n1.start();
+  auto& nodes = cluster.nodes;
+  for (auto& n : nodes) n->start();
 
   ASSERT_TRUE(wait_for([&]() {
-    const auto a0 = n0.active_validators_for_next_height_for_test();
-    const auto a1 = n1.active_validators_for_next_height_for_test();
-    return a0.size() >= 2 && a1.size() >= 2;
-  }, std::chrono::seconds(45)));
+    return nodes[0]->status().height >= 5 && nodes[1]->status().height >= 5 &&
+           nodes[0]->status().tip_hash == nodes[1]->status().tip_hash;
+  }, std::chrono::seconds(60)));
 
-  const auto a0 = n0.active_validators_for_next_height_for_test();
-  const auto a1 = n1.active_validators_for_next_height_for_test();
-  ASSERT_EQ(a0.size(), 2u);
-  ASSERT_EQ(a1.size(), 2u);
+  const auto& new_val = keys[1];
+  const auto sender_pkh = crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end()));
+  const auto funding_utxos = nodes[0]->find_utxos_by_pubkey_hash_for_test(sender_pkh);
+  ASSERT_TRUE(!funding_utxos.empty());
+
+  auto request_tx = create_join_request_tx_from_validator0(*nodes[0], keys[0], new_val, 1, 0);
+  ASSERT_TRUE(request_tx.has_value());
+  const auto request_txid = request_tx->txid();
+  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*request_tx, true));
+
   ASSERT_TRUE(wait_for([&]() {
-    const auto s0 = n0.status();
-    const auto s1 = n1.status();
-    return s0.height == s1.height && s0.tip_hash == s1.tip_hash && s0.height >= 120;
-  }, std::chrono::seconds(20)));
-  const auto s0 = n0.status();
-  const auto s1 = n1.status();
-  ASSERT_TRUE(!s0.bootstrap_validator_pubkey.empty());
-  ASSERT_EQ(s1.bootstrap_validator_pubkey, s0.bootstrap_validator_pubkey);
+    auto blk = find_block_with_tx(base + "/node0", request_txid, nodes[0]->status().height);
+    return blk.has_value();
+  }, std::chrono::seconds(60)));
 
-  n1.stop();
-  n0.stop();
+  const auto height_after_request = nodes[0]->status().height;
+  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= height_after_request + 3; }, std::chrono::seconds(60)));
+
+  for (const auto& n : nodes) {
+    ASSERT_TRUE(!n->validator_info_for_test(new_val.public_key).has_value());
+    ASSERT_EQ(n->active_validators_for_next_height_for_test().size(), 1u);
+  }
+
+  auto approval_tx = create_join_approval_tx_from_validator0(*nodes[0], keys[0], request_txid, new_val.public_key, 0);
+  ASSERT_TRUE(approval_tx.has_value());
+  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*approval_tx, true));
+
+  std::uint64_t joined_height = 0;
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto info = n->validator_info_for_test(new_val.public_key);
+      if (!info.has_value()) return false;
+      if (info->status != consensus::ValidatorStatus::PENDING &&
+          info->status != consensus::ValidatorStatus::ACTIVE) {
+        return false;
+      }
+      joined_height = info->joined_height;
+    }
+    return joined_height > 0;
+  }, std::chrono::seconds(60)));
+
+  ASSERT_TRUE(wait_for([&]() {
+    for (const auto& n : nodes) {
+      auto active = n->active_validators_for_next_height_for_test();
+      if (std::find(active.begin(), active.end(), new_val.public_key) == active.end()) return false;
+    }
+    return true;
+  }, std::chrono::seconds(120)));
 }
 
-TEST(test_bootstrap_joiner_is_not_sponsored_until_synced) {
-  const std::string base = "/tmp/selfcoin_it_bootstrap_joiner_waits_for_sync";
+TEST(test_bootstrap_join_request_without_approval_is_not_auto_approved) {
+  const std::string base = "/tmp/selfcoin_it_bootstrap_joiner_no_approval";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
   const std::string gpath = base + "/genesis.json";
@@ -2048,34 +2103,68 @@ TEST(test_bootstrap_joiner_is_not_sponsored_until_synced) {
     n0.stop();
     return;
   }
-  ASSERT_TRUE(wait_for_tip(n0, 3, std::chrono::seconds(12)));
+  ASSERT_TRUE(wait_for_tip(n0, 5, std::chrono::seconds(20)));
 
-  const auto joiner = key_from_byte(99);
-  p2p::VersionMsg v;
-  v.proto_version = static_cast<std::uint32_t>(cfg0.network.protocol_version);
-  v.network_id = cfg0.network.network_id;
-  v.feature_flags = cfg0.network.feature_flags;
-  v.timestamp = static_cast<std::uint64_t>(::time(nullptr));
-  v.nonce = 424242;
-  v.start_height = 0;
-  v.start_hash = zero_hash();
-  v.node_software_version =
-      "selfcoin-tests/0.7;genesis=" + n0.status().genesis_hash + ";network_id=" +
-      hex_encode(Bytes(cfg0.network.network_id.begin(), cfg0.network.network_id.end())) + ";cv=7;validator_pubkey=" +
-      hex_encode(Bytes(joiner.public_key.begin(), joiner.public_key.end()));
+  node::NodeConfig cfg1;
+  cfg1.node_id = 1;
+  cfg1.dns_seeds = false;
+  cfg1.db_path = base + "/node1";
+  cfg1.p2p_port = reserve_test_port();
+  if (cfg1.p2p_port == 0) {
+    n0.stop();
+    return;
+  }
+  cfg1.genesis_path = gpath;
+  cfg1.allow_unsafe_genesis_override = true;
+  cfg1.validator_min_bond_override = 1;
+  cfg1.validator_bond_min_amount_override = 1;
+  cfg1.validator_bond_max_amount_override = 1;
+  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
 
-  int fd = connect_bootstrap_joiner_without_sync("127.0.0.1", port0, v, cfg0.network);
-  ASSERT_TRUE(fd >= 0);
+  node::Node n1(cfg1);
+  if (!n1.init()) {
+    n0.stop();
+    return;
+  }
+  n1.start();
 
-  ASSERT_TRUE(wait_for([&]() { return n0.status().pending_bootstrap_joiners >= 1; }, std::chrono::seconds(5)));
-  std::this_thread::sleep_for(std::chrono::seconds(6));
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.established_peers >= 1 && s1.established_peers >= 1 && s1.height >= 5;
+  }, std::chrono::seconds(30)));
 
-  const auto info = n0.validator_info_for_test(joiner.public_key);
-  ASSERT_TRUE(!info.has_value());
+  const std::string leader_key_path = keystore::default_validator_keystore_path(cfg0.db_path);
+  keystore::ValidatorKey leader_vk;
+  std::string err;
+  ASSERT_TRUE(keystore::load_validator_keystore(leader_key_path, "", &leader_vk, &err));
+
+  const std::string key_path = keystore::default_validator_keystore_path(cfg1.db_path);
+  keystore::ValidatorKey joiner_vk;
+  ASSERT_TRUE(keystore::load_validator_keystore(key_path, "", &joiner_vk, &err));
+
+  crypto::KeyPair leader_kp{Bytes(leader_vk.privkey.begin(), leader_vk.privkey.end()), leader_vk.pubkey};
+  crypto::KeyPair joiner_kp{Bytes(joiner_vk.privkey.begin(), joiner_vk.privkey.end()), joiner_vk.pubkey};
+  auto request_tx = create_join_request_tx_from_validator0(n0, leader_kp, joiner_kp, 1, 0);
+  ASSERT_TRUE(request_tx.has_value());
+  const auto request_txid = request_tx->txid();
+  ASSERT_TRUE(n0.inject_tx_for_test(*request_tx, true));
+
+  ASSERT_TRUE(wait_for(std::function<bool()>{[&]() {
+    auto blk = find_block_with_tx(base + "/node0", request_txid, n0.status().height);
+    return blk.has_value();
+  }}, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(60))));
+
+  const auto height_after_request = n0.status().height;
+  ASSERT_TRUE(wait_for(std::function<bool()>{[&]() { return n0.status().height >= height_after_request + 3; }},
+                       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(60))));
+
+  ASSERT_EQ(n0.status().pending_bootstrap_joiners, 1u);
+  ASSERT_TRUE(!n0.validator_info_for_test(joiner_vk.pubkey).has_value());
   ASSERT_EQ(n0.active_validators_for_next_height_for_test().size(), 1u);
+  ASSERT_EQ(n1.active_validators_for_next_height_for_test().size(), 1u);
 
-  ::shutdown(fd, SHUT_RDWR);
-  ::close(fd);
+  n1.stop();
   n0.stop();
 }
 

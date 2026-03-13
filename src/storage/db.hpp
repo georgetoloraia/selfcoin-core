@@ -56,6 +56,8 @@ class DB {
 
   bool put_validator(const PubKey32& pub, const consensus::ValidatorInfo& info);
   std::map<PubKey32, consensus::ValidatorInfo> load_validators() const;
+  bool put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req);
+  std::map<Hash32, ValidatorJoinRequest> load_validator_join_requests() const;
 
   struct TxLocation {
     std::uint64_t height{0};

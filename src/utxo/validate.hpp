@@ -34,6 +34,8 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
                                const SpecialValidationContext* ctx = nullptr);
 std::optional<Bytes> signing_message_for_input(const Tx& tx, std::uint32_t input_index);
 std::optional<Bytes> unbond_message_for_input(const Tx& tx, std::uint32_t input_index);
+Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const PubKey32& payout_pubkey);
+Bytes validator_join_approval_message(const Hash32& request_txid, const PubKey32& validator_pubkey);
 bool is_p2pkh_script_pubkey(const Bytes& script_pubkey, std::array<std::uint8_t, 20>* out_hash = nullptr);
 bool is_p2pkh_script_sig(const Bytes& script_sig, Sig64* out_sig = nullptr, PubKey32* out_pub = nullptr);
 bool is_supported_base_layer_output_script(const Bytes& script_pubkey);

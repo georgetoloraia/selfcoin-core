@@ -293,6 +293,7 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
   }
 
   auto apply_validator_changes = [&](const Block& block, std::uint64_t h) {
+    std::map<Hash32, ValidatorJoinRequest> join_requests;
     for (size_t txi = 1; txi < block.txs.size(); ++txi) {
       for (const auto& in : block.txs[txi].inputs) {
         const OutPoint op{in.prev_txid, in.prev_index};
@@ -307,10 +308,49 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
     }
     for (const auto& tx : block.txs) {
       const Hash32 txid = tx.txid();
+      std::set<PubKey32> requested_in_tx;
+      for (std::uint32_t i = 0; i < tx.outputs.size(); ++i) {
+        PubKey32 pub{};
+        PubKey32 payout{};
+        Sig64 pop{};
+        if (!is_validator_join_request_script(tx.outputs[i].script_pubkey, &pub, &payout, &pop)) continue;
+        for (std::uint32_t bond_i = 0; bond_i < tx.outputs.size(); ++bond_i) {
+          PubKey32 bond_pub{};
+          if (!is_validator_register_script(tx.outputs[bond_i].script_pubkey, &bond_pub) || bond_pub != pub) continue;
+          ValidatorJoinRequest req;
+          req.request_txid = txid;
+          req.validator_pubkey = pub;
+          req.payout_pubkey = payout;
+          req.bond_outpoint = OutPoint{txid, bond_i};
+          req.bond_amount = tx.outputs[bond_i].value;
+          req.requested_height = h;
+          req.status = ValidatorJoinRequestStatus::REQUESTED;
+          join_requests[txid] = req;
+          requested_in_tx.insert(pub);
+          break;
+        }
+      }
       for (std::uint32_t i = 0; i < tx.outputs.size(); ++i) {
         PubKey32 pub{};
         if (tx.outputs[i].value == BOND_AMOUNT && is_validator_register_script(tx.outputs[i].script_pubkey, &pub)) {
+          if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
           vr.register_bond(pub, OutPoint{txid, i}, h);
+          continue;
+        }
+        Hash32 request_txid{};
+        PubKey32 validator_pub{};
+        PubKey32 approver_pub{};
+        Sig64 approval_sig{};
+        if (is_validator_join_approval_script(tx.outputs[i].script_pubkey, &request_txid, &validator_pub, &approver_pub,
+                                              &approval_sig)) {
+          auto it = join_requests.find(request_txid);
+          if (it == join_requests.end()) continue;
+          auto& req = it->second;
+          if (req.validator_pubkey != validator_pub) continue;
+          if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = h;
+          vr.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
         }
       }
     }

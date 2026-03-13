@@ -112,6 +112,73 @@ std::optional<Tx> build_unbond_tx(const OutPoint& bond_outpoint, const PubKey32&
   return tx;
 }
 
+std::optional<Tx> build_validator_join_request_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+                                                  const Bytes& funding_privkey_32, const PubKey32& validator_pubkey,
+                                                  const Bytes& validator_privkey_32, const PubKey32& payout_pubkey,
+                                                  std::uint64_t bond_amount, std::uint64_t fee,
+                                                  const Bytes& change_script_pubkey, std::string* err) {
+  if (prev_out.value < bond_amount + fee) {
+    if (err) *err = "insufficient prev value for bond + fee";
+    return std::nullopt;
+  }
+  auto pop = crypto::ed25519_sign(validator_join_request_pop_message(validator_pubkey, payout_pubkey), validator_privkey_32);
+  if (!pop.has_value()) {
+    if (err) *err = "failed to sign join request proof";
+    return std::nullopt;
+  }
+
+  Bytes reg_spk{'S', 'C', 'V', 'A', 'L', 'R', 'E', 'G'};
+  reg_spk.insert(reg_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  Bytes req_spk{'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+  req_spk.insert(req_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  req_spk.insert(req_spk.end(), payout_pubkey.begin(), payout_pubkey.end());
+  req_spk.insert(req_spk.end(), pop->begin(), pop->end());
+
+  std::vector<TxOut> outputs{TxOut{bond_amount, reg_spk}, TxOut{0, req_spk}};
+  const std::uint64_t change = prev_out.value - bond_amount - fee;
+  if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
+  return build_signed_p2pkh_tx_single_input(prev_outpoint, prev_out, funding_privkey_32, outputs, err);
+}
+
+std::optional<Tx> build_validator_join_approval_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
+                                                   const Bytes& funding_privkey_32, const Hash32& request_txid,
+                                                   const PubKey32& validator_pubkey,
+                                                   const Bytes& approver_privkey_32,
+                                                   const Bytes& change_script_pubkey, std::uint64_t fee,
+                                                   std::string* err) {
+  if (prev_out.value < fee) {
+    if (err) *err = "fee exceeds prev value";
+    return std::nullopt;
+  }
+  std::array<std::uint8_t, 32> seed{};
+  if (approver_privkey_32.size() != 32) {
+    if (err) *err = "approver private key must be 32 bytes";
+    return std::nullopt;
+  }
+  std::copy(approver_privkey_32.begin(), approver_privkey_32.end(), seed.begin());
+  auto kp = crypto::keypair_from_seed32(seed);
+  if (!kp.has_value()) {
+    if (err) *err = "failed to derive approver keypair";
+    return std::nullopt;
+  }
+  auto approval_sig = crypto::ed25519_sign(validator_join_approval_message(request_txid, validator_pubkey), approver_privkey_32);
+  if (!approval_sig.has_value()) {
+    if (err) *err = "failed to sign validator join approval";
+    return std::nullopt;
+  }
+
+  Bytes approve_spk{'S', 'C', 'V', 'A', 'L', 'J', 'A', 'P'};
+  approve_spk.insert(approve_spk.end(), request_txid.begin(), request_txid.end());
+  approve_spk.insert(approve_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
+  approve_spk.insert(approve_spk.end(), kp->public_key.begin(), kp->public_key.end());
+  approve_spk.insert(approve_spk.end(), approval_sig->begin(), approval_sig->end());
+
+  std::vector<TxOut> outputs{TxOut{0, approve_spk}};
+  const std::uint64_t change = prev_out.value - fee;
+  if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
+  return build_signed_p2pkh_tx_single_input(prev_outpoint, prev_out, funding_privkey_32, outputs, err);
+}
+
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee, std::string* err) {
   if (bond_value < fee) {

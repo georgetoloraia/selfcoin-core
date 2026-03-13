@@ -274,6 +274,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli address_from_pubkey --hrp <sc> --pubkey <hex32>\n"
               << "  selfcoin-cli build_p2pkh_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
+              << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_unbond_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --validator-pubkey <hex32> --validator-privkey <hex32> [--fee <u64>]\n"
               << "  selfcoin-cli create_slash_tx --bond-txid <hex32> --bond-index <u32> --bond-value <u64> --a-height <u64> --a-round <u32> --a-block <hex32> --a-pub <hex32> --a-sig <hex64> --b-height <u64> --b-round <u32> --b-block <hex32> --b-pub <hex32> --b-sig <hex64> [--fee <u64>]\n"
               << "  selfcoin-cli genesis_build --in <genesis.json> --out <genesis.bin>\n"
@@ -1029,6 +1031,145 @@ int main(int argc, char** argv) {
     auto tx = selfcoin::build_signed_p2pkh_tx_single_input(op, prev_out, selfcoin::Bytes(priv->begin(), priv->end()), outputs, &err);
     if (!tx) {
       std::cerr << "create bond tx failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "create_validator_join_request_tx") {
+    std::string prev_txid_hex;
+    std::uint32_t prev_index = 0;
+    std::uint64_t prev_value = 0;
+    std::string funding_priv_hex;
+    std::string validator_priv_hex;
+    std::string payout_pub_hex;
+    std::string change_addr;
+    std::uint64_t bond_amount = selfcoin::BOND_AMOUNT;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--funding-privkey" && i + 1 < argc) funding_priv_hex = argv[++i];
+      else if (a == "--validator-privkey" && i + 1 < argc) validator_priv_hex = argv[++i];
+      else if (a == "--payout-pubkey" && i + 1 < argc) payout_pub_hex = argv[++i];
+      else if (a == "--bond-amount" && i + 1 < argc) bond_amount = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto prev_txid = decode_hex32(prev_txid_hex);
+    auto funding_priv = decode_hex32(funding_priv_hex);
+    auto validator_priv = decode_hex32(validator_priv_hex);
+    if (!prev_txid || !funding_priv || !validator_priv) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+
+    auto funding_kp = selfcoin::crypto::keypair_from_seed32(*funding_priv);
+    auto validator_kp = selfcoin::crypto::keypair_from_seed32(*validator_priv);
+    if (!funding_kp || !validator_kp) {
+      std::cerr << "invalid private key\n";
+      return 1;
+    }
+    selfcoin::PubKey32 payout_pub = validator_kp->public_key;
+    if (!payout_pub_hex.empty()) {
+      auto payout = decode_hex32(payout_pub_hex);
+      if (!payout) {
+        std::cerr << "invalid payout pubkey\n";
+        return 1;
+      }
+      payout_pub = *payout;
+    }
+
+    auto funding_pkh = selfcoin::crypto::h160(selfcoin::Bytes(funding_kp->public_key.begin(), funding_kp->public_key.end()));
+    selfcoin::OutPoint op{*prev_txid, prev_index};
+    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(funding_pkh)};
+    selfcoin::Bytes change_spk = selfcoin::address::p2pkh_script_pubkey(funding_pkh);
+    if (!change_addr.empty()) {
+      auto ch = selfcoin::address::decode(change_addr);
+      if (!ch) {
+        std::cerr << "invalid change address\n";
+        return 1;
+      }
+      change_spk = selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash);
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_validator_join_request_tx(
+        op, prev_out, selfcoin::Bytes(funding_priv->begin(), funding_priv->end()), validator_kp->public_key,
+        selfcoin::Bytes(validator_priv->begin(), validator_priv->end()), payout_pub, bond_amount, fee, change_spk, &err);
+    if (!tx) {
+      std::cerr << "create join request tx failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
+    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
+    return 0;
+  }
+
+  if (cmd == "create_validator_join_approval_tx") {
+    std::string prev_txid_hex;
+    std::uint32_t prev_index = 0;
+    std::uint64_t prev_value = 0;
+    std::string funding_priv_hex;
+    std::string approver_priv_hex;
+    std::string request_txid_hex;
+    std::string validator_pub_hex;
+    std::string change_addr;
+    std::uint64_t fee = 0;
+
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
+      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+      else if (a == "--funding-privkey" && i + 1 < argc) funding_priv_hex = argv[++i];
+      else if (a == "--approver-privkey" && i + 1 < argc) approver_priv_hex = argv[++i];
+      else if (a == "--request-txid" && i + 1 < argc) request_txid_hex = argv[++i];
+      else if (a == "--validator-pubkey" && i + 1 < argc) validator_pub_hex = argv[++i];
+      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
+      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
+    }
+
+    auto prev_txid = decode_hex32(prev_txid_hex);
+    auto funding_priv = decode_hex32(funding_priv_hex);
+    auto approver_priv = decode_hex32(approver_priv_hex);
+    auto request_txid = decode_hex32(request_txid_hex);
+    auto validator_pub = decode_hex32(validator_pub_hex);
+    if (!prev_txid || !funding_priv || !approver_priv || !request_txid || !validator_pub) {
+      std::cerr << "invalid required args\n";
+      return 1;
+    }
+
+    auto funding_kp = selfcoin::crypto::keypair_from_seed32(*funding_priv);
+    if (!funding_kp) {
+      std::cerr << "invalid funding private key\n";
+      return 1;
+    }
+    auto funding_pkh = selfcoin::crypto::h160(selfcoin::Bytes(funding_kp->public_key.begin(), funding_kp->public_key.end()));
+    selfcoin::OutPoint op{*prev_txid, prev_index};
+    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(funding_pkh)};
+    selfcoin::Bytes change_spk = selfcoin::address::p2pkh_script_pubkey(funding_pkh);
+    if (!change_addr.empty()) {
+      auto ch = selfcoin::address::decode(change_addr);
+      if (!ch) {
+        std::cerr << "invalid change address\n";
+        return 1;
+      }
+      change_spk = selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash);
+    }
+
+    std::string err;
+    auto tx = selfcoin::build_validator_join_approval_tx(
+        op, prev_out, selfcoin::Bytes(funding_priv->begin(), funding_priv->end()), *request_txid, *validator_pub,
+        selfcoin::Bytes(approver_priv->begin(), approver_priv->end()), change_spk, fee, &err);
+    if (!tx) {
+      std::cerr << "create join approval tx failed: " << err << "\n";
       return 1;
     }
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";

@@ -311,6 +311,43 @@ bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey) {
   return true;
 }
 
+bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey,
+                                      PubKey32* out_payout_pubkey, Sig64* out_pop) {
+  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'J', 'R', 'Q'};
+  if (script.size() != 136) return false;
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  if (out_validator_pubkey) {
+    std::copy(script.begin() + 8, script.begin() + 40, out_validator_pubkey->begin());
+  }
+  if (out_payout_pubkey) {
+    std::copy(script.begin() + 40, script.begin() + 72, out_payout_pubkey->begin());
+  }
+  if (out_pop) {
+    std::copy(script.begin() + 72, script.end(), out_pop->begin());
+  }
+  return true;
+}
+
+bool is_validator_join_approval_script(const Bytes& script, Hash32* out_request_txid,
+                                       PubKey32* out_validator_pubkey, PubKey32* out_approver_pubkey, Sig64* out_sig) {
+  static const std::array<std::uint8_t, 8> prefix = {'S', 'C', 'V', 'A', 'L', 'J', 'A', 'P'};
+  if (script.size() != 168) return false;
+  if (!std::equal(prefix.begin(), prefix.end(), script.begin())) return false;
+  if (out_request_txid) {
+    std::copy(script.begin() + 8, script.begin() + 40, out_request_txid->begin());
+  }
+  if (out_validator_pubkey) {
+    std::copy(script.begin() + 40, script.begin() + 72, out_validator_pubkey->begin());
+  }
+  if (out_approver_pubkey) {
+    std::copy(script.begin() + 72, script.begin() + 104, out_approver_pubkey->begin());
+  }
+  if (out_sig) {
+    std::copy(script.begin() + 104, script.end(), out_sig->begin());
+  }
+  return true;
+}
+
 bool is_burn_script(const Bytes& script, Hash32* out_evidence_hash) {
   static const std::array<std::uint8_t, 6> prefix = {'S', 'C', 'B', 'U', 'R', 'N'};
   if (script.size() != 38) return false;

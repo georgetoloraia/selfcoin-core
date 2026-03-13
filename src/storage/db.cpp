@@ -154,6 +154,51 @@ std::optional<consensus::ValidatorInfo> parse_validator(const Bytes& b) {
   return info;
 }
 
+Bytes serialize_validator_join_request(const ValidatorJoinRequest& req) {
+  codec::ByteWriter w;
+  w.bytes_fixed(req.request_txid);
+  w.bytes_fixed(req.validator_pubkey);
+  w.bytes_fixed(req.payout_pubkey);
+  w.bytes_fixed(req.bond_outpoint.txid);
+  w.u32le(req.bond_outpoint.index);
+  w.u64le(req.bond_amount);
+  w.u64le(req.requested_height);
+  w.u64le(req.approved_height);
+  w.u8(static_cast<std::uint8_t>(req.status));
+  return w.take();
+}
+
+std::optional<ValidatorJoinRequest> parse_validator_join_request(const Bytes& b) {
+  ValidatorJoinRequest req;
+  if (!codec::parse_exact(b, [&](codec::ByteReader& r) {
+        auto request_txid = r.bytes_fixed<32>();
+        auto validator_pub = r.bytes_fixed<32>();
+        auto payout_pub = r.bytes_fixed<32>();
+        auto bond_txid = r.bytes_fixed<32>();
+        auto bond_index = r.u32le();
+        auto bond_amount = r.u64le();
+        auto requested_height = r.u64le();
+        auto approved_height = r.u64le();
+        auto status = r.u8();
+        if (!request_txid || !validator_pub || !payout_pub || !bond_txid || !bond_index || !bond_amount ||
+            !requested_height || !approved_height || !status) {
+          return false;
+        }
+        req.request_txid = *request_txid;
+        req.validator_pubkey = *validator_pub;
+        req.payout_pubkey = *payout_pub;
+        req.bond_outpoint = OutPoint{*bond_txid, *bond_index};
+        req.bond_amount = *bond_amount;
+        req.requested_height = *requested_height;
+        req.approved_height = *approved_height;
+        req.status = static_cast<ValidatorJoinRequestStatus>(*status);
+        return true;
+      })) {
+    return std::nullopt;
+  }
+  return req;
+}
+
 Bytes u64be_bytes(std::uint64_t v) {
   Bytes out(8);
   for (int i = 7; i >= 0; --i) {
@@ -180,6 +225,9 @@ std::string key_height(std::uint64_t height) {
 }
 std::string key_utxo(const OutPoint& op) { return "U:" + hex_encode(serialize_outpoint(op)); }
 std::string key_validator(const PubKey32& pub) { return "V:" + hex_encode(Bytes(pub.begin(), pub.end())); }
+std::string key_validator_join_request(const Hash32& request_txid) {
+  return "VJR:" + hex_encode(Bytes(request_txid.begin(), request_txid.end()));
+}
 std::string key_txidx(const Hash32& txid) { return "X:" + hex_encode(Bytes(txid.begin(), txid.end())); }
 std::string key_su_prefix(const Hash32& scripthash) {
   return "SU:" + hex_encode(Bytes(scripthash.begin(), scripthash.end())) + ":";
@@ -370,6 +418,24 @@ std::map<PubKey32, consensus::ValidatorInfo> DB::load_validators() const {
     PubKey32 pub{};
     std::copy(b->begin(), b->end(), pub.begin());
     out[pub] = *info;
+  }
+  return out;
+}
+
+bool DB::put_validator_join_request(const Hash32& request_txid, const ValidatorJoinRequest& req) {
+  return put(key_validator_join_request(request_txid), serialize_validator_join_request(req));
+}
+
+std::map<Hash32, ValidatorJoinRequest> DB::load_validator_join_requests() const {
+  std::map<Hash32, ValidatorJoinRequest> out;
+  for (const auto& [k, v] : scan_prefix("VJR:")) {
+    auto hex = k.substr(4);
+    auto b = hex_decode(hex);
+    auto req = parse_validator_join_request(v);
+    if (!b.has_value() || b->size() != 32 || !req.has_value()) continue;
+    Hash32 request_txid{};
+    std::copy(b->begin(), b->end(), request_txid.begin());
+    out[request_txid] = *req;
   }
   return out;
 }

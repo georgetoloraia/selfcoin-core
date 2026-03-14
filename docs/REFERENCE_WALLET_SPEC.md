@@ -43,6 +43,10 @@ Implemented now in `selfcoin-wallet`:
   - grouped private note inventory by denomination
   - recent deposit list
   - recent redemption/status list
+- classic detail surfaces for:
+  - latest on-chain transaction dialog
+  - latest mint activity dialog
+  - clearer `pending / finalized / failed` badge-style history rows
 
 Intentionally deferred to the next wallet phase:
 - QR rendering

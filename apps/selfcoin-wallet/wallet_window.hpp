@@ -48,6 +48,22 @@ class WalletWindow final : public QMainWindow {
     selfcoin::Bytes script_pubkey;
   };
 
+  struct ChainRecord {
+    QString status;
+    QString kind;
+    QString amount;
+    QString txid;
+    QString details;
+  };
+
+  struct MintRecord {
+    QString status;
+    QString kind;
+    QString reference;
+    QString amount;
+    QString details;
+  };
+
   void build_ui();
   void load_settings();
   void save_settings() const;
@@ -68,6 +84,8 @@ class WalletWindow final : public QMainWindow {
   void save_connection_settings();
   void validate_send_form();
   void submit_send();
+  void show_latest_chain_detail();
+  void show_latest_mint_detail();
   void submit_mint_deposit();
   void issue_mint_note();
   void submit_mint_redemption();
@@ -89,6 +107,7 @@ class WalletWindow final : public QMainWindow {
   QLabel* receive_address_label_{nullptr};
   QPlainTextEdit* history_view_{nullptr};
   QLabel* tip_status_label_{nullptr};
+  QPushButton* history_detail_button_{nullptr};
 
   QLineEdit* send_address_edit_{nullptr};
   QLineEdit* send_amount_edit_{nullptr};
@@ -107,6 +126,7 @@ class WalletWindow final : public QMainWindow {
   QPlainTextEdit* mint_deposits_view_{nullptr};
   QPlainTextEdit* mint_notes_view_{nullptr};
   QPlainTextEdit* mint_redemptions_view_{nullptr};
+  QPushButton* mint_detail_button_{nullptr};
 
   QLineEdit* lightserver_url_edit_{nullptr};
   QLineEdit* mint_url_edit_{nullptr};
@@ -124,6 +144,8 @@ class WalletWindow final : public QMainWindow {
   std::uint32_t mint_last_deposit_vout_{0};
   QString mint_last_redemption_batch_id_;
   std::vector<MintNote> mint_notes_;
+  std::vector<ChainRecord> chain_records_;
+  std::vector<MintRecord> mint_records_;
   WalletStore store_;
 };
 

@@ -154,6 +154,19 @@ QString extract_field_value(const QString& line, const QString& field) {
   return line.mid(pos + needle.size(), end - (pos + needle.size())).trimmed();
 }
 
+QString badge_text(const QString& status) {
+  const QString upper = status.trimmed().toUpper();
+  return upper.isEmpty() ? "[INFO]" : "[" + upper + "]";
+}
+
+QString mint_state_badge(const QString& state) {
+  const QString lower = state.trimmed().toLower();
+  if (lower == "finalized" || lower == "issued") return "FINALIZED";
+  if (lower == "broadcast" || lower == "pending" || lower == "registered") return "PENDING";
+  if (lower == "rejected" || lower == "failed") return "FAILED";
+  return state.trimmed().isEmpty() ? "INFO" : state.trimmed().toUpper();
+}
+
 std::optional<std::vector<std::size_t>> choose_note_subset_exact(const std::vector<selfcoin::wallet::WalletWindow::MintNote>& notes,
                                                                  std::uint64_t target) {
   std::map<std::uint64_t, std::vector<std::size_t>> reachable;
@@ -294,6 +307,11 @@ void WalletWindow::build_ui() {
 
   auto* history = new QWidget(this);
   auto* history_layout = new QVBoxLayout(history);
+  auto* history_actions = new QHBoxLayout();
+  history_detail_button_ = new QPushButton("Latest Transaction Details", history);
+  history_actions->addStretch(1);
+  history_actions->addWidget(history_detail_button_);
+  history_layout->addLayout(history_actions);
   history_view_ = new QPlainTextEdit(history);
   history_view_->setReadOnly(true);
   history_view_->setPlainText("No wallet history yet.\nOpen or create a wallet to start recording local wallet actions.");
@@ -384,6 +402,11 @@ void WalletWindow::build_ui() {
 
   auto* redemption_box = new QGroupBox("Recent Redemptions", mint_ops);
   auto* redemption_layout = new QVBoxLayout(redemption_box);
+  auto* redemption_actions = new QHBoxLayout();
+  mint_detail_button_ = new QPushButton("Latest Mint Details", redemption_box);
+  redemption_actions->addStretch(1);
+  redemption_actions->addWidget(mint_detail_button_);
+  redemption_layout->addLayout(redemption_actions);
   mint_redemptions_view_ = new QPlainTextEdit(redemption_box);
   mint_redemptions_view_->setReadOnly(true);
   mint_redemptions_view_->setMaximumBlockCount(48);
@@ -432,10 +455,12 @@ void WalletWindow::build_ui() {
   });
   connect(send_review_button, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button, &QPushButton::clicked, this, [this]() { submit_send(); });
+  connect(history_detail_button_, &QPushButton::clicked, this, [this]() { show_latest_chain_detail(); });
   connect(mint_deposit_button, &QPushButton::clicked, this, [this]() { submit_mint_deposit(); });
   connect(mint_issue_button, &QPushButton::clicked, this, [this]() { issue_mint_note(); });
   connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
   connect(mint_redeem_status_button, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
+  connect(mint_detail_button_, &QPushButton::clicked, this, [this]() { show_latest_mint_detail(); });
   connect(save_settings_button, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
 
   const QString mono = mono_font_family();
@@ -495,13 +520,19 @@ void WalletWindow::update_connection_views() {
 }
 
 void WalletWindow::render_history_view() {
-  QStringList combined = local_history_lines_;
-  for (const auto& line : chain_history_lines_) combined.push_back(line);
+  QStringList combined = chain_history_lines_;
+  if (!local_history_lines_.empty()) {
+    combined.push_back("");
+    combined.push_back("Local wallet events");
+    combined.push_back("-------------------");
+    for (const auto& line : local_history_lines_) combined.push_back(line);
+  }
   if (combined.empty()) {
     history_view_->setPlainText("No wallet history yet.\nOpen or create a wallet to start syncing activity.");
     return;
   }
   history_view_->setPlainText(combined.join("\n"));
+  history_detail_button_->setEnabled(!chain_records_.empty());
 }
 
 void WalletWindow::render_mint_state() {
@@ -533,21 +564,34 @@ void WalletWindow::render_mint_state() {
 
   QStringList deposit_lines;
   QStringList redemption_lines;
+  mint_records_.clear();
   for (int i = local_history_lines_.size() - 1; i >= 0; --i) {
     const QString line = local_history_lines_[i];
     if (line.startsWith("[mint-deposit]")) {
-      deposit_lines.push_back(trim_after_token(line, "[mint-deposit]"));
+      const QString details = trim_after_token(line, "[mint-deposit]");
+      deposit_lines.push_back(QString("%1 %2").arg(badge_text("PENDING"), details));
+      mint_records_.push_back(MintRecord{"PENDING", "deposit", mint_deposit_ref_, {}, details});
     } else if (line.startsWith("[mint-redeem]")) {
       const QString batch = extract_field_value(line, "batch");
       const QString amount = extract_field_value(line, "amount");
       const QString notes = extract_field_value(line, "notes");
-      redemption_lines.push_back(QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes));
+      const QString details = QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes);
+      redemption_lines.push_back(QString("%1 %2").arg(badge_text("PENDING"), details));
+      mint_records_.push_back(MintRecord{"PENDING", "redemption", batch, amount, details});
     } else if (line.startsWith("[mint-status]")) {
       const QString batch = extract_field_value(line, "batch");
       const QString state = extract_field_value(line, "state");
       const QString txid = extract_field_value(line, "l1_txid");
-      redemption_lines.push_back(QString("batch=%1  state=%2  tx=%3")
-                                     .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8)));
+      const QString details = QString("batch=%1  state=%2  tx=%3")
+                                  .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8));
+      redemption_lines.push_back(QString("%1 %2").arg(badge_text(mint_state_badge(state)), details));
+      mint_records_.push_back(MintRecord{mint_state_badge(state), "status", batch, {}, details});
+    } else if (line.startsWith("[mint-issue]")) {
+      const QString issuance = extract_field_value(line, "issuance");
+      const QString amount = extract_field_value(line, "amount");
+      const QString notes = extract_field_value(line, "notes");
+      mint_records_.push_back(MintRecord{
+          "FINALIZED", "issue", issuance, amount, QString("issuance=%1  amount=%2  notes=%3").arg(issuance, amount, notes)});
     }
     if (deposit_lines.size() >= 10 && redemption_lines.size() >= 12) break;
   }
@@ -555,6 +599,7 @@ void WalletWindow::render_mint_state() {
                                                             : deposit_lines.join("\n"));
   mint_redemptions_view_->setPlainText(redemption_lines.isEmpty() ? "No redemptions recorded yet."
                                                                   : redemption_lines.join("\n"));
+  mint_detail_button_->setEnabled(!mint_records_.empty());
 }
 
 void WalletWindow::save_wallet_local_state() {
@@ -642,11 +687,14 @@ void WalletWindow::refresh_chain_state(bool interactive) {
 
   std::set<std::string> sent_index(local_sent_txids_.begin(), local_sent_txids_.end());
   chain_history_lines_.clear();
+  chain_records_.clear();
   const auto own_decoded = selfcoin::address::decode(wallet_->address);
   const Bytes own_spk = own_decoded ? selfcoin::address::p2pkh_script_pubkey(own_decoded->pubkey_hash) : Bytes{};
   std::reverse(history->begin(), history->end());
+  std::set<std::string> finalized_seen;
   for (const auto& entry : *history) {
     const std::string txid_hex = hex_encode32(entry.txid);
+    finalized_seen.insert(txid_hex);
     auto txv = lightserver::rpc_get_tx(rpc_url.toStdString(), entry.txid, &err);
     if (!txv) continue;
     auto tx = Tx::parse(txv->tx_bytes);
@@ -659,11 +707,29 @@ void WalletWindow::refresh_chain_state(bool interactive) {
     }
     QString kind = sent_index.count(txid_hex) ? "sent" : (credited > 0 ? "received" : "activity");
     QString detail = credited > 0 ? format_coin_amount(credited) : QString("tx %1").arg(elide_middle(QString::fromStdString(txid_hex), 10));
-    chain_history_lines_.push_back(QString("[%1] height=%2 %3 %4")
-                                       .arg(kind)
-                                       .arg(entry.height)
-                                       .arg(detail)
-                                       .arg(elide_middle(QString::fromStdString(txid_hex), 12)));
+    const QString txid_q = QString::fromStdString(txid_hex);
+    const QString line = QString("%1 %2  %3  height=%4  tx=%5")
+                             .arg(badge_text("FINALIZED"))
+                             .arg(kind.toUpper())
+                             .arg(detail)
+                             .arg(entry.height)
+                             .arg(elide_middle(txid_q, 12));
+    chain_history_lines_.push_back(line);
+    chain_records_.push_back(ChainRecord{"FINALIZED", kind.toUpper(), detail, txid_q,
+                                         QString("Height: %1\nTransaction: %2\nAmount/Detail: %3")
+                                             .arg(entry.height)
+                                             .arg(txid_q)
+                                             .arg(detail)});
+  }
+  for (const auto& txid_hex : local_sent_txids_) {
+    if (finalized_seen.count(txid_hex)) continue;
+    const QString txid_q = QString::fromStdString(txid_hex);
+    const QString line = QString("%1 SENT  awaiting finalization  tx=%2")
+                             .arg(badge_text("PENDING"))
+                             .arg(elide_middle(txid_q, 12));
+    chain_history_lines_.push_back(line);
+    chain_records_.push_back(ChainRecord{"PENDING", "SENT", "awaiting finalization", txid_q,
+                                         QString("Transaction: %1\nState: pending broadcast/finality observation").arg(txid_q)});
   }
 
   update_wallet_views();
@@ -954,6 +1020,34 @@ void WalletWindow::submit_send() {
                          .arg(elide_middle(QString::fromStdString(result->txid_hex), 12)));
   refresh_chain_state(false);
   statusBar()->showMessage("Transaction broadcasted.", 3000);
+}
+
+void WalletWindow::show_latest_chain_detail() {
+  if (chain_records_.empty()) {
+    QMessageBox::information(this, "Transaction Details", "No on-chain transaction records yet.");
+    return;
+  }
+  const auto& rec = chain_records_.front();
+  QMessageBox::information(
+      this, "Transaction Details",
+      QString("Status: %1\nType: %2\nAmount/Detail: %3\nTXID: %4\n\n%5")
+          .arg(rec.status, rec.kind, rec.amount, rec.txid, rec.details));
+}
+
+void WalletWindow::show_latest_mint_detail() {
+  if (mint_records_.empty()) {
+    QMessageBox::information(this, "Mint Details", "No mint records yet.");
+    return;
+  }
+  const auto& rec = mint_records_.front();
+  QMessageBox::information(
+      this, "Mint Details",
+      QString("Status: %1\nKind: %2\nReference: %3\nAmount: %4\n\n%5")
+          .arg(rec.status,
+               rec.kind,
+               rec.reference.isEmpty() ? "-" : rec.reference,
+               rec.amount.isEmpty() ? "-" : rec.amount,
+               rec.details));
 }
 
 void WalletWindow::submit_mint_deposit() {

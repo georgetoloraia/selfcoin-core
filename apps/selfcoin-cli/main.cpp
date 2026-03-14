@@ -445,6 +445,8 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_redeem_status --url http://host:port/path --batch-id <id>\n"
               << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
+              << "  selfcoin-cli mint_reserve_alerts --url http://host:port/path\n"
+              << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_accounting_summary --url http://host:port/path\n"
               << "  selfcoin-cli mint_attest_reserves --url http://host:port/path\n"
               << "  selfcoin-cli mint_audit_export --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
@@ -1878,6 +1880,56 @@ int main(int argc, char** argv) {
     auto body = http_get_json(url, &err);
     if (!body) {
       std::cerr << "mint_reserves failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_reserve_alerts") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_reserve_alerts requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_reserve_alerts failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_reserve_consolidate") {
+    std::string url;
+    std::string operator_key_id;
+    std::string operator_secret_hex;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+    }
+    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty()) {
+      std::cerr << "mint_reserve_consolidate requires --url, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    const std::string body_json = "{}";
+    std::string err;
+    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_reserve_consolidate failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
+    if (!body) {
+      std::cerr << "mint_reserve_consolidate failed: " << err << "\n";
       return 1;
     }
     std::cout << *body << "\n";

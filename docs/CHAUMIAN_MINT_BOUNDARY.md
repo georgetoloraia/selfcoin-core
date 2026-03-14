@@ -45,6 +45,7 @@ Suggested example HTTP endpoints:
 - `POST /issuance/blind`
 - `POST /redemptions/create`
 - `POST /redemptions/approve_broadcast`
+- `POST /reserves/consolidate`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
 - `GET /accounting/summary`
@@ -174,6 +175,12 @@ then signed operators can call `POST /redemptions/approve_broadcast` to:
 4. transition the redemption to `broadcast`
 
 Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcast -> finalized` via observed L1 confirmation depth.
+
+Signed operators may also call `POST /reserves/consolidate` to:
+1. select a bounded set of small reserve UTXOs using the consolidation policy
+2. build a self-transfer consolidation transaction back to the reserve address
+3. broadcast it through lightserver
+4. persist the consolidation record for later audit/finalization reporting
 
 ### 6. Reserve and accounting views
 

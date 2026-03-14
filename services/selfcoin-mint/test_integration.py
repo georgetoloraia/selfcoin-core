@@ -435,6 +435,67 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertTrue(attest_json["payload"]["alert_reserve_exhaustion_risk"])
                     self.assertTrue(attest_json["signature_hex"])
 
+                    lightserver.utxos_by_scripthash[reserve_scripthash] = [
+                        {
+                            "txid": "88" * 32,
+                            "vout": 0,
+                            "value": 500,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                        {
+                            "txid": "99" * 32,
+                            "vout": 1,
+                            "value": 700,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                        {
+                            "txid": "aa" * 32,
+                            "vout": 2,
+                            "value": 3000,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                    ]
+                    lightserver.broadcast_spend_queue.append(
+                        [
+                            ("88" * 32, 0),
+                            ("99" * 32, 1),
+                            ("aa" * 32, 2),
+                        ]
+                    )
+                    consolidate_cmd = [
+                        str(CLI),
+                        "mint_reserve_consolidate",
+                        "--url",
+                        f"http://127.0.0.1:{port}/reserves/consolidate",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    consolidate = subprocess.run(consolidate_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    consolidate_json = json.loads(consolidate.stdout)
+                    self.assertTrue(consolidate_json["accepted"])
+                    self.assertEqual(consolidate_json["input_count"], 3)
+                    self.assertEqual(consolidate_json["total_input_value"], 4200)
+                    self.assertEqual(consolidate_json["output_value"], 3200)
+
+                    reserves_after_consolidation = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                    self.assertEqual(reserves_after_consolidation["wallet_utxo_count"], 0)
+                    self.assertTrue(reserves_after_consolidation["alert_reserve_exhaustion_risk"])
+
+                    consolidation_txid = consolidate_json["l1_txid"]
+                    lightserver.tip_height = 25
+                    lightserver.tx_heights[consolidation_txid] = 25
+
+                    final_audit = subprocess.run(audit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    final_audit_json = json.loads(final_audit.stdout)
+                    self.assertEqual(len(final_audit_json["payload"]["consolidations"]), 1)
+                    self.assertEqual(final_audit_json["payload"]["consolidations"][0]["state"], "finalized")
+                    self.assertEqual(final_audit_json["payload"]["consolidations"][0]["coin_selection_policy"], "smallest-first-consolidation")
+
                     operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")
                     self.assertEqual(operator_pub["operator_key_id"], operator_key_id)
                 finally:

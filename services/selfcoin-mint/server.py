@@ -212,6 +212,7 @@ class MintState:
             "issuances": {},
             "redemptions": {},
             "note_records": {},
+            "consolidations": {},
         }
         self._load()
 
@@ -374,6 +375,50 @@ class MintState:
                 if isinstance(item, dict) and item.get("state") == "broadcast"
             ]
 
+    def record_consolidation(self, consolidation: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = dict(consolidation)
+            now = int(time.time())
+            item.setdefault("created_at", now)
+            item.setdefault("updated_at", now)
+            self._data["consolidations"][item["consolidation_id"]] = item
+            self._flush()
+            return dict(item)
+
+    def get_consolidation(self, consolidation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            item = self._data["consolidations"].get(consolidation_id)
+            return dict(item) if isinstance(item, dict) else None
+
+    def list_broadcast_consolidations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._data["consolidations"].values()
+                if isinstance(item, dict) and item.get("state") == "broadcast"
+            ]
+
+    def update_consolidation(self, consolidation_id: str, new_state: str, l1_txid: str = "") -> dict[str, Any]:
+        allowed = {
+            "broadcast": {"finalized", "rejected"},
+        }
+        with self._lock:
+            item = self._data["consolidations"].get(consolidation_id)
+            if not isinstance(item, dict):
+                raise KeyError("unknown consolidation_id")
+            current = str(item.get("state", "broadcast"))
+            if current == new_state:
+                return dict(item)
+            if current not in allowed or new_state not in allowed[current]:
+                raise ValueError("invalid consolidation state transition")
+            item["state"] = new_state
+            item["updated_at"] = int(time.time())
+            if l1_txid:
+                item["l1_txid"] = l1_txid
+            self._data["consolidations"][consolidation_id] = item
+            self._flush()
+            return dict(item)
+
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
             record = self._data["note_records"].get(note)
@@ -476,6 +521,7 @@ class MintState:
                 "deposits": list(self._data["deposits"].values()),
                 "issuances": list(self._data["issuances"].values()),
                 "redemptions": list(self._data["redemptions"].values()),
+                "consolidations": list(self._data["consolidations"].values()),
                 "note_records": list(self._data["note_records"].values()),
                 "accounting": self._accounting_summary_locked(),
                 "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
@@ -504,6 +550,11 @@ class MintState:
             for item in self._data["redemptions"].values()
             if isinstance(item, dict) and item.get("state") == "broadcast"
         ]
+        consolidations = [
+            item
+            for item in self._data["consolidations"].values()
+            if isinstance(item, dict) and item.get("state") == "broadcast"
+        ]
         return {
             "total_deposited": total_deposited,
             "reserved_redemption_amount": reserved,
@@ -512,6 +563,8 @@ class MintState:
             "available_reserve": total_deposited - reserved,
             "pending_spend_commitment_count": len(spend_commitments),
             "pending_spend_input_count": sum(len(item.get("selected_utxos", [])) for item in spend_commitments),
+            "pending_consolidation_count": len(consolidations),
+            "pending_consolidation_input_count": sum(len(item.get("selected_utxos", [])) for item in consolidations),
         }
 
     def _accounting_summary_locked(self) -> dict[str, Any]:
@@ -739,16 +792,43 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if confirmations >= config.confirmations_required:
                 state.update_redemption(batch_id, "finalized", txid)
 
+        def _reconcile_consolidation(self, consolidation_id: str) -> None:
+            item = state.get_consolidation(consolidation_id)
+            if not isinstance(item, dict):
+                return
+            if item.get("state") != "broadcast":
+                return
+            txid = str(item.get("l1_txid", ""))
+            if not txid:
+                return
+            observed = lightserver_confirmations(config.lightserver_url, txid)
+            if observed is None:
+                return
+            _, confirmations = observed
+            if confirmations >= config.confirmations_required:
+                state.update_consolidation(consolidation_id, "finalized", txid)
+
         def _reconcile_all_broadcast(self) -> None:
             for redemption in state.list_broadcast_redemptions():
                 batch_id = redemption.get("redemption_batch_id")
                 if isinstance(batch_id, str):
                     self._reconcile_redemption(batch_id)
+            for consolidation in state.list_broadcast_consolidations():
+                consolidation_id = consolidation.get("consolidation_id")
+                if isinstance(consolidation_id, str):
+                    self._reconcile_consolidation(consolidation_id)
 
         def _locked_reserve_outpoints(self) -> set[tuple[str, int]]:
             locked: set[tuple[str, int]] = set()
             for redemption in state.list_broadcast_redemptions():
                 for utxo in redemption.get("selected_utxos", []):
+                    if isinstance(utxo, dict):
+                        txid = str(utxo.get("txid", ""))
+                        vout = int(utxo.get("vout", -1))
+                        if txid and vout >= 0:
+                            locked.add((txid, vout))
+            for consolidation in state.list_broadcast_consolidations():
+                for utxo in consolidation.get("selected_utxos", []):
                     if isinstance(utxo, dict):
                         txid = str(utxo.get("txid", ""))
                         vout = int(utxo.get("vout", -1))
@@ -838,6 +918,34 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     return selected
             return []
 
+        def _select_consolidation_utxos(self) -> list[dict[str, Any]]:
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                raise ValueError("invalid reserve address")
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            utxos = [
+                item
+                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+                if int(item.get("value", 0)) > 0
+                and (str(item.get("txid", "")), int(item.get("vout", -1))) not in self._locked_reserve_outpoints()
+            ]
+            if len(utxos) < 2:
+                return []
+            prioritized = sorted(
+                utxos,
+                key=lambda item: (
+                    0 if int(item.get("value", 0)) < RESERVE_MIN_CHANGE else 1,
+                    int(item.get("value", 0)),
+                ),
+            )
+            if len(prioritized) < 2:
+                return []
+            if len(prioritized) < RESERVE_CONSOLIDATE_UTXO_COUNT and sum(
+                1 for item in prioritized if int(item.get("value", 0)) < RESERVE_MIN_CHANGE
+            ) == 0:
+                return []
+            return prioritized[:RESERVE_MAX_INPUTS]
+
         def _maybe_broadcast_redemption(self, batch_id: str) -> dict[str, Any]:
             redemption = state.get_redemption(batch_id)
             if not isinstance(redemption, dict):
@@ -874,6 +982,54 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "coin_selection_policy": "smallest-sufficient-non-dust-change",
                     "min_change": RESERVE_MIN_CHANGE,
                 },
+            )
+
+        def _broadcast_consolidation(self) -> dict[str, Any]:
+            if not config.lightserver_url or not config.reserve_privkey_hex or not config.reserve_address:
+                raise ValueError("reserve wallet not configured")
+            selected = self._select_consolidation_utxos()
+            if len(selected) < 2:
+                raise ValueError("no consolidation candidates available")
+            total_input_value = _sum_utxo_values(selected)
+            if total_input_value <= config.reserve_fee:
+                raise ValueError("selected utxos do not cover reserve fee")
+            txid, tx_hex = build_redemption_tx(
+                config,
+                selected,
+                config.reserve_address,
+                total_input_value - config.reserve_fee,
+            )
+            ok, err = lightserver_broadcast_tx(config.lightserver_url, tx_hex)
+            if not ok:
+                raise ValueError(err)
+            consolidation_id = sha256_hex(
+                [
+                    "reserve-consolidation",
+                    txid,
+                    str(total_input_value),
+                    str(len(selected)),
+                ]
+            )
+            return state.record_consolidation(
+                {
+                    "consolidation_id": consolidation_id,
+                    "state": "broadcast",
+                    "l1_txid": txid,
+                    "reserve_address": config.reserve_address,
+                    "selected_utxos": [
+                        {
+                            "txid": str(item["txid"]),
+                            "vout": int(item["vout"]),
+                            "value": int(item["value"]),
+                        }
+                        for item in selected
+                    ],
+                    "total_input_value": total_input_value,
+                    "output_value": total_input_value - config.reserve_fee,
+                    "fee": config.reserve_fee,
+                    "coin_selection_policy": "smallest-first-consolidation",
+                    "max_inputs": RESERVE_MAX_INPUTS,
+                }
             )
 
         def do_GET(self) -> None:
@@ -977,6 +1133,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/redemptions/approve_broadcast":
                 self._handle_redemption_approve_broadcast(body, raw_body)
+                return
+            if self.path == "/reserves/consolidate":
+                self._handle_reserve_consolidate(raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1193,6 +1352,29 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "accepted": True,
                     "state": updated["state"],
                     "l1_txid": updated.get("l1_txid", ""),
+                },
+            )
+
+        def _handle_reserve_consolidate(self, raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            try:
+                item = self._broadcast_consolidation()
+            except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "consolidation_id": item["consolidation_id"],
+                    "state": item["state"],
+                    "l1_txid": item["l1_txid"],
+                    "input_count": len(item.get("selected_utxos", [])),
+                    "total_input_value": item["total_input_value"],
+                    "output_value": item["output_value"],
+                    "fee": item["fee"],
                 },
             )
 

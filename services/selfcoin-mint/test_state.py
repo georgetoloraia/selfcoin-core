@@ -175,6 +175,32 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(attest["mint_id"], "22" * 32)
             self.assertTrue(attest["state_hash"])
 
+    def test_consolidation_persists_and_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            item = state.record_consolidation(
+                {
+                    "consolidation_id": "cons-1",
+                    "state": "broadcast",
+                    "l1_txid": "44" * 32,
+                    "selected_utxos": [{"txid": "55" * 32, "vout": 0, "value": 2000}],
+                    "total_input_value": 2000,
+                    "output_value": 1000,
+                    "fee": 1000,
+                    "coin_selection_policy": "smallest-first-consolidation",
+                }
+            )
+            self.assertEqual(item["state"], "broadcast")
+            reloaded = server.MintState(state_path)
+            got = reloaded.get_consolidation("cons-1")
+            self.assertIsNotNone(got)
+            self.assertEqual(got["l1_txid"], "44" * 32)
+            reloaded.update_consolidation("cons-1", "finalized", "44" * 32)
+            audit = reloaded.audit_export("22" * 32)
+            self.assertEqual(len(audit["consolidations"]), 1)
+            self.assertEqual(audit["consolidations"][0]["state"], "finalized")
+
     def test_blind_signer_signs_and_verifies(self) -> None:
         signer = server.BlindSigner.from_seed("seed-x", bits=256)
         message = 123456789

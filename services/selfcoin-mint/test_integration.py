@@ -164,17 +164,57 @@ class FakeLightserver:
         self._thread.join(timeout=5)
 
 
+class FakeNotifierSink:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.received: list[dict] = []
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), self._make_handler())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def _make_handler(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                payload = json.loads(raw.decode("utf-8"))
+                outer.received.append({"path": self.path, "payload": payload})
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        return Handler
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
 class MintIntegrationTests(unittest.TestCase):
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()
         lightserver_port = free_port()
+        notifier_port = free_port()
         lightserver = FakeLightserver(lightserver_port)
+        notifier = FakeNotifierSink(notifier_port)
         lightserver.start()
+        notifier.start()
         operator_key_id = "integration-operator"
         operator_secret_hex = "11" * 32
         try:
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
+                email_spool = Path(td) / "email-spool"
                 reserve_wallet = Path(td) / "reserve-wallet.json"
                 reserve_privkey = "55" * 32
                 wallet_cmd = [
@@ -350,6 +390,29 @@ class MintIntegrationTests(unittest.TestCase):
                     enabled_json = json.loads(enabled.stdout)
                     self.assertTrue(enabled_json["auto_pause_enabled"])
 
+                    for notifier_id, kind, target, extra in [
+                        ("ops-webhook", "webhook", f"http://127.0.0.1:{notifier_port}/webhook", []),
+                        ("ops-alertmanager", "alertmanager", f"http://127.0.0.1:{notifier_port}/alertmanager", []),
+                        ("ops-email", "email_spool", str(email_spool), ["--email-to", "ops@example.test", "--email-from", "mint@example.test"]),
+                    ]:
+                        notifier_cmd = [
+                            str(CLI),
+                            "mint_notifier_upsert",
+                            "--url",
+                            f"http://127.0.0.1:{port}/monitoring/notifiers",
+                            "--operator-key-id",
+                            operator_key_id,
+                            "--operator-secret-hex",
+                            operator_secret_hex,
+                            "--notifier-id",
+                            notifier_id,
+                            "--kind",
+                            kind,
+                            "--target",
+                            target,
+                        ] + extra
+                        subprocess.run(notifier_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
                     n = int(pubkey["modulus_hex"], 16)
                     e = int(pubkey["public_exponent"])
@@ -492,6 +555,10 @@ class MintIntegrationTests(unittest.TestCase):
                     alert_history = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
                     self.assertGreaterEqual(len(alert_history["events"]), 1)
                     self.assertEqual(alert_history["events"][0]["event_type"], "policy.auto_pause")
+                    self.assertGreaterEqual(len(notifier.received), 2)
+                    self.assertIn("/webhook", {item["path"] for item in notifier.received})
+                    self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
+                    self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
 
                     metrics_cmd = [
                         str(CLI),
@@ -502,6 +569,71 @@ class MintIntegrationTests(unittest.TestCase):
                     metrics = subprocess.run(metrics_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                     self.assertIn("selfcoin_mint_auto_pause_recommended 1", metrics.stdout)
                     self.assertIn("selfcoin_mint_redemptions_paused 1", metrics.stdout)
+
+                    ack_cmd = [
+                        str(CLI),
+                        "mint_alert_ack",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/ack",
+                        "--event-id",
+                        alert_history["events"][0]["event_id"],
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--note",
+                        "seen",
+                    ]
+                    subprocess.run(ack_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    history_after_ack = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                    acked = next(item for item in history_after_ack["events"] if item["event_id"] == alert_history["events"][0]["event_id"])
+                    self.assertTrue(acked["acknowledged"])
+
+                    silence_cmd = [
+                        str(CLI),
+                        "mint_alert_silence",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/silence",
+                        "--event-type",
+                        "policy.auto_pause",
+                        "--until",
+                        "4102444800",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--reason",
+                        "maintenance",
+                    ]
+                    subprocess.run(silence_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    silences_cmd = [
+                        str(CLI),
+                        "mint_alert_silences",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/silences",
+                    ]
+                    silences = subprocess.run(silences_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    silences_json = json.loads(silences.stdout)
+                    self.assertEqual(silences_json["silences"][0]["event_type"], "policy.auto_pause")
+
+                    event_policy_update_cmd = [
+                        str(CLI),
+                        "mint_event_policy_update",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/policy",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--retention-limit",
+                        "64",
+                        "--export-include-acknowledged",
+                        "false",
+                    ]
+                    subprocess.run(event_policy_update_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    event_policy = http_get_json(f"http://127.0.0.1:{port}/monitoring/events/policy")
+                    self.assertEqual(event_policy["event_retention_limit"], 64)
+                    self.assertFalse(event_policy["export_include_acknowledged"])
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
@@ -647,6 +779,7 @@ class MintIntegrationTests(unittest.TestCase):
                         proc.stderr.close()
         finally:
             lightserver.stop()
+            notifier.stop()
 
 
 if __name__ == "__main__":

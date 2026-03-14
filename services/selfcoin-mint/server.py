@@ -59,6 +59,15 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.wfile.write(body)
 
 
+def write_text(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str, content_type: str) -> None:
+    data = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -216,10 +225,14 @@ class MintState:
             "note_records": {},
             "consolidations": {},
             "events": [],
+            "silences": [],
+            "notifiers": [],
             "policy": {
                 "redemptions_paused": False,
                 "pause_reason": "",
                 "auto_pause_enabled": False,
+                "event_retention_limit": 256,
+                "export_include_acknowledged": True,
                 "updated_at": 0,
             },
         }
@@ -247,9 +260,15 @@ class MintState:
                 self._data.pop("spent_notes", None)
                 if "events" not in self._data or not isinstance(self._data["events"], list):
                     self._data["events"] = []
+                if "silences" not in self._data or not isinstance(self._data["silences"], list):
+                    self._data["silences"] = []
+                if "notifiers" not in self._data or not isinstance(self._data["notifiers"], list):
+                    self._data["notifiers"] = []
                 policy = self._data.get("policy", {})
-                if isinstance(policy, dict) and "auto_pause_enabled" not in policy:
-                    policy["auto_pause_enabled"] = False
+                if isinstance(policy, dict):
+                    policy.setdefault("auto_pause_enabled", False)
+                    policy.setdefault("event_retention_limit", 256)
+                    policy.setdefault("export_include_acknowledged", True)
                     self._data["policy"] = policy
         except Exception:
             pass
@@ -448,7 +467,14 @@ class MintState:
             item = self._data.get("policy", {})
             return dict(item) if isinstance(item, dict) else {}
 
-    def update_policy(self, paused: bool, reason: str, auto_pause_enabled: bool | None = None) -> dict[str, Any]:
+    def update_policy(
+        self,
+        paused: bool,
+        reason: str,
+        auto_pause_enabled: bool | None = None,
+        event_retention_limit: int | None = None,
+        export_include_acknowledged: bool | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             item = dict(self._data.get("policy", {}))
             item["redemptions_paused"] = bool(paused)
@@ -457,6 +483,14 @@ class MintState:
                 item["auto_pause_enabled"] = bool(auto_pause_enabled)
             else:
                 item.setdefault("auto_pause_enabled", False)
+            if event_retention_limit is not None:
+                item["event_retention_limit"] = max(16, min(int(event_retention_limit), 5000))
+            else:
+                item.setdefault("event_retention_limit", 256)
+            if export_include_acknowledged is not None:
+                item["export_include_acknowledged"] = bool(export_include_acknowledged)
+            else:
+                item.setdefault("export_include_acknowledged", True)
             item["updated_at"] = int(time.time())
             self._data["policy"] = item
             self._flush()
@@ -468,13 +502,18 @@ class MintState:
                 "event_id": sha256_hex([event_type, str(time.time_ns()), json.dumps(payload, sort_keys=True)]),
                 "event_type": event_type,
                 "payload": dict(payload),
+                "acknowledged": False,
+                "acknowledged_at": 0,
+                "ack_note": "",
                 "created_at": int(time.time()),
             }
             events = self._data.get("events", [])
             if not isinstance(events, list):
                 events = []
             events.append(item)
-            self._data["events"] = events[-256:]
+            retention_limit = int(self._data.get("policy", {}).get("event_retention_limit", 256))
+            retention_limit = max(16, min(retention_limit, 5000))
+            self._data["events"] = events[-retention_limit:]
             self._flush()
             return dict(item)
 
@@ -485,6 +524,104 @@ class MintState:
                 return []
             tail = events[-max(0, int(limit)):]
             return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+    def acknowledge_event(self, event_id: str, note: str) -> dict[str, Any]:
+        with self._lock:
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                raise KeyError("unknown event_id")
+            for idx, item in enumerate(events):
+                if isinstance(item, dict) and str(item.get("event_id", "")) == event_id:
+                    updated = dict(item)
+                    updated["acknowledged"] = True
+                    updated["acknowledged_at"] = int(time.time())
+                    updated["ack_note"] = note
+                    events[idx] = updated
+                    self._data["events"] = events
+                    self._flush()
+                    return dict(updated)
+            raise KeyError("unknown event_id")
+
+    def add_silence(self, event_type: str, until_ts: int, reason: str) -> dict[str, Any]:
+        with self._lock:
+            item = {
+                "silence_id": sha256_hex([event_type, str(until_ts), reason, str(time.time_ns())]),
+                "event_type": event_type,
+                "until_ts": int(until_ts),
+                "reason": reason,
+                "created_at": int(time.time()),
+                "active": True,
+            }
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                silences = []
+            silences.append(item)
+            self._data["silences"] = silences[-256:]
+            self._flush()
+            return dict(item)
+
+    def list_silences(self, active_only: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                return []
+            now = int(time.time())
+            out = []
+            for item in silences:
+                if not isinstance(item, dict):
+                    continue
+                active = bool(item.get("active", True)) and int(item.get("until_ts", 0)) > now
+                row = dict(item)
+                row["active"] = active
+                if active_only and not active:
+                    continue
+                out.append(row)
+            return list(reversed(out))
+
+    def event_silenced(self, event_type: str) -> bool:
+        now = int(time.time())
+        with self._lock:
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                return False
+            for item in silences:
+                if not isinstance(item, dict):
+                    continue
+                if not bool(item.get("active", True)):
+                    continue
+                if str(item.get("event_type", "")) != event_type:
+                    continue
+                if int(item.get("until_ts", 0)) > now:
+                    return True
+            return False
+
+    def upsert_notifier(self, notifier: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = dict(notifier)
+            item["updated_at"] = int(time.time())
+            notifiers = self._data.get("notifiers", [])
+            if not isinstance(notifiers, list):
+                notifiers = []
+            notifier_id = str(item.get("notifier_id", ""))
+            replaced = False
+            for idx, existing in enumerate(notifiers):
+                if isinstance(existing, dict) and str(existing.get("notifier_id", "")) == notifier_id:
+                    notifiers[idx] = item
+                    replaced = True
+                    break
+            if not replaced:
+                item.setdefault("created_at", int(time.time()))
+                notifiers.append(item)
+            self._data["notifiers"] = notifiers[-128:]
+            self._flush()
+            return dict(item)
+
+    def list_notifiers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            notifiers = self._data.get("notifiers", [])
+            if not isinstance(notifiers, list):
+                return []
+            return [dict(item) for item in notifiers if isinstance(item, dict)]
 
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
@@ -591,7 +728,17 @@ class MintState:
                 "redemptions": list(self._data["redemptions"].values()),
                 "consolidations": list(self._data["consolidations"].values()),
                 "note_records": list(self._data["note_records"].values()),
-                "events": list(self._data.get("events", [])),
+                "events": [
+                    dict(item)
+                    for item in self._data.get("events", [])
+                    if isinstance(item, dict)
+                    and (
+                        bool(self._data.get("policy", {}).get("export_include_acknowledged", True))
+                        or not bool(item.get("acknowledged", False))
+                    )
+                ],
+                "silences": list(self._data.get("silences", [])),
+                "notifiers": list(self._data.get("notifiers", [])),
                 "policy": dict(self._data.get("policy", {})),
                 "accounting": self._accounting_summary_locked(),
                 "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
@@ -1066,6 +1213,78 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             ]
             return "\n".join(lines) + "\n"
 
+        def _dispatch_notifier(self, notifier: dict[str, Any], event: dict[str, Any]) -> None:
+            if not bool(notifier.get("enabled", True)):
+                return
+            kind = str(notifier.get("kind", ""))
+            if kind == "webhook":
+                url = str(notifier.get("target", ""))
+                if not url:
+                    return
+                req = urllib.request.Request(
+                    url,
+                    data=canonical_json_bytes({"event": event}),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
+                return
+            if kind == "alertmanager":
+                url = str(notifier.get("target", ""))
+                if not url:
+                    return
+                payload = [{
+                    "labels": {
+                        "alertname": str(event.get("event_type", "selfcoin_mint_event")),
+                        "service": "selfcoin-mint",
+                    },
+                    "annotations": {
+                        "event_id": str(event.get("event_id", "")),
+                        "note": str(event.get("ack_note", "")),
+                        "payload": json.dumps(event.get("payload", {}), sort_keys=True),
+                    },
+                    "startsAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(event.get("created_at", 0)))),
+                }]
+                req = urllib.request.Request(
+                    url,
+                    data=canonical_json_bytes({"alerts": payload}),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
+                return
+            if kind == "email_spool":
+                spool_dir = str(notifier.get("target", ""))
+                if not spool_dir:
+                    return
+                to_addr = str(notifier.get("email_to", "ops@example.invalid"))
+                from_addr = str(notifier.get("email_from", "selfcoin-mint@example.invalid"))
+                path = Path(spool_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                subject = f"[selfcoin-mint] {event.get('event_type', 'event')}"
+                body = (
+                    f"From: {from_addr}\n"
+                    f"To: {to_addr}\n"
+                    f"Subject: {subject}\n\n"
+                    f"{json.dumps(event, indent=2, sort_keys=True)}\n"
+                )
+                out = path / f"{event.get('event_id', 'event')}.eml"
+                out.write_text(body, encoding="utf-8")
+                return
+
+        def _record_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+            event = state.append_event(event_type, payload)
+            if state.event_silenced(event_type):
+                return event
+            for notifier in state.list_notifiers():
+                try:
+                    self._dispatch_notifier(notifier, event)
+                except Exception:
+                    continue
+            return event
+
         def _maybe_apply_auto_pause(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
             policy = state.policy()
             current = dict(policy)
@@ -1077,7 +1296,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if not bool(recommendation.get("auto_pause_recommended", False)):
                 return current
             updated = state.update_policy(True, f"auto: {recommendation.get('auto_pause_reason', 'threshold triggered')}")
-            state.append_event(
+            self._record_event(
                 "policy.auto_pause",
                 {
                     "reason": updated.get("pause_reason", ""),
@@ -1402,19 +1621,23 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 inventory = self._reserve_inventory()
                 alerts = self._reserve_alerts(summary, inventory)
                 self._maybe_apply_auto_pause(summary, inventory, alerts)
-                body = self._metrics_payload(summary, inventory, alerts).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/plain; version=0.0.4")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                write_text(self, HTTPStatus.OK, self._metrics_payload(summary, inventory, alerts), "text/plain; version=0.0.4")
                 return
             if self.path.startswith("/monitoring/alerts/history"):
                 summary = state.reserve_summary()
                 inventory = self._reserve_inventory()
                 alerts = self._reserve_alerts(summary, inventory)
                 self._maybe_apply_auto_pause(summary, inventory, alerts)
-                write_json(self, HTTPStatus.OK, {"events": state.list_events(100)})
+                write_json(self, HTTPStatus.OK, {"events": state.list_events(100), "silences": state.list_silences(False)})
+                return
+            if self.path == "/monitoring/events/policy":
+                write_json(self, HTTPStatus.OK, state.policy())
+                return
+            if self.path == "/monitoring/events/silences":
+                write_json(self, HTTPStatus.OK, {"silences": state.list_silences(False)})
+                return
+            if self.path == "/monitoring/notifiers":
+                write_json(self, HTTPStatus.OK, {"notifiers": state.list_notifiers()})
                 return
             if self.path == "/accounting/summary":
                 summary = state.accounting_summary()
@@ -1509,6 +1732,18 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/policy/redemptions":
                 self._handle_redemption_policy_update(body, raw_body)
+                return
+            if self.path == "/monitoring/events/ack":
+                self._handle_event_ack(body, raw_body)
+                return
+            if self.path == "/monitoring/events/silence":
+                self._handle_event_silence(body, raw_body)
+                return
+            if self.path == "/monitoring/events/policy":
+                self._handle_event_policy_update(body, raw_body)
+                return
+            if self.path == "/monitoring/notifiers":
+                self._handle_notifier_upsert(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1757,19 +1992,35 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             paused = body.get("redemptions_paused")
             reason = body.get("pause_reason", "")
             auto_pause_enabled = body.get("auto_pause_enabled")
+            event_retention_limit = body.get("event_retention_limit")
+            export_include_acknowledged = body.get("export_include_acknowledged")
             if not isinstance(paused, bool) or not isinstance(reason, str):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid policy fields"})
                 return
             if auto_pause_enabled is not None and not isinstance(auto_pause_enabled, bool):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid auto_pause_enabled"})
                 return
-            policy = state.update_policy(paused, reason, auto_pause_enabled)
-            state.append_event(
+            if event_retention_limit is not None and not isinstance(event_retention_limit, int):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event_retention_limit"})
+                return
+            if export_include_acknowledged is not None and not isinstance(export_include_acknowledged, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid export_include_acknowledged"})
+                return
+            policy = state.update_policy(
+                paused,
+                reason,
+                auto_pause_enabled,
+                event_retention_limit,
+                export_include_acknowledged,
+            )
+            self._record_event(
                 "policy.operator_update",
                 {
                     "redemptions_paused": bool(policy.get("redemptions_paused", False)),
                     "pause_reason": str(policy.get("pause_reason", "")),
                     "auto_pause_enabled": bool(policy.get("auto_pause_enabled", False)),
+                    "event_retention_limit": int(policy.get("event_retention_limit", 256)),
+                    "export_include_acknowledged": bool(policy.get("export_include_acknowledged", True)),
                 },
             )
             summary = state.reserve_summary()
@@ -1778,6 +2029,89 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             policy.update(self._policy_recommendations(summary, inventory, alerts))
             policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
             write_json(self, HTTPStatus.OK, {"accepted": True, **policy})
+
+        def _handle_event_ack(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            event_id = body.get("event_id")
+            note = body.get("note", "")
+            if not isinstance(event_id, str) or not isinstance(note, str) or not event_id:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event ack fields"})
+                return
+            try:
+                updated = state.acknowledge_event(event_id, note)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown event_id"})
+                return
+            self._record_event("event.acknowledged", {"event_id": event_id, "note": note})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "event": updated})
+
+        def _handle_event_silence(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            event_type = body.get("event_type")
+            until_ts = body.get("until_ts")
+            reason = body.get("reason", "")
+            if not isinstance(event_type, str) or not isinstance(until_ts, int) or not isinstance(reason, str) or not event_type:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid silence fields"})
+                return
+            silence = state.add_silence(event_type, until_ts, reason)
+            self._record_event("event.silenced", {"event_type": event_type, "until_ts": until_ts, "reason": reason})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "silence": silence})
+
+        def _handle_event_policy_update(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            retention = body.get("event_retention_limit")
+            export_include_acknowledged = body.get("export_include_acknowledged")
+            if retention is not None and not isinstance(retention, int):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event_retention_limit"})
+                return
+            if export_include_acknowledged is not None and not isinstance(export_include_acknowledged, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid export_include_acknowledged"})
+                return
+            current = state.policy()
+            updated = state.update_policy(
+                bool(current.get("redemptions_paused", False)),
+                str(current.get("pause_reason", "")),
+                bool(current.get("auto_pause_enabled", False)),
+                retention,
+                export_include_acknowledged,
+            )
+            self._record_event(
+                "event.policy_update",
+                {
+                    "event_retention_limit": int(updated.get("event_retention_limit", 256)),
+                    "export_include_acknowledged": bool(updated.get("export_include_acknowledged", True)),
+                },
+            )
+            write_json(self, HTTPStatus.OK, {"accepted": True, **updated})
+
+        def _handle_notifier_upsert(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            notifier_id = body.get("notifier_id")
+            kind = body.get("kind")
+            target = body.get("target")
+            enabled = body.get("enabled", True)
+            if not isinstance(notifier_id, str) or not isinstance(kind, str) or not isinstance(target, str) or not isinstance(enabled, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier fields"})
+                return
+            if kind not in {"webhook", "alertmanager", "email_spool"}:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "unsupported notifier kind"})
+                return
+            notifier = {
+                "notifier_id": notifier_id,
+                "kind": kind,
+                "target": target,
+                "enabled": enabled,
+            }
+            if kind == "email_spool":
+                notifier["email_to"] = str(body.get("email_to", "ops@example.invalid"))
+                notifier["email_from"] = str(body.get("email_from", "selfcoin-mint@example.invalid"))
+            saved = state.upsert_notifier(notifier)
+            self._record_event("notifier.upsert", {"notifier_id": notifier_id, "kind": kind, "enabled": enabled})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "notifier": saved})
 
     return MintHandler
 

@@ -55,6 +55,9 @@ Suggested example HTTP endpoints:
 - `GET /policy/redemptions`
 - `GET /monitoring/reserve_health`
 - `GET /monitoring/alerts/history`
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
 - `GET /monitoring/metrics`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -204,6 +207,17 @@ auto-pause recommendations and threshold metadata.
 
 `GET /monitoring/alerts/history` returns the recent persisted alert/policy event log.
 
+Signed operators may call:
+- `POST /monitoring/events/ack` to acknowledge an event
+- `POST /monitoring/events/silence` to silence an event type until a timestamp
+- `POST /monitoring/events/policy` to update retention/export policy
+- `POST /monitoring/notifiers` to upsert notifier hooks
+
+The service also exposes:
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
+
 `GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
 - available reserve
 - reserve balance
@@ -212,6 +226,12 @@ auto-pause recommendations and threshold metadata.
 - alert booleans
 - redemptions paused / auto-pause enabled
 - current health status
+- event log size
+
+Supported notifier hooks:
+- `webhook`: POST `{ "event": ... }` JSON to a target URL
+- `alertmanager`: POST alert-style JSON to a target URL
+- `email_spool`: write `.eml` files into a configured spool directory
 
 ### 6. Reserve and accounting views
 
@@ -281,6 +301,13 @@ selfcoin-cli mint_redemptions_pause --url http://host:port/policy/redemptions --
 selfcoin-cli mint_redemptions_resume --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_redemptions_auto_pause_enable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_redemptions_auto_pause_disable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_alert_ack --url http://host:port/monitoring/events/ack --event-id <id> --operator-key-id <id> --operator-secret-hex <hex> [--note <text>]
+selfcoin-cli mint_alert_silence --url http://host:port/monitoring/events/silence --event-type <type> --until <unix> --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]
+selfcoin-cli mint_alert_silences --url http://host:port/monitoring/events/silences
+selfcoin-cli mint_event_policy --url http://host:port/monitoring/events/policy
+selfcoin-cli mint_event_policy_update --url http://host:port/monitoring/events/policy --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]
+selfcoin-cli mint_notifier_list --url http://host:port/monitoring/notifiers
+selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value>
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health
 selfcoin-cli mint_reserve_metrics --url http://host:port/monitoring/metrics

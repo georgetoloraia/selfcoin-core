@@ -38,6 +38,9 @@ It is a narrow scaffold, not a production mint:
 - `GET /policy/redemptions`
 - `GET /monitoring/reserve_health`
 - `GET /monitoring/alerts/history`
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
 - `GET /monitoring/metrics`
 - `GET /accounting/summary`
 - `GET /operator/key`
@@ -128,6 +131,15 @@ python3 services/selfcoin-mint/server.py \
 
 ./build/selfcoin-cli mint_alert_history \
   --url http://127.0.0.1:8080/monitoring/alerts/history
+
+./build/selfcoin-cli mint_event_policy \
+  --url http://127.0.0.1:8080/monitoring/events/policy
+
+./build/selfcoin-cli mint_alert_silences \
+  --url http://127.0.0.1:8080/monitoring/events/silences
+
+./build/selfcoin-cli mint_notifier_list \
+  --url http://127.0.0.1:8080/monitoring/notifiers
 ```
 
 ```bash
@@ -151,6 +163,36 @@ python3 services/selfcoin-mint/server.py \
   --url http://127.0.0.1:8080/policy/redemptions \
   --operator-key-id dev-operator \
   --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_alert_ack \
+  --url http://127.0.0.1:8080/monitoring/events/ack \
+  --event-id <event-id> \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --note "seen"
+
+./build/selfcoin-cli mint_alert_silence \
+  --url http://127.0.0.1:8080/monitoring/events/silence \
+  --event-type policy.auto_pause \
+  --until 4102444800 \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --reason "maintenance"
+
+./build/selfcoin-cli mint_event_policy_update \
+  --url http://127.0.0.1:8080/monitoring/events/policy \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --retention-limit 128 \
+  --export-include-acknowledged false
+
+./build/selfcoin-cli mint_notifier_upsert \
+  --url http://127.0.0.1:8080/monitoring/notifiers \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --notifier-id ops-webhook \
+  --kind webhook \
+  --target http://127.0.0.1:9099/webhook
 ```
 
 ```bash
@@ -179,7 +221,14 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
 - `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
 - `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
+- `/monitoring/events/policy` exposes event retention/export settings.
+- `/monitoring/events/silences` exposes active and expired silences.
+- `/monitoring/notifiers` exposes configured notifier hooks.
 - `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
+- Notifier hooks currently support:
+  - `webhook`
+  - `alertmanager`
+  - `email_spool` for local `.eml` drop delivery
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:

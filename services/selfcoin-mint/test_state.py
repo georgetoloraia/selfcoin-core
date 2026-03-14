@@ -68,6 +68,34 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["payload"]["reason"], "reserve exhaustion risk")
 
+    def test_event_ack_silence_and_notifier_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            acked = state.acknowledge_event(event["event_id"], "seen")
+            self.assertTrue(acked["acknowledged"])
+            self.assertEqual(acked["ack_note"], "seen")
+
+            silence = state.add_silence("policy.auto_pause", 4102444800, "maintenance")
+            self.assertEqual(silence["event_type"], "policy.auto_pause")
+            self.assertTrue(state.event_silenced("policy.auto_pause"))
+
+            notifier = state.upsert_notifier(
+                {
+                    "notifier_id": "ops-webhook",
+                    "kind": "webhook",
+                    "target": "http://127.0.0.1:9/hook",
+                    "enabled": True,
+                }
+            )
+            self.assertEqual(notifier["notifier_id"], "ops-webhook")
+
+            reloaded = server.MintState(state_path)
+            self.assertEqual(reloaded.list_events(10)[0]["ack_note"], "seen")
+            self.assertEqual(reloaded.list_silences(True)[0]["reason"], "maintenance")
+            self.assertEqual(reloaded.list_notifiers()[0]["kind"], "webhook")
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"

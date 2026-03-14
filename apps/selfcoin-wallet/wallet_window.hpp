@@ -12,8 +12,9 @@
 
 class QLabel;
 class QLineEdit;
-class QListWidget;
+class QComboBox;
 class QPushButton;
+class QTableWidget;
 class QTabWidget;
 
 namespace selfcoin::keystore {
@@ -52,6 +53,8 @@ class WalletWindow final : public QMainWindow {
     QString status;
     QString kind;
     QString amount;
+    QString reference;
+    QString height;
     QString txid;
     QString details;
   };
@@ -61,7 +64,14 @@ class WalletWindow final : public QMainWindow {
     QString kind;
     QString reference;
     QString amount;
+    QString height_or_state;
     QString details;
+  };
+
+  struct HistoryRowRef {
+    enum class Source { Chain, Mint };
+    Source source{Source::Chain};
+    int index{-1};
   };
 
   void build_ui();
@@ -84,12 +94,13 @@ class WalletWindow final : public QMainWindow {
   void save_connection_settings();
   void validate_send_form();
   void submit_send();
-  void show_selected_chain_detail();
+  void show_selected_history_detail();
   void show_selected_mint_detail();
   void submit_mint_deposit();
   void issue_mint_note();
   void submit_mint_redemption();
   void refresh_mint_redemption_status();
+  void refresh_history_table();
 
   std::optional<LoadedWallet> load_wallet_file(const QString& path, const QString& passphrase);
   std::optional<QString> prompt_passphrase(const QString& title, bool confirm) const;
@@ -105,7 +116,8 @@ class WalletWindow final : public QMainWindow {
   QLabel* pending_balance_label_{nullptr};
   QLabel* receive_address_home_label_{nullptr};
   QLabel* receive_address_label_{nullptr};
-  QListWidget* history_view_{nullptr};
+  QComboBox* history_filter_combo_{nullptr};
+  QTableWidget* history_view_{nullptr};
   QLabel* tip_status_label_{nullptr};
   QPushButton* history_detail_button_{nullptr};
 
@@ -123,9 +135,9 @@ class WalletWindow final : public QMainWindow {
   QLabel* mint_status_label_{nullptr};
   QLabel* mint_private_balance_label_{nullptr};
   QLabel* mint_note_count_label_{nullptr};
-  QListWidget* mint_deposits_view_{nullptr};
-  QListWidget* mint_notes_view_{nullptr};
-  QListWidget* mint_redemptions_view_{nullptr};
+  QTableWidget* mint_deposits_view_{nullptr};
+  QTableWidget* mint_notes_view_{nullptr};
+  QTableWidget* mint_redemptions_view_{nullptr};
   QPushButton* mint_detail_button_{nullptr};
 
   QLineEdit* lightserver_url_edit_{nullptr};
@@ -136,7 +148,6 @@ class WalletWindow final : public QMainWindow {
   std::optional<LoadedWallet> wallet_;
   std::vector<WalletUtxo> utxos_;
   QStringList local_history_lines_;
-  QStringList chain_history_lines_;
   std::vector<std::string> local_sent_txids_;
   std::uint64_t tip_height_{0};
   QString mint_deposit_ref_;
@@ -146,6 +157,7 @@ class WalletWindow final : public QMainWindow {
   std::vector<MintNote> mint_notes_;
   std::vector<ChainRecord> chain_records_;
   std::vector<MintRecord> mint_records_;
+  std::vector<HistoryRowRef> history_row_refs_;
   WalletStore store_;
 };
 

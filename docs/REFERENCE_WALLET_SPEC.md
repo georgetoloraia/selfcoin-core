@@ -48,6 +48,9 @@ Implemented now in `selfcoin-wallet`:
   - selected mint activity dialog
   - clearer `pending / finalized / failed` badge-style history rows
   - explicit row selection from visible ledger lists
+- classic ledger tables for:
+  - status / amount / reference / height-state columns
+  - history filtering with `All / On-Chain / Mint / Pending`
 
 Intentionally deferred to the next wallet phase:
 - QR rendering

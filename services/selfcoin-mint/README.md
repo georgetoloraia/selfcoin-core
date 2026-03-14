@@ -47,6 +47,7 @@ It is a narrow scaffold, not a production mint:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /monitoring/worker`
 - `GET /dashboard`
 - `GET /dashboard/incidents`
 - `POST /monitoring/dead_letters/replay`
@@ -71,6 +72,24 @@ python3 services/selfcoin-mint/server.py \
   --cli-path ./build/selfcoin-cli \
   --notifier-retry-interval-seconds 5 \
   --notifier-secrets-file /etc/selfcoin-mint/notifier-secrets.json \
+  --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
+  --notifier-secret-env-prefix SELFCOIN_MINT_SECRET_ \
+  --worker-lock-file /var/lib/selfcoin-mint/worker.lock
+```
+
+Run a separate worker process:
+
+```bash
+python3 services/selfcoin-mint/server.py \
+  --mode worker \
+  --state-file /tmp/selfcoin-mint-state.json \
+  --operator-key dev-operator:1111111111111111111111111111111111111111111111111111111111111111 \
+  --lightserver-url http://127.0.0.1:19444/rpc \
+  --reserve-privkey 5555555555555555555555555555555555555555555555555555555555555555 \
+  --reserve-address sc1... \
+  --cli-path ./build/selfcoin-cli \
+  --notifier-retry-interval-seconds 5 \
+  --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
   --worker-lock-file /var/lib/selfcoin-mint/worker.lock
 ```
 
@@ -248,6 +267,7 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/policy/redemptions` now includes auto-pause recommendations and threshold metadata derived from the current reserve state.
 - `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
 - `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
+- `/monitoring/worker` exposes worker leadership / lock-owner state.
 - `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
 - `/monitoring/events/policy` exposes event retention/export settings.
 - `/monitoring/events/silences` exposes active and expired silences.
@@ -274,8 +294,15 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `tls_client_cert_file`
 - `tls_client_key_file`
 - The service runs a background retry worker (`--notifier-retry-interval-seconds`) backed by a persisted delivery job queue, so retries survive restart and do not depend on request traffic.
+- `--mode server` runs only the HTTP service.
+- `--mode worker` runs only the queue worker.
+- `--mode all` keeps the old combined behavior when needed.
 - If `--worker-lock-file` is configured, only the process holding that file lock drains delivery jobs.
-- Secret values are expected in `--notifier-secrets-file` as a JSON object mapping secret refs to secret values; the state file stores refs, not the secrets themselves.
+- Secret values can come from:
+  - `--notifier-secret-dir` as one file per secret ref
+  - `SELFCOIN_MINT_SECRET_<REF>` environment variables
+  - `--notifier-secrets-file` as a fallback JSON map
+- The state file stores refs, not the secret values themselves.
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

@@ -94,6 +94,8 @@ class MintConfig:
     cli_path: str
     notifier_retry_interval_seconds: int
     notifier_secrets_file: Path | None
+    notifier_secret_dir: Path | None
+    notifier_secret_env_prefix: str
     worker_lock_file: Path | None
 
 
@@ -1096,6 +1098,20 @@ def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
 def load_notifier_secrets(path: Path | None) -> dict[str, str]:
     if path is None or not path.exists():
         return {}
+
+
+def load_notifier_secret_from_path(secret_dir: Path | None, ref: str) -> str:
+    if secret_dir is None or not ref:
+        return ""
+    try:
+        if "/" in ref or "\\" in ref or ".." in ref:
+            return ""
+        path = secret_dir / ref
+        if not path.exists() or not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1141,6 +1157,19 @@ class WorkerLeaderLock:
             self._fd.close()
             self._fd = None
             self._owned = False
+
+    def status(self) -> dict[str, Any]:
+        owner_pid = ""
+        if self._path is not None and self._path.exists():
+            try:
+                owner_pid = self._path.read_text(encoding="utf-8").strip()
+            except Exception:
+                owner_pid = ""
+        return {
+            "lock_file": str(self._path) if self._path is not None else "",
+            "owned": self._owned,
+            "owner_pid": owner_pid,
+        }
 
 
 def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_id: str) -> dict[str, Any]:
@@ -1204,7 +1233,7 @@ def _html_escape(value: Any) -> str:
     )
 
 
-def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str):
+def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str, leader_lock: WorkerLeaderLock | None = None):
     class MintHandler(BaseHTTPRequestHandler):
         server_version = "selfcoin-mint/0.1"
 
@@ -1214,8 +1243,28 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
         def _notifier_secret(self, notifier: dict[str, Any], ref_key: str, direct_key: str) -> str:
             ref = str(notifier.get(ref_key, ""))
             if ref:
+                secret = load_notifier_secret_from_path(config.notifier_secret_dir, ref)
+                if secret:
+                    return secret
+                env_key = f"{config.notifier_secret_env_prefix}{ref}".upper()
+                if config.notifier_secret_env_prefix:
+                    env_value = os.environ.get(env_key, "")
+                    if env_value:
+                        return env_value
                 return load_notifier_secrets(config.notifier_secrets_file).get(ref, "")
             return str(notifier.get(direct_key, ""))
+
+        def _worker_status(self) -> dict[str, Any]:
+            if leader_lock is None:
+                return {
+                    "mode": "standalone",
+                    "lock_file": "",
+                    "owned": False,
+                    "owner_pid": "",
+                }
+            status = leader_lock.status()
+            status["mode"] = "lock-managed"
+            return status
 
         def _require_operator(self, raw_body: bytes) -> bool:
             key_id = self.headers.get("X-Selfcoin-Operator-Key", "")
@@ -1424,6 +1473,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "auto_pause_recommended": bool(policy.get("auto_pause_recommended", False)),
                 },
                 "policy": policy,
+                "worker": self._worker_status(),
                 "updated_at": int(time.time()),
             }
 
@@ -1493,6 +1543,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 f"selfcoin_mint_pending_notifier_delivery_count {pending_delivery}",
                 "# TYPE selfcoin_mint_delivery_job_queue_size gauge",
                 f"selfcoin_mint_delivery_job_queue_size {len(state.list_delivery_jobs(2048))}",
+                "# TYPE selfcoin_mint_worker_leader_owned gauge",
+                f"selfcoin_mint_worker_leader_owned {1 if bool(self._worker_status().get('owned', False)) else 0}",
                 "# TYPE selfcoin_mint_notifier_delivered_count gauge",
                 f"selfcoin_mint_notifier_delivered_count {delivered_count}",
                 "# TYPE selfcoin_mint_notifier_success_rate gauge",
@@ -2090,6 +2142,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 alerts = self._reserve_alerts(summary, inventory)
                 self._maybe_apply_auto_pause(summary, inventory, alerts)
                 write_json(self, HTTPStatus.OK, self._reserve_health_summary(summary, inventory, alerts))
+                return
+            if self.path == "/monitoring/worker":
+                write_json(self, HTTPStatus.OK, self._worker_status())
                 return
             if self.path == "/monitoring/metrics":
                 summary = state.reserve_summary()
@@ -2694,7 +2749,10 @@ def main() -> int:
     parser.add_argument("--cli-path", default="./build/selfcoin-cli", help="Path to selfcoin-cli used for tx construction.")
     parser.add_argument("--notifier-retry-interval-seconds", type=int, default=5, help="Background notifier retry interval.")
     parser.add_argument("--notifier-secrets-file", default="", help="Optional JSON file mapping notifier secret refs to secret values.")
+    parser.add_argument("--notifier-secret-dir", default="", help="Optional directory containing notifier secrets as individual files keyed by secret ref.")
+    parser.add_argument("--notifier-secret-env-prefix", default="SELFCOIN_MINT_SECRET_", help="Optional env prefix used for notifier secret refs.")
     parser.add_argument("--worker-lock-file", default="", help="Optional file lock used to ensure only one process drains delivery jobs.")
+    parser.add_argument("--mode", choices=["server", "worker", "all"], default="server", help="Run HTTP server, worker loop, or both.")
     args = parser.parse_args()
 
     operator_keys = parse_operator_keys(args.operator_key)
@@ -2713,27 +2771,47 @@ def main() -> int:
         cli_path=args.cli_path,
         notifier_retry_interval_seconds=max(1, args.notifier_retry_interval_seconds),
         notifier_secrets_file=Path(args.notifier_secrets_file) if args.notifier_secrets_file else None,
+        notifier_secret_dir=Path(args.notifier_secret_dir) if args.notifier_secret_dir else None,
+        notifier_secret_env_prefix=str(args.notifier_secret_env_prefix),
         worker_lock_file=Path(args.worker_lock_file) if args.worker_lock_file else None,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
     attestor = BlindSigner.from_seed(config.signing_seed + ":attestation")
-    handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id)
-    server = ThreadingHTTPServer((args.host, args.port), handler_cls)
-    stop_retry = threading.Event()
     leader_lock = WorkerLeaderLock(config.worker_lock_file)
+    handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id, leader_lock)
 
-    def retry_loop() -> None:
+    if args.mode == "worker":
         retry_handler = handler_cls.__new__(handler_cls)
-        while not stop_retry.wait(config.notifier_retry_interval_seconds):
-            try:
+        print("selfcoin-mint worker started", flush=True)
+        try:
+            while True:
                 if leader_lock.try_acquire():
                     retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
-            except Exception:
-                continue
+                time.sleep(config.notifier_retry_interval_seconds)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            leader_lock.release()
+        return 0
 
-    retry_thread = threading.Thread(target=retry_loop, daemon=True)
-    retry_thread.start()
+    server = ThreadingHTTPServer((args.host, args.port), handler_cls)
+    stop_retry = threading.Event()
+    retry_thread: threading.Thread | None = None
+
+    if args.mode == "all":
+        def retry_loop() -> None:
+            retry_handler = handler_cls.__new__(handler_cls)
+            while not stop_retry.wait(config.notifier_retry_interval_seconds):
+                try:
+                    if leader_lock.try_acquire():
+                        retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
+                except Exception:
+                    continue
+
+        retry_thread = threading.Thread(target=retry_loop, daemon=True)
+        retry_thread.start()
+
     print(f"selfcoin-mint listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
@@ -2742,7 +2820,8 @@ def main() -> int:
     finally:
         stop_retry.set()
         server.server_close()
-        retry_thread.join(timeout=5)
+        if retry_thread is not None:
+            retry_thread.join(timeout=5)
         leader_lock.release()
     return 0
 

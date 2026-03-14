@@ -61,6 +61,7 @@ Suggested example HTTP endpoints:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /monitoring/worker`
 - `GET /dashboard`
 - `GET /dashboard/incidents`
 - `POST /monitoring/dead_letters/replay`
@@ -237,6 +238,7 @@ The service also exposes:
 - event log size
 - dead-letter count
 - pending notifier delivery count
+- worker leader owned
 
 Supported notifier hooks:
 - `webhook`: POST `{ "event": ... }` JSON to a target URL
@@ -263,8 +265,13 @@ When a notifier fails:
 
 Operationally:
 - the worker may use a leader/lock file so only one process drains notifier jobs
-- notifier secrets should come from an external secrets JSON file, not the persisted mint state
+- notifier secrets should come from OS-managed files or environment policy first, not the persisted mint state
 - TLS contexts are rebuilt per delivery so CA/client certificate file rotation is picked up without restart
+
+Recommended process split:
+- `server` mode: HTTP API only
+- `worker` mode: delivery queue worker only
+- `all` mode: combined development convenience
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 

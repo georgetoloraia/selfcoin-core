@@ -453,6 +453,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_reserve_alerts --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_health --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_metrics --url http://host:port/path\n"
+              << "  selfcoin-cli mint_worker_status --url http://host:port/path\n"
               << "  selfcoin-cli mint_alert_history --url http://host:port/path\n"
               << "  selfcoin-cli mint_alert_ack --url http://host:port/path --event-id <id> --operator-key-id <id> --operator-secret-hex <hex> [--note <text>]\n"
               << "  selfcoin-cli mint_alert_silence --url http://host:port/path --event-type <type> --until <unix> --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
@@ -2053,7 +2054,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "mint_alert_silences" || cmd == "mint_event_policy" || cmd == "mint_notifier_list" ||
-      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export") {
+      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export" || cmd == "mint_worker_status") {
     std::string url;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];

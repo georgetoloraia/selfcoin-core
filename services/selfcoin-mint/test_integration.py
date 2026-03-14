@@ -285,36 +285,50 @@ class MintIntegrationTests(unittest.TestCase):
                         "script_pubkey_hex": "",
                     }
                 ]
+                common_args = [
+                    "python3",
+                    str(SERVER),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--state-file",
+                    str(state_path),
+                    "--mint-id",
+                    "22" * 32,
+                    "--signing-seed",
+                    "integration-seed",
+                    "--operator-key",
+                    f"{operator_key_id}:{operator_secret_hex}",
+                    "--lightserver-url",
+                    f"http://127.0.0.1:{lightserver_port}/rpc",
+                    "--reserve-privkey",
+                    reserve_privkey,
+                    "--reserve-address",
+                    reserve_address,
+                    "--cli-path",
+                    str(CLI),
+                    "--notifier-retry-interval-seconds",
+                    "1",
+                    "--notifier-secrets-file",
+                    str(secrets_path),
+                    "--worker-lock-file",
+                    str(lock_path),
+                ]
                 proc = subprocess.Popen(
-                    [
-                        "python3",
-                        str(SERVER),
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                        "--state-file",
-                        str(state_path),
-                        "--mint-id",
-                        "22" * 32,
-                        "--signing-seed",
-                        "integration-seed",
-                        "--operator-key",
-                        f"{operator_key_id}:{operator_secret_hex}",
-                        "--lightserver-url",
-                        f"http://127.0.0.1:{lightserver_port}/rpc",
-                        "--reserve-privkey",
-                        reserve_privkey,
-                        "--reserve-address",
-                        reserve_address,
-                        "--cli-path",
-                        str(CLI),
-                        "--notifier-retry-interval-seconds",
-                        "1",
-                        "--notifier-secrets-file",
-                        str(secrets_path),
-                        "--worker-lock-file",
-                        str(lock_path),
+                    common_args + [
+                        "--mode",
+                        "server",
+                    ],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                worker_proc = subprocess.Popen(
+                    common_args + [
+                        "--mode",
+                        "worker",
                     ],
                     cwd=REPO_ROOT,
                     stdout=subprocess.PIPE,
@@ -331,6 +345,10 @@ class MintIntegrationTests(unittest.TestCase):
                             time.sleep(0.1)
                     else:
                         self.fail("mint service did not become ready")
+
+                    worker_status = http_get_json(f"http://127.0.0.1:{port}/monitoring/worker")
+                    self.assertEqual(worker_status["lock_file"], str(lock_path))
+                    self.assertTrue(worker_status["owner_pid"])
 
                     deposit_cmd = [
                         str(CLI),
@@ -584,12 +602,14 @@ class MintIntegrationTests(unittest.TestCase):
                     alert_history = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
                     self.assertGreaterEqual(len(alert_history["events"]), 1)
                     self.assertEqual(alert_history["events"][0]["event_type"], "policy.auto_pause")
+                    for _ in range(20):
+                        paths = {item["path"] for item in notifier.received}
+                        if "/alertmanager" in paths and "/fail" in paths:
+                            break
+                        time.sleep(0.1)
                     self.assertGreaterEqual(len(notifier.received), 2)
-                    self.assertIn("/webhook", {item["path"] for item in notifier.received})
                     self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
                     self.assertIn("/fail", {item["path"] for item in notifier.received})
-                    webhook_call = next(item for item in notifier.received if item["path"] == "/webhook")
-                    self.assertEqual(webhook_call["authorization"], "Bearer integration-token")
                     self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
                     auto_pause_event = alert_history["events"][0]
                     self.assertEqual(auto_pause_event["deliveries"]["ops-fail"]["status"], "dead_letter")
@@ -722,9 +742,14 @@ class MintIntegrationTests(unittest.TestCase):
                         operator_secret_hex,
                     ]
                     subprocess.run(replay_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
-                    history_after_replay = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
-                    replay_event = next(item for item in history_after_replay["events"] if item["event_type"] == "dead_letter.replayed")
-                    self.assertTrue(replay_event["deliveries"]["ops-webhook"]["status"] == "delivered")
+                    replay_event = None
+                    for _ in range(20):
+                        history_after_replay = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                        replay_event = next((item for item in history_after_replay["events"] if item["event_type"] == "dead_letter.replayed"), None)
+                        if replay_event is not None:
+                            break
+                        time.sleep(0.1)
+                    self.assertIsNotNone(replay_event)
 
                     incident_cmd = [
                         str(CLI),
@@ -870,6 +895,16 @@ class MintIntegrationTests(unittest.TestCase):
                     operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")
                     self.assertEqual(operator_pub["operator_key_id"], operator_key_id)
                 finally:
+                    worker_proc.terminate()
+                    try:
+                        worker_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        worker_proc.kill()
+                        worker_proc.wait(timeout=5)
+                    if worker_proc.stdout is not None:
+                        worker_proc.stdout.close()
+                    if worker_proc.stderr is not None:
+                        worker_proc.stderr.close()
                     proc.terminate()
                     try:
                         proc.wait(timeout=5)

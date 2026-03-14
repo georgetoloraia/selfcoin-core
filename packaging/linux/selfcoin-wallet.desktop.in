@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SelfCoin Wallet
+GenericName=Cryptocurrency Wallet
+Comment=Reference desktop wallet for selfcoin-core
+Exec=selfcoin-wallet
+Terminal=false
+Categories=Finance;
+StartupNotify=true

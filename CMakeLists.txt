@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(selfcoin_core LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -123,6 +125,26 @@ if(Qt5Widgets_FOUND)
     target_compile_options(selfcoin-wallet PRIVATE ${SC_SAN_FLAGS})
     target_link_options(selfcoin-wallet PRIVATE -fsanitize=address,undefined)
   endif()
+
+  set(SELFCOIN_WALLET_DESKTOP_DIR "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+  set(SELFCOIN_WALLET_DOC_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/selfcoin-wallet")
+  configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/selfcoin-wallet.desktop.in
+    ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
+    @ONLY
+  )
+
+  install(TARGETS selfcoin-wallet
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
+    DESTINATION ${SELFCOIN_WALLET_DESKTOP_DIR}
+  )
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/REFERENCE_WALLET_SPEC.md
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/SELFCOIN_CORE_CURRENT_BEHAVIOR.md
+    DESTINATION ${SELFCOIN_WALLET_DOC_DIR}
+  )
 else()
   message(STATUS "Qt5 Widgets not found; skipping selfcoin-wallet target")
 endif()
@@ -183,3 +205,12 @@ endif()
 enable_testing()
 add_test(NAME selfcoin-tests COMMAND selfcoin-tests)
 set_tests_properties(selfcoin-tests PROPERTIES RESOURCE_LOCK ports)
+
+set(CPACK_PACKAGE_NAME "selfcoin-wallet")
+set(CPACK_PACKAGE_VENDOR "selfcoin")
+set(CPACK_PACKAGE_CONTACT "selfcoin")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SelfCoin reference desktop wallet")
+set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_GENERATOR "TGZ;ZIP")
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}")
+include(CPack)

@@ -12,8 +12,8 @@
 
 class QLabel;
 class QLineEdit;
+class QListWidget;
 class QPushButton;
-class QPlainTextEdit;
 class QTabWidget;
 
 namespace selfcoin::keystore {
@@ -84,8 +84,8 @@ class WalletWindow final : public QMainWindow {
   void save_connection_settings();
   void validate_send_form();
   void submit_send();
-  void show_latest_chain_detail();
-  void show_latest_mint_detail();
+  void show_selected_chain_detail();
+  void show_selected_mint_detail();
   void submit_mint_deposit();
   void issue_mint_note();
   void submit_mint_redemption();
@@ -105,7 +105,7 @@ class WalletWindow final : public QMainWindow {
   QLabel* pending_balance_label_{nullptr};
   QLabel* receive_address_home_label_{nullptr};
   QLabel* receive_address_label_{nullptr};
-  QPlainTextEdit* history_view_{nullptr};
+  QListWidget* history_view_{nullptr};
   QLabel* tip_status_label_{nullptr};
   QPushButton* history_detail_button_{nullptr};
 
@@ -123,9 +123,9 @@ class WalletWindow final : public QMainWindow {
   QLabel* mint_status_label_{nullptr};
   QLabel* mint_private_balance_label_{nullptr};
   QLabel* mint_note_count_label_{nullptr};
-  QPlainTextEdit* mint_deposits_view_{nullptr};
-  QPlainTextEdit* mint_notes_view_{nullptr};
-  QPlainTextEdit* mint_redemptions_view_{nullptr};
+  QListWidget* mint_deposits_view_{nullptr};
+  QListWidget* mint_notes_view_{nullptr};
+  QListWidget* mint_redemptions_view_{nullptr};
   QPushButton* mint_detail_button_{nullptr};
 
   QLineEdit* lightserver_url_edit_{nullptr};

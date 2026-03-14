@@ -20,8 +20,8 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMessageBox>
-#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSettings>
 #include <QStatusBar>
@@ -308,13 +308,11 @@ void WalletWindow::build_ui() {
   auto* history = new QWidget(this);
   auto* history_layout = new QVBoxLayout(history);
   auto* history_actions = new QHBoxLayout();
-  history_detail_button_ = new QPushButton("Latest Transaction Details", history);
+  history_detail_button_ = new QPushButton("Selected Transaction Details", history);
   history_actions->addStretch(1);
   history_actions->addWidget(history_detail_button_);
   history_layout->addLayout(history_actions);
-  history_view_ = new QPlainTextEdit(history);
-  history_view_->setReadOnly(true);
-  history_view_->setPlainText("No wallet history yet.\nOpen or create a wallet to start recording local wallet actions.");
+  history_view_ = new QListWidget(history);
   history_layout->addWidget(history_view_);
   tabs_->addTab(history, "History");
 
@@ -386,30 +384,24 @@ void WalletWindow::build_ui() {
 
   auto* deposits_box = new QGroupBox("Recent Deposits", mint_ops);
   auto* deposits_layout = new QVBoxLayout(deposits_box);
-  mint_deposits_view_ = new QPlainTextEdit(deposits_box);
-  mint_deposits_view_->setReadOnly(true);
-  mint_deposits_view_->setMaximumBlockCount(32);
+  mint_deposits_view_ = new QListWidget(deposits_box);
   deposits_layout->addWidget(mint_deposits_view_);
   mint_right->addWidget(deposits_box);
 
   auto* notes_box = new QGroupBox("Note Inventory", mint_ops);
   auto* notes_layout = new QVBoxLayout(notes_box);
-  mint_notes_view_ = new QPlainTextEdit(notes_box);
-  mint_notes_view_->setReadOnly(true);
-  mint_notes_view_->setMaximumBlockCount(64);
+  mint_notes_view_ = new QListWidget(notes_box);
   notes_layout->addWidget(mint_notes_view_);
   mint_right->addWidget(notes_box);
 
   auto* redemption_box = new QGroupBox("Recent Redemptions", mint_ops);
   auto* redemption_layout = new QVBoxLayout(redemption_box);
   auto* redemption_actions = new QHBoxLayout();
-  mint_detail_button_ = new QPushButton("Latest Mint Details", redemption_box);
+  mint_detail_button_ = new QPushButton("Selected Mint Details", redemption_box);
   redemption_actions->addStretch(1);
   redemption_actions->addWidget(mint_detail_button_);
   redemption_layout->addLayout(redemption_actions);
-  mint_redemptions_view_ = new QPlainTextEdit(redemption_box);
-  mint_redemptions_view_->setReadOnly(true);
-  mint_redemptions_view_->setMaximumBlockCount(48);
+  mint_redemptions_view_ = new QListWidget(redemption_box);
   redemption_layout->addWidget(mint_redemptions_view_);
   mint_right->addWidget(redemption_box);
 
@@ -455,13 +447,17 @@ void WalletWindow::build_ui() {
   });
   connect(send_review_button, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button, &QPushButton::clicked, this, [this]() { submit_send(); });
-  connect(history_detail_button_, &QPushButton::clicked, this, [this]() { show_latest_chain_detail(); });
+  connect(history_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_chain_detail(); });
   connect(mint_deposit_button, &QPushButton::clicked, this, [this]() { submit_mint_deposit(); });
   connect(mint_issue_button, &QPushButton::clicked, this, [this]() { issue_mint_note(); });
   connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
   connect(mint_redeem_status_button, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
-  connect(mint_detail_button_, &QPushButton::clicked, this, [this]() { show_latest_mint_detail(); });
+  connect(mint_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_mint_detail(); });
   connect(save_settings_button, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
+  connect(history_view_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) { show_selected_chain_detail(); });
+  connect(mint_deposits_view_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) { show_selected_mint_detail(); });
+  connect(mint_notes_view_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) { show_selected_mint_detail(); });
+  connect(mint_redemptions_view_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem*) { show_selected_mint_detail(); });
 
   const QString mono = mono_font_family();
   history_view_->setFont(QFont(mono));
@@ -520,18 +516,25 @@ void WalletWindow::update_connection_views() {
 }
 
 void WalletWindow::render_history_view() {
-  QStringList combined = chain_history_lines_;
-  if (!local_history_lines_.empty()) {
-    combined.push_back("");
-    combined.push_back("Local wallet events");
-    combined.push_back("-------------------");
-    for (const auto& line : local_history_lines_) combined.push_back(line);
-  }
-  if (combined.empty()) {
-    history_view_->setPlainText("No wallet history yet.\nOpen or create a wallet to start syncing activity.");
+  history_view_->clear();
+  if (chain_records_.empty() && local_history_lines_.empty()) {
+    auto* item = new QListWidgetItem("No wallet history yet.", history_view_);
+    item->setData(Qt::UserRole, -1);
+    history_detail_button_->setEnabled(false);
     return;
   }
-  history_view_->setPlainText(combined.join("\n"));
+  for (std::size_t i = 0; i < chain_history_lines_.size(); ++i) {
+    auto* item = new QListWidgetItem(chain_history_lines_[static_cast<int>(i)], history_view_);
+    item->setData(Qt::UserRole, static_cast<int>(i));
+  }
+  if (!local_history_lines_.empty()) {
+    auto* sep = new QListWidgetItem("---- Local Wallet Events ----", history_view_);
+    sep->setFlags(Qt::NoItemFlags);
+    for (const auto& line : local_history_lines_) {
+      auto* item = new QListWidgetItem(line, history_view_);
+      item->setData(Qt::UserRole, -1);
+    }
+  }
   history_detail_button_->setEnabled(!chain_records_.empty());
 }
 
@@ -544,61 +547,75 @@ void WalletWindow::render_mint_state() {
     private_total += note.amount;
     by_amount[note.amount] += 1;
   }
+  mint_records_.clear();
+  mint_deposits_view_->clear();
+  mint_notes_view_->clear();
+  mint_redemptions_view_->clear();
   mint_private_balance_label_->setText(format_coin_amount(private_total));
   mint_note_count_label_->setText(QString::number(mint_notes_.size()));
   if (mint_notes_.empty()) {
     mint_notes_label_->setText("-");
-    mint_notes_view_->setPlainText("No active private notes.");
+    auto* item = new QListWidgetItem("No active private notes.", mint_notes_view_);
+    item->setData(Qt::UserRole, -1);
   } else {
     QStringList summary_lines;
-    QStringList detail_lines;
+    mint_notes_view_->clear();
     for (const auto& [amount, count] : by_amount) {
       summary_lines.push_back(QString("%1 x %2").arg(QString::number(count), format_coin_amount(amount)));
     }
     for (const auto& note : mint_notes_) {
-      detail_lines.push_back(QString("%1  %2").arg(format_coin_amount(note.amount), elide_middle(note.note_ref, 10)));
+      const QString details = QString("%1  %2").arg(format_coin_amount(note.amount), elide_middle(note.note_ref, 10));
+      auto* item = new QListWidgetItem(details, mint_notes_view_);
+      mint_records_.push_back(MintRecord{"FINALIZED", "note", note.note_ref, format_coin_amount(note.amount), details});
+      item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
     }
     mint_notes_label_->setText(summary_lines.join("\n"));
-    mint_notes_view_->setPlainText(detail_lines.join("\n"));
   }
 
-  QStringList deposit_lines;
-  QStringList redemption_lines;
-  mint_records_.clear();
   for (int i = local_history_lines_.size() - 1; i >= 0; --i) {
     const QString line = local_history_lines_[i];
     if (line.startsWith("[mint-deposit]")) {
       const QString details = trim_after_token(line, "[mint-deposit]");
-      deposit_lines.push_back(QString("%1 %2").arg(badge_text("PENDING"), details));
       mint_records_.push_back(MintRecord{"PENDING", "deposit", mint_deposit_ref_, {}, details});
+      auto* item = new QListWidgetItem(QString("%1 %2").arg(badge_text("PENDING"), details), mint_deposits_view_);
+      item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
     } else if (line.startsWith("[mint-redeem]")) {
       const QString batch = extract_field_value(line, "batch");
       const QString amount = extract_field_value(line, "amount");
       const QString notes = extract_field_value(line, "notes");
       const QString details = QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes);
-      redemption_lines.push_back(QString("%1 %2").arg(badge_text("PENDING"), details));
       mint_records_.push_back(MintRecord{"PENDING", "redemption", batch, amount, details});
+      auto* item = new QListWidgetItem(QString("%1 %2").arg(badge_text("PENDING"), details), mint_redemptions_view_);
+      item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
     } else if (line.startsWith("[mint-status]")) {
       const QString batch = extract_field_value(line, "batch");
       const QString state = extract_field_value(line, "state");
       const QString txid = extract_field_value(line, "l1_txid");
       const QString details = QString("batch=%1  state=%2  tx=%3")
                                   .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8));
-      redemption_lines.push_back(QString("%1 %2").arg(badge_text(mint_state_badge(state)), details));
       mint_records_.push_back(MintRecord{mint_state_badge(state), "status", batch, {}, details});
+      auto* item =
+          new QListWidgetItem(QString("%1 %2").arg(badge_text(mint_state_badge(state)), details), mint_redemptions_view_);
+      item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
     } else if (line.startsWith("[mint-issue]")) {
       const QString issuance = extract_field_value(line, "issuance");
       const QString amount = extract_field_value(line, "amount");
       const QString notes = extract_field_value(line, "notes");
-      mint_records_.push_back(MintRecord{
-          "FINALIZED", "issue", issuance, amount, QString("issuance=%1  amount=%2  notes=%3").arg(issuance, amount, notes)});
+      const QString details = QString("issuance=%1  amount=%2  notes=%3").arg(issuance, amount, notes);
+      mint_records_.push_back(MintRecord{"FINALIZED", "issue", issuance, amount, details});
+      auto* item = new QListWidgetItem(QString("%1 %2").arg(badge_text("FINALIZED"), details), mint_redemptions_view_);
+      item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
     }
-    if (deposit_lines.size() >= 10 && redemption_lines.size() >= 12) break;
+    if (mint_deposits_view_->count() >= 10 && mint_redemptions_view_->count() >= 12) break;
   }
-  mint_deposits_view_->setPlainText(deposit_lines.isEmpty() ? "No mint deposits recorded yet."
-                                                            : deposit_lines.join("\n"));
-  mint_redemptions_view_->setPlainText(redemption_lines.isEmpty() ? "No redemptions recorded yet."
-                                                                  : redemption_lines.join("\n"));
+  if (mint_deposits_view_->count() == 0) {
+    auto* item = new QListWidgetItem("No mint deposits recorded yet.", mint_deposits_view_);
+    item->setData(Qt::UserRole, -1);
+  }
+  if (mint_redemptions_view_->count() == 0) {
+    auto* item = new QListWidgetItem("No redemptions recorded yet.", mint_redemptions_view_);
+    item->setData(Qt::UserRole, -1);
+  }
   mint_detail_button_->setEnabled(!mint_records_.empty());
 }
 
@@ -1022,24 +1039,42 @@ void WalletWindow::submit_send() {
   statusBar()->showMessage("Transaction broadcasted.", 3000);
 }
 
-void WalletWindow::show_latest_chain_detail() {
-  if (chain_records_.empty()) {
-    QMessageBox::information(this, "Transaction Details", "No on-chain transaction records yet.");
+void WalletWindow::show_selected_chain_detail() {
+  auto* item = history_view_->currentItem();
+  if (!item) {
+    QMessageBox::information(this, "Transaction Details", "Select a transaction row first.");
     return;
   }
-  const auto& rec = chain_records_.front();
+  const int index = item->data(Qt::UserRole).toInt();
+  if (index < 0 || static_cast<std::size_t>(index) >= chain_records_.size()) {
+    QMessageBox::information(this, "Transaction Details", "The selected row does not have transaction details.");
+    return;
+  }
+  const auto& rec = chain_records_[static_cast<std::size_t>(index)];
   QMessageBox::information(
       this, "Transaction Details",
       QString("Status: %1\nType: %2\nAmount/Detail: %3\nTXID: %4\n\n%5")
           .arg(rec.status, rec.kind, rec.amount, rec.txid, rec.details));
 }
 
-void WalletWindow::show_latest_mint_detail() {
-  if (mint_records_.empty()) {
-    QMessageBox::information(this, "Mint Details", "No mint records yet.");
+void WalletWindow::show_selected_mint_detail() {
+  QListWidgetItem* item = nullptr;
+  if (mint_deposits_view_->hasFocus()) item = mint_deposits_view_->currentItem();
+  if (!item && mint_notes_view_->hasFocus()) item = mint_notes_view_->currentItem();
+  if (!item && mint_redemptions_view_->hasFocus()) item = mint_redemptions_view_->currentItem();
+  if (!item) item = mint_redemptions_view_->currentItem();
+  if (!item) item = mint_deposits_view_->currentItem();
+  if (!item) item = mint_notes_view_->currentItem();
+  if (!item) {
+    QMessageBox::information(this, "Mint Details", "Select a mint row first.");
     return;
   }
-  const auto& rec = mint_records_.front();
+  const int index = item->data(Qt::UserRole).toInt();
+  if (index < 0 || static_cast<std::size_t>(index) >= mint_records_.size()) {
+    QMessageBox::information(this, "Mint Details", "The selected row does not have mint details.");
+    return;
+  }
+  const auto& rec = mint_records_[static_cast<std::size_t>(index)];
   QMessageBox::information(
       this, "Mint Details",
       QString("Status: %1\nKind: %2\nReference: %3\nAmount: %4\n\n%5")

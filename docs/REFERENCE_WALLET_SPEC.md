@@ -44,9 +44,10 @@ Implemented now in `selfcoin-wallet`:
   - recent deposit list
   - recent redemption/status list
 - classic detail surfaces for:
-  - latest on-chain transaction dialog
-  - latest mint activity dialog
+  - selected on-chain transaction dialog
+  - selected mint activity dialog
   - clearer `pending / finalized / failed` badge-style history rows
+  - explicit row selection from visible ledger lists
 
 Intentionally deferred to the next wallet phase:
 - QR rendering

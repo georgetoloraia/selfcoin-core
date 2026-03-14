@@ -183,6 +183,13 @@ class FakeNotifierSink:
                 raw = self.rfile.read(length)
                 payload = json.loads(raw.decode("utf-8"))
                 outer.received.append({"path": self.path, "payload": payload})
+                if self.path == "/fail":
+                    self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", "2")
@@ -394,6 +401,7 @@ class MintIntegrationTests(unittest.TestCase):
                         ("ops-webhook", "webhook", f"http://127.0.0.1:{notifier_port}/webhook", []),
                         ("ops-alertmanager", "alertmanager", f"http://127.0.0.1:{notifier_port}/alertmanager", []),
                         ("ops-email", "email_spool", str(email_spool), ["--email-to", "ops@example.test", "--email-from", "mint@example.test"]),
+                        ("ops-fail", "webhook", f"http://127.0.0.1:{notifier_port}/fail", ["--retry-max-attempts", "1", "--retry-backoff-seconds", "1"]),
                     ]:
                         notifier_cmd = [
                             str(CLI),
@@ -558,7 +566,10 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertGreaterEqual(len(notifier.received), 2)
                     self.assertIn("/webhook", {item["path"] for item in notifier.received})
                     self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
+                    self.assertIn("/fail", {item["path"] for item in notifier.received})
                     self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
+                    auto_pause_event = alert_history["events"][0]
+                    self.assertEqual(auto_pause_event["deliveries"]["ops-fail"]["status"], "dead_letter")
 
                     metrics_cmd = [
                         str(CLI),
@@ -569,6 +580,7 @@ class MintIntegrationTests(unittest.TestCase):
                     metrics = subprocess.run(metrics_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
                     self.assertIn("selfcoin_mint_auto_pause_recommended 1", metrics.stdout)
                     self.assertIn("selfcoin_mint_redemptions_paused 1", metrics.stdout)
+                    self.assertIn("selfcoin_mint_dead_letter_count 2", metrics.stdout)
 
                     ack_cmd = [
                         str(CLI),
@@ -634,6 +646,29 @@ class MintIntegrationTests(unittest.TestCase):
                     event_policy = http_get_json(f"http://127.0.0.1:{port}/monitoring/events/policy")
                     self.assertEqual(event_policy["event_retention_limit"], 64)
                     self.assertFalse(event_policy["export_include_acknowledged"])
+
+                    dead_letters_cmd = [
+                        str(CLI),
+                        "mint_dead_letters",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/dead_letters",
+                    ]
+                    dead_letters = subprocess.run(dead_letters_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    dead_letters_json = json.loads(dead_letters.stdout)
+                    self.assertGreaterEqual(len(dead_letters_json["dead_letters"]), 2)
+                    self.assertTrue(all(item["notifier_id"] == "ops-fail" for item in dead_letters_json["dead_letters"]))
+
+                    incident_cmd = [
+                        str(CLI),
+                        "mint_incident_timeline_export",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/incidents/export",
+                    ]
+                    incident = subprocess.run(incident_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    incident_json = json.loads(incident.stdout)
+                    self.assertTrue(incident_json["signature_hex"])
+                    self.assertGreaterEqual(len(incident_json["payload"]["dead_letters"]), 1)
+                    self.assertGreaterEqual(len(incident_json["payload"]["events"]), 1)
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20

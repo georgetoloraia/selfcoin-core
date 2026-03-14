@@ -58,6 +58,8 @@ Suggested example HTTP endpoints:
 - `GET /monitoring/events/policy`
 - `GET /monitoring/events/silences`
 - `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -217,6 +219,8 @@ The service also exposes:
 - `GET /monitoring/events/policy`
 - `GET /monitoring/events/silences`
 - `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
 
 `GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
 - available reserve
@@ -227,11 +231,24 @@ The service also exposes:
 - redemptions paused / auto-pause enabled
 - current health status
 - event log size
+- dead-letter count
+- pending notifier delivery count
 
 Supported notifier hooks:
 - `webhook`: POST `{ "event": ... }` JSON to a target URL
 - `alertmanager`: POST alert-style JSON to a target URL
 - `email_spool`: write `.eml` files into a configured spool directory
+
+Notifier configuration includes:
+- `retry_max_attempts`
+- `retry_backoff_seconds`
+
+When a notifier fails:
+- the event stores per-notifier delivery status, attempt count, error text, and next retry time
+- retries are attempted on subsequent service activity
+- once the retry budget is exhausted, the delivery is moved into `dead_letters`
+
+`GET /monitoring/incidents/export` returns a signed incident timeline suitable for audit/ops review.
 
 ### 6. Reserve and accounting views
 
@@ -307,7 +324,9 @@ selfcoin-cli mint_alert_silences --url http://host:port/monitoring/events/silenc
 selfcoin-cli mint_event_policy --url http://host:port/monitoring/events/policy
 selfcoin-cli mint_event_policy_update --url http://host:port/monitoring/events/policy --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]
 selfcoin-cli mint_notifier_list --url http://host:port/monitoring/notifiers
-selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value>
+selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--retry-max-attempts <n>] [--retry-backoff-seconds <n>]
+selfcoin-cli mint_dead_letters --url http://host:port/monitoring/dead_letters
+selfcoin-cli mint_incident_timeline_export --url http://host:port/monitoring/incidents/export
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health
 selfcoin-cli mint_reserve_metrics --url http://host:port/monitoring/metrics

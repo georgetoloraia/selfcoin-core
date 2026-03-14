@@ -460,7 +460,9 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_event_policy --url http://host:port/path\n"
               << "  selfcoin-cli mint_event_policy_update --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]\n"
               << "  selfcoin-cli mint_notifier_list --url http://host:port/path\n"
-              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--email-to <addr>] [--email-from <addr>]\n"
+              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--email-to <addr>] [--email-from <addr>]\n"
+              << "  selfcoin-cli mint_dead_letters --url http://host:port/path\n"
+              << "  selfcoin-cli mint_incident_timeline_export --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_redemptions_pause --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
@@ -2049,7 +2051,8 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (cmd == "mint_alert_silences" || cmd == "mint_event_policy" || cmd == "mint_notifier_list") {
+  if (cmd == "mint_alert_silences" || cmd == "mint_event_policy" || cmd == "mint_notifier_list" ||
+      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export") {
     std::string url;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -2111,7 +2114,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "mint_notifier_upsert") {
-    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from;
+    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
@@ -2121,6 +2124,8 @@ int main(int argc, char** argv) {
       else if (a == "--kind" && i + 1 < argc) kind = argv[++i];
       else if (a == "--target" && i + 1 < argc) target = argv[++i];
       else if (a == "--enabled" && i + 1 < argc) enabled = argv[++i];
+      else if (a == "--retry-max-attempts" && i + 1 < argc) retry_max_attempts = argv[++i];
+      else if (a == "--retry-backoff-seconds" && i + 1 < argc) retry_backoff_seconds = argv[++i];
       else if (a == "--email-to" && i + 1 < argc) email_to = argv[++i];
       else if (a == "--email-from" && i + 1 < argc) email_from = argv[++i];
     }
@@ -2132,6 +2137,8 @@ int main(int argc, char** argv) {
     std::ostringstream body_json;
     body_json << "{\"notifier_id\":\"" << notifier_id << "\",\"kind\":\"" << kind
               << "\",\"target\":\"" << target << "\",\"enabled\":" << (enabled_value ? "true" : "false");
+    if (!retry_max_attempts.empty()) body_json << ",\"retry_max_attempts\":" << retry_max_attempts;
+    if (!retry_backoff_seconds.empty()) body_json << ",\"retry_backoff_seconds\":" << retry_backoff_seconds;
     if (!email_to.empty()) body_json << ",\"email_to\":\"" << email_to << "\"";
     if (!email_from.empty()) body_json << ",\"email_from\":\"" << email_from << "\"";
     body_json << "}";

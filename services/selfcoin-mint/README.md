@@ -41,6 +41,8 @@ It is a narrow scaffold, not a production mint:
 - `GET /monitoring/events/policy`
 - `GET /monitoring/events/silences`
 - `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
 - `GET /accounting/summary`
 - `GET /operator/key`
@@ -140,6 +142,12 @@ python3 services/selfcoin-mint/server.py \
 
 ./build/selfcoin-cli mint_notifier_list \
   --url http://127.0.0.1:8080/monitoring/notifiers
+
+./build/selfcoin-cli mint_dead_letters \
+  --url http://127.0.0.1:8080/monitoring/dead_letters
+
+./build/selfcoin-cli mint_incident_timeline_export \
+  --url http://127.0.0.1:8080/monitoring/incidents/export
 ```
 
 ```bash
@@ -192,7 +200,9 @@ python3 services/selfcoin-mint/server.py \
   --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
   --notifier-id ops-webhook \
   --kind webhook \
-  --target http://127.0.0.1:9099/webhook
+  --target http://127.0.0.1:9099/webhook \
+  --retry-max-attempts 3 \
+  --retry-backoff-seconds 30
 ```
 
 ```bash
@@ -224,11 +234,17 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/monitoring/events/policy` exposes event retention/export settings.
 - `/monitoring/events/silences` exposes active and expired silences.
 - `/monitoring/notifiers` exposes configured notifier hooks.
+- `/monitoring/dead_letters` exposes failed notifier deliveries that exhausted retries.
+- `/monitoring/incidents/export` exposes a signed incident timeline including events, silences, dead letters, and notifier state.
 - `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
 - Notifier hooks currently support:
   - `webhook`
   - `alertmanager`
   - `email_spool` for local `.eml` drop delivery
+- Each notifier supports:
+  - `retry_max_attempts`
+  - `retry_backoff_seconds`
+- Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:

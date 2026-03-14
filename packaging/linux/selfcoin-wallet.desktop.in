@@ -5,6 +5,7 @@ Name=SelfCoin Wallet
 GenericName=Cryptocurrency Wallet
 Comment=Reference desktop wallet for selfcoin-core
 Exec=selfcoin-wallet
+Icon=selfcoin-wallet
 Terminal=false
 Categories=Finance;
 StartupNotify=true

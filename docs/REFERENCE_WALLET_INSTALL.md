@@ -21,6 +21,7 @@ cmake --install build --prefix /tmp/selfcoin-wallet-stage
 That produces:
 - `bin/selfcoin-wallet`
 - `share/applications/selfcoin-wallet.desktop`
+- `share/icons/hicolor/scalable/apps/selfcoin-wallet.svg`
 - `share/doc/selfcoin-wallet/*`
 
 ## Package Artifacts
@@ -34,6 +35,40 @@ cpack -G ZIP
 ```
 
 The generated package contains the staged wallet binary, desktop entry, and wallet docs.
+
+## One-Step Release Build
+
+To build, stage, package, and generate release checksums/manifests in one step:
+
+```bash
+./scripts/package_reference_wallet.sh
+```
+
+That produces:
+- staged install under `/tmp/selfcoin-wallet-stage` by default
+- package archives under `build/release/`
+- `build/release/SHA256SUMS.txt`
+- `build/release/manifest.txt`
+- `build/release/RELEASE_NOTES.md`
+
+For signed release metadata:
+
+```bash
+RELEASE_SIGNING_KEY=/path/to/release-private.pem \
+RELEASE_SIGNING_PUBKEY=/path/to/release-public.pem \
+./scripts/package_reference_wallet.sh
+```
+
+That additionally produces:
+- `build/release/SHA256SUMS.txt.sig`
+- `build/release/manifest.txt.sig`
+- copied public key, if provided
+
+To verify a built release:
+
+```bash
+./scripts/verify_wallet_release.sh build/release /path/to/release-public.pem
+```
 
 ## Desktop Launch
 

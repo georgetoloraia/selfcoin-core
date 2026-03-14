@@ -128,6 +128,7 @@ if(Qt5Widgets_FOUND)
 
   set(SELFCOIN_WALLET_DESKTOP_DIR "${CMAKE_INSTALL_DATAROOTDIR}/applications")
   set(SELFCOIN_WALLET_DOC_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/selfcoin-wallet")
+  set(SELFCOIN_WALLET_ICON_DIR "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps")
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/selfcoin-wallet.desktop.in
     ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
@@ -140,8 +141,12 @@ if(Qt5Widgets_FOUND)
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
     DESTINATION ${SELFCOIN_WALLET_DESKTOP_DIR}
   )
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/selfcoin-wallet.svg
+    DESTINATION ${SELFCOIN_WALLET_ICON_DIR}
+  )
   install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/docs/REFERENCE_WALLET_SPEC.md
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/REFERENCE_WALLET_INSTALL.md
     ${CMAKE_CURRENT_SOURCE_DIR}/docs/SELFCOIN_CORE_CURRENT_BEHAVIOR.md
     DESTINATION ${SELFCOIN_WALLET_DOC_DIR}
   )

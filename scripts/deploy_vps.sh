@@ -13,7 +13,7 @@ Examples:
 What it does:
   1) Builds local binaries (Release)
   2) Copies binaries to <remote_dir>/build on VPS
-  3) Optionally starts mainnet public node on VPS (--start)
+  3) Optionally starts a public node on VPS (--start)
 EOF
 }
 
@@ -58,9 +58,9 @@ echo "[deploy] Marking binaries executable..."
 ssh "${TARGET_HOST}" "chmod +x ${REMOTE_DIR}/build/selfcoin-node ${REMOTE_DIR}/build/selfcoin-lightserver ${REMOTE_DIR}/build/selfcoin-cli"
 
 if [[ "${START_NODE}" -eq 1 ]]; then
-  echo "[deploy] Starting selfcoin-node on VPS (nohup, mainnet, public)..."
-  ssh "${TARGET_HOST}" "pkill -f '${REMOTE_DIR}/build/selfcoin-node --mainnet' || true"
-  ssh "${TARGET_HOST}" "nohup ${REMOTE_DIR}/build/selfcoin-node --mainnet --public > ${REMOTE_DIR}/node.log 2>&1 &"
+  echo "[deploy] Starting selfcoin-node on VPS (nohup, public)..."
+  ssh "${TARGET_HOST}" "pkill -f '${REMOTE_DIR}/build/selfcoin-node --public' || true"
+  ssh "${TARGET_HOST}" "nohup ${REMOTE_DIR}/build/selfcoin-node --public > ${REMOTE_DIR}/node.log 2>&1 &"
   echo "[deploy] Started. Tail logs with:"
   echo "ssh ${TARGET_HOST} 'tail -f ${REMOTE_DIR}/node.log'"
 fi

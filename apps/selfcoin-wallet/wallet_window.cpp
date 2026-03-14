@@ -21,12 +21,16 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QComboBox>
+#include <QAction>
+#include <QKeySequence>
 #include <QMessageBox>
+#include <QMenuBar>
 #include <QPushButton>
 #include <QSettings>
 #include <QStatusBar>
 #include <QTableWidget>
 #include <QHeaderView>
+#include <QMenu>
 #include <QTabWidget>
 #include <QFontDatabase>
 #include <QVBoxLayout>
@@ -182,9 +186,63 @@ void configure_table(QTableWidget* table, const QStringList& headers) {
   table->setSelectionMode(QAbstractItemView::SingleSelection);
   table->setEditTriggers(QAbstractItemView::NoEditTriggers);
   table->setAlternatingRowColors(true);
+  table->setSortingEnabled(true);
   table->verticalHeader()->setVisible(false);
   table->horizontalHeader()->setStretchLastSection(true);
   table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+}
+
+void restore_table_sort(QTableWidget* table, QSettings& settings, const QString& prefix, int default_col = 0) {
+  const int column = settings.value(prefix + "_sort_column", default_col).toInt();
+  const auto order = static_cast<Qt::SortOrder>(settings.value(prefix + "_sort_order", static_cast<int>(Qt::AscendingOrder)).toInt());
+  table->sortByColumn(column, order);
+}
+
+QColor status_background(const QString& status) {
+  const QString upper = status.trimmed().toUpper();
+  if (upper == "FINALIZED") return QColor(223, 239, 223);
+  if (upper == "PENDING") return QColor(250, 243, 214);
+  if (upper == "FAILED") return QColor(248, 220, 220);
+  return QColor(243, 243, 243);
+}
+
+void apply_status_item_style(QTableWidgetItem* item) {
+  if (!item) return;
+  item->setBackground(QBrush(status_background(item->text())));
+}
+
+void install_copy_menu(QLabel* label, QWidget* owner) {
+  label->setContextMenuPolicy(Qt::CustomContextMenu);
+  QObject::connect(label, &QLabel::customContextMenuRequested, owner, [label, owner](const QPoint& pos) {
+    if (label->text().trimmed().isEmpty() || label->text() == "-") return;
+    QMenu menu(owner);
+    auto* copy = menu.addAction("Copy");
+    if (menu.exec(label->mapToGlobal(pos)) == copy) QApplication::clipboard()->setText(label->text().trimmed());
+  });
+}
+
+void install_table_copy_menu(QTableWidget* table, QWidget* owner) {
+  table->setContextMenuPolicy(Qt::CustomContextMenu);
+  QObject::connect(table, &QTableWidget::customContextMenuRequested, owner, [table, owner](const QPoint& pos) {
+    auto* item = table->itemAt(pos);
+    if (!item || item->text().trimmed().isEmpty()) return;
+    QMenu menu(owner);
+    auto* copy_cell = menu.addAction("Copy Cell");
+    auto* copy_row = menu.addAction("Copy Row");
+    auto* chosen = menu.exec(table->viewport()->mapToGlobal(pos));
+    if (chosen == copy_cell) {
+      QApplication::clipboard()->setText(item->text().trimmed());
+      return;
+    }
+    if (chosen == copy_row) {
+      QStringList values;
+      for (int c = 0; c < table->columnCount(); ++c) {
+        auto* cell = table->item(item->row(), c);
+        if (cell && !cell->text().trimmed().isEmpty()) values.push_back(cell->text().trimmed());
+      }
+      QApplication::clipboard()->setText(values.join(" | "));
+    }
+  });
 }
 
 std::optional<std::vector<std::size_t>> choose_note_subset_exact(const std::vector<selfcoin::wallet::WalletWindow::MintNote>& notes,
@@ -222,6 +280,29 @@ void WalletWindow::build_ui() {
 
   auto* central = new QWidget(this);
   auto* root = new QVBoxLayout(central);
+
+  auto* file_menu = menuBar()->addMenu("&File");
+  auto* wallet_menu = menuBar()->addMenu("&Wallet");
+  auto* view_menu = menuBar()->addMenu("&View");
+
+  auto* create_action = file_menu->addAction("Create Wallet");
+  create_action->setShortcut(QKeySequence("Ctrl+N"));
+  auto* open_action = file_menu->addAction("Open Wallet");
+  open_action->setShortcut(QKeySequence::Open);
+  auto* import_action = file_menu->addAction("Import Wallet");
+  import_action->setShortcut(QKeySequence("Ctrl+I"));
+  auto* export_action = file_menu->addAction("Export Backup");
+  export_action->setShortcut(QKeySequence("Ctrl+E"));
+  file_menu->addSeparator();
+  auto* quit_action = file_menu->addAction("Quit");
+  quit_action->setShortcut(QKeySequence::Quit);
+
+  auto* refresh_action = view_menu->addAction("Refresh");
+  refresh_action->setShortcut(QKeySequence::Refresh);
+  auto* history_detail_action = view_menu->addAction("Selected Record Details");
+  history_detail_action->setShortcut(QKeySequence("Ctrl+D"));
+  auto* mint_detail_action = wallet_menu->addAction("Selected Mint Details");
+  mint_detail_action->setShortcut(QKeySequence("Ctrl+M"));
 
   auto* top_actions = new QHBoxLayout();
   auto* create_button = new QPushButton("Create Wallet", this);
@@ -464,10 +545,15 @@ void WalletWindow::build_ui() {
   setCentralWidget(central);
 
   connect(create_button, &QPushButton::clicked, this, [this]() { create_wallet(); });
+  connect(create_action, &QAction::triggered, this, [this]() { create_wallet(); });
   connect(open_button, &QPushButton::clicked, this, [this]() { open_wallet(); });
+  connect(open_action, &QAction::triggered, this, [this]() { open_wallet(); });
   connect(import_button, &QPushButton::clicked, this, [this]() { import_wallet(); });
+  connect(import_action, &QAction::triggered, this, [this]() { import_wallet(); });
   connect(export_button, &QPushButton::clicked, this, [this]() { export_wallet_secret(); });
+  connect(export_action, &QAction::triggered, this, [this]() { export_wallet_secret(); });
   connect(refresh_button, &QPushButton::clicked, this, [this]() { refresh_chain_state(true); });
+  connect(refresh_action, &QAction::triggered, this, [this]() { refresh_chain_state(true); });
   connect(copy_address_button, &QPushButton::clicked, this, [this]() {
     if (!wallet_) return;
     QApplication::clipboard()->setText(QString::fromStdString(wallet_->address));
@@ -476,11 +562,13 @@ void WalletWindow::build_ui() {
   connect(send_review_button, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button, &QPushButton::clicked, this, [this]() { submit_send(); });
   connect(history_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_history_detail(); });
+  connect(history_detail_action, &QAction::triggered, this, [this]() { show_selected_history_detail(); });
   connect(mint_deposit_button, &QPushButton::clicked, this, [this]() { submit_mint_deposit(); });
   connect(mint_issue_button, &QPushButton::clicked, this, [this]() { issue_mint_note(); });
   connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
   connect(mint_redeem_status_button, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
   connect(mint_detail_button_, &QPushButton::clicked, this, [this]() { show_selected_mint_detail(); });
+  connect(mint_detail_action, &QAction::triggered, this, [this]() { show_selected_mint_detail(); });
   connect(save_settings_button, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
   connect(history_filter_combo_, &QComboBox::currentTextChanged, this, [this](const QString&) { refresh_history_table(); });
   connect(history_view_, &QTableWidget::cellDoubleClicked, this, [this](int, int) { show_selected_history_detail(); });
@@ -493,6 +581,15 @@ void WalletWindow::build_ui() {
   mint_deposits_view_->setFont(QFont(mono));
   mint_notes_view_->setFont(QFont(mono));
   mint_redemptions_view_->setFont(QFont(mono));
+  install_copy_menu(receive_address_home_label_, this);
+  install_copy_menu(receive_address_label_, this);
+  install_copy_menu(mint_deposit_ref_label_, this);
+  install_copy_menu(mint_redemption_label_, this);
+  install_table_copy_menu(history_view_, this);
+  install_table_copy_menu(mint_deposits_view_, this);
+  install_table_copy_menu(mint_notes_view_, this);
+  install_table_copy_menu(mint_redemptions_view_, this);
+  connect(quit_action, &QAction::triggered, this, [this]() { close(); });
 }
 
 void WalletWindow::load_settings() {
@@ -500,6 +597,13 @@ void WalletWindow::load_settings() {
   lightserver_url_edit_->setText(settings.value("lightserver_url", "http://127.0.0.1:8080").toString());
   mint_url_edit_->setText(settings.value("mint_url", "http://127.0.0.1:8090").toString());
   mint_id_edit_->setText(settings.value("mint_id", "").toString());
+  const QString history_filter = settings.value("history_filter", "All").toString();
+  const int history_idx = history_filter_combo_->findText(history_filter);
+  if (history_idx >= 0) history_filter_combo_->setCurrentIndex(history_idx);
+  restore_table_sort(history_view_, settings, "history_table", 4);
+  restore_table_sort(mint_deposits_view_, settings, "mint_deposits_table", 0);
+  restore_table_sort(mint_notes_view_, settings, "mint_notes_table", 1);
+  restore_table_sort(mint_redemptions_view_, settings, "mint_redemptions_table", 0);
 }
 
 void WalletWindow::save_settings() const {
@@ -507,6 +611,15 @@ void WalletWindow::save_settings() const {
   settings.setValue("lightserver_url", lightserver_url_edit_->text().trimmed());
   settings.setValue("mint_url", mint_url_edit_->text().trimmed());
   settings.setValue("mint_id", mint_id_edit_->text().trimmed());
+  settings.setValue("history_filter", history_filter_combo_->currentText());
+  settings.setValue("history_table_sort_column", history_view_->horizontalHeader()->sortIndicatorSection());
+  settings.setValue("history_table_sort_order", static_cast<int>(history_view_->horizontalHeader()->sortIndicatorOrder()));
+  settings.setValue("mint_deposits_table_sort_column", mint_deposits_view_->horizontalHeader()->sortIndicatorSection());
+  settings.setValue("mint_deposits_table_sort_order", static_cast<int>(mint_deposits_view_->horizontalHeader()->sortIndicatorOrder()));
+  settings.setValue("mint_notes_table_sort_column", mint_notes_view_->horizontalHeader()->sortIndicatorSection());
+  settings.setValue("mint_notes_table_sort_order", static_cast<int>(mint_notes_view_->horizontalHeader()->sortIndicatorOrder()));
+  settings.setValue("mint_redemptions_table_sort_column", mint_redemptions_view_->horizontalHeader()->sortIndicatorSection());
+  settings.setValue("mint_redemptions_table_sort_order", static_cast<int>(mint_redemptions_view_->horizontalHeader()->sortIndicatorOrder()));
 }
 
 void WalletWindow::update_wallet_views() {
@@ -558,6 +671,9 @@ void WalletWindow::render_mint_state() {
     by_amount[note.amount] += 1;
   }
   mint_records_.clear();
+  mint_deposits_view_->setSortingEnabled(false);
+  mint_notes_view_->setSortingEnabled(false);
+  mint_redemptions_view_->setSortingEnabled(false);
   mint_deposits_view_->setRowCount(0);
   mint_notes_view_->setRowCount(0);
   mint_redemptions_view_->setRowCount(0);
@@ -578,6 +694,7 @@ void WalletWindow::render_mint_state() {
       mint_notes_view_->insertRow(row);
       auto* status_item = new QTableWidgetItem("FINALIZED");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
+      apply_status_item_style(status_item);
       mint_notes_view_->setItem(row, 0, status_item);
       mint_notes_view_->setItem(row, 1, new QTableWidgetItem(amount));
       mint_notes_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(note.note_ref, 10)));
@@ -602,6 +719,7 @@ void WalletWindow::render_mint_state() {
       mint_deposits_view_->insertRow(row);
       auto* status_item = new QTableWidgetItem("PENDING");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
+      apply_status_item_style(status_item);
       mint_deposits_view_->setItem(row, 0, status_item);
       mint_deposits_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
       mint_deposits_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(mint_deposit_ref_, 10)));
@@ -616,6 +734,7 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->insertRow(row);
       auto* status_item = new QTableWidgetItem("PENDING");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
+      apply_status_item_style(status_item);
       mint_redemptions_view_->setItem(row, 0, status_item);
       mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
@@ -631,6 +750,7 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->insertRow(row);
       auto* status_item = new QTableWidgetItem(mint_state_badge(state));
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
+      apply_status_item_style(status_item);
       mint_redemptions_view_->setItem(row, 0, status_item);
       mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem("-"));
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(batch, 10)));
@@ -645,6 +765,7 @@ void WalletWindow::render_mint_state() {
       mint_redemptions_view_->insertRow(row);
       auto* status_item = new QTableWidgetItem("FINALIZED");
       status_item->setData(Qt::UserRole, static_cast<int>(mint_records_.size() - 1));
+      apply_status_item_style(status_item);
       mint_redemptions_view_->setItem(row, 0, status_item);
       mint_redemptions_view_->setItem(row, 1, new QTableWidgetItem(amount.isEmpty() ? "-" : amount));
       mint_redemptions_view_->setItem(row, 2, new QTableWidgetItem(elide_middle(issuance, 10)));
@@ -654,16 +775,19 @@ void WalletWindow::render_mint_state() {
   }
   if (mint_deposits_view_->rowCount() == 0) {
     mint_deposits_view_->insertRow(0);
-    auto* item = new QTableWidgetItem("No deposits");
+    auto* item = new QTableWidgetItem("No deposits recorded yet");
     item->setData(Qt::UserRole, -1);
     mint_deposits_view_->setItem(0, 0, item);
   }
   if (mint_redemptions_view_->rowCount() == 0) {
     mint_redemptions_view_->insertRow(0);
-    auto* item = new QTableWidgetItem("No redemptions");
+    auto* item = new QTableWidgetItem("No redemptions recorded yet");
     item->setData(Qt::UserRole, -1);
     mint_redemptions_view_->setItem(0, 0, item);
   }
+  mint_deposits_view_->setSortingEnabled(true);
+  mint_notes_view_->setSortingEnabled(true);
+  mint_redemptions_view_->setSortingEnabled(true);
   mint_detail_button_->setEnabled(!mint_records_.empty());
 }
 
@@ -1154,6 +1278,7 @@ void WalletWindow::refresh_history_table() {
   history_view_->setRowCount(0);
   history_row_refs_.clear();
   const QString filter = history_filter_combo_ ? history_filter_combo_->currentText() : "All";
+  history_view_->setSortingEnabled(false);
   auto add_row = [&](const QString& type, const QString& status, const QString& amount,
                      const QString& reference, const QString& height_or_state,
                      HistoryRowRef::Source source, int index) {
@@ -1163,7 +1288,9 @@ void WalletWindow::refresh_history_table() {
     const int row = history_view_->rowCount();
     history_view_->insertRow(row);
     history_view_->setItem(row, 0, new QTableWidgetItem(type));
-    history_view_->setItem(row, 1, new QTableWidgetItem(status));
+    auto* status_item = new QTableWidgetItem(status);
+    apply_status_item_style(status_item);
+    history_view_->setItem(row, 1, status_item);
     history_view_->setItem(row, 2, new QTableWidgetItem(amount));
     history_view_->setItem(row, 3, new QTableWidgetItem(reference));
     history_view_->setItem(row, 4, new QTableWidgetItem(height_or_state));
@@ -1182,9 +1309,16 @@ void WalletWindow::refresh_history_table() {
   }
   if (history_view_->rowCount() == 0) {
     history_view_->insertRow(0);
-    history_view_->setItem(0, 0, new QTableWidgetItem("No records"));
+    QString message = "No records";
+    if (filter == "On-Chain") message = "No on-chain records yet";
+    else if (filter == "Mint") message = "No mint records yet";
+    else if (filter == "Pending") message = "No pending records";
+    auto* item = new QTableWidgetItem(message);
+    item->setData(Qt::UserRole, -1);
+    history_view_->setItem(0, 0, item);
     history_row_refs_.push_back(HistoryRowRef{HistoryRowRef::Source::Chain, -1});
   }
+  history_view_->setSortingEnabled(true);
   history_detail_button_->setEnabled(!history_row_refs_.empty() &&
                                      !(history_row_refs_.size() == 1 && history_row_refs_[0].index < 0));
 }

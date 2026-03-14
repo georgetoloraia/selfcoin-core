@@ -51,6 +51,13 @@ Implemented now in `selfcoin-wallet`:
 - classic ledger tables for:
   - status / amount / reference / height-state columns
   - history filtering with `All / On-Chain / Mint / Pending`
+- classic usability polish for:
+  - sortable ledger columns
+  - filter-specific empty-state messages
+  - right-click copy for addresses, txids, refs, and table rows
+  - subtle status colors for `PENDING / FINALIZED / FAILED`
+  - persisted filter/sort preferences across launches
+  - classic menu-bar and keyboard shortcuts for common actions
 
 Intentionally deferred to the next wallet phase:
 - QR rendering

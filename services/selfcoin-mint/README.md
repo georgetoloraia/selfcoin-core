@@ -18,6 +18,8 @@ It is a narrow scaffold, not a production mint:
 - lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
 - HMAC-signed operator admin requests
 - persistent notifier delivery job queue
+- optional single-worker leader lock for queue draining
+- notifier secret refs resolved from an external secrets file
 - signed reserve attestations / audit exports
 - no federation
 - no multi-operator quorum custody
@@ -67,7 +69,9 @@ python3 services/selfcoin-mint/server.py \
   --reserve-address sc1... \
   --reserve-fee 1000 \
   --cli-path ./build/selfcoin-cli \
-  --notifier-retry-interval-seconds 5
+  --notifier-retry-interval-seconds 5 \
+  --notifier-secrets-file /etc/selfcoin-mint/notifier-secrets.json \
+  --worker-lock-file /var/lib/selfcoin-mint/worker.lock
 ```
 
 ## Example with selfcoin-cli
@@ -213,7 +217,7 @@ python3 services/selfcoin-mint/server.py \
   --kind webhook \
   --target http://127.0.0.1:9099/webhook \
   --auth-type bearer \
-  --auth-token secret-token \
+  --auth-token-secret-ref ops_webhook_bearer \
   --tls-verify true \
   --retry-max-attempts 3 \
   --retry-backoff-seconds 30
@@ -262,10 +266,16 @@ curl http://127.0.0.1:8080/attestations/reserves
   - `retry_backoff_seconds`
 - `webhook` and `alertmanager` notifiers also support:
   - `auth_type=none|bearer|basic`
-  - bearer/basic credentials
+  - `auth_token_secret_ref`
+  - `auth_user_secret_ref`
+  - `auth_pass_secret_ref`
   - `tls_verify`
   - `tls_ca_file`
+- `tls_client_cert_file`
+- `tls_client_key_file`
 - The service runs a background retry worker (`--notifier-retry-interval-seconds`) backed by a persisted delivery job queue, so retries survive restart and do not depend on request traffic.
+- If `--worker-lock-file` is configured, only the process holding that file lock drains delivery jobs.
+- Secret values are expected in `--notifier-secrets-file` as a JSON object mapping secret refs to secret values; the state file stores refs, not the secrets themselves.
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

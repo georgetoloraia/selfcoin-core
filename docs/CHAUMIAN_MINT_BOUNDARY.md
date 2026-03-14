@@ -247,15 +247,24 @@ Notifier configuration includes:
 - `retry_max_attempts`
 - `retry_backoff_seconds`
 - `auth_type=none|bearer|basic`
-- bearer/basic credentials for external targets
+- `auth_token_secret_ref`
+- `auth_user_secret_ref`
+- `auth_pass_secret_ref`
 - `tls_verify`
 - `tls_ca_file`
+- `tls_client_cert_file`
+- `tls_client_key_file`
 
 When a notifier fails:
 - the event stores per-notifier delivery status, attempt count, error text, and next retry time
 - a persisted delivery job queue tracks pending/running/done/dead-letter work
 - a background retry worker drains that queue on a fixed interval
 - once the retry budget is exhausted, the delivery is moved into `dead_letters`
+
+Operationally:
+- the worker may use a leader/lock file so only one process drains notifier jobs
+- notifier secrets should come from an external secrets JSON file, not the persisted mint state
+- TLS contexts are rebuilt per delivery so CA/client certificate file rotation is picked up without restart
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 

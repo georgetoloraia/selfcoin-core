@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import fcntl
 import hmac
 import hashlib
 import json
@@ -91,6 +93,8 @@ class MintConfig:
     reserve_fee: int
     cli_path: str
     notifier_retry_interval_seconds: int
+    notifier_secrets_file: Path | None
+    worker_lock_file: Path | None
 
 
 _BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
@@ -1089,6 +1093,56 @@ def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
     return out
 
 
+def load_notifier_secrets(path: Path | None) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+    except Exception:
+        return {}
+
+
+class WorkerLeaderLock:
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._fd: Any = None
+        self._owned = False
+
+    def try_acquire(self) -> bool:
+        if self._path is None:
+            self._owned = True
+            return True
+        if self._owned:
+            return True
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = self._path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._fd.seek(0)
+            self._fd.truncate()
+            self._fd.write(str(os.getpid()))
+            self._fd.flush()
+            self._owned = True
+        except OSError:
+            self._owned = False
+        return self._owned
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            if self._owned:
+                fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fd.close()
+            self._fd = None
+            self._owned = False
+
+
 def sign_snapshot(attestor: BlindSigner, payload: dict[str, Any], operator_key_id: str) -> dict[str, Any]:
     body = canonical_json_bytes(payload)
     digest_hex = hashlib.sha256(body).hexdigest()
@@ -1156,6 +1210,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
+
+        def _notifier_secret(self, notifier: dict[str, Any], ref_key: str, direct_key: str) -> str:
+            ref = str(notifier.get(ref_key, ""))
+            if ref:
+                return load_notifier_secrets(config.notifier_secrets_file).get(ref, "")
+            return str(notifier.get(direct_key, ""))
 
         def _require_operator(self, raw_body: bytes) -> bool:
             key_id = self.headers.get("X-Selfcoin-Operator-Key", "")
@@ -1449,14 +1509,14 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             headers = {"Content-Type": content_type}
             auth_type = str(notifier.get("auth_type", "none"))
             if auth_type == "bearer":
-                token = str(notifier.get("auth_token", ""))
+                token = self._notifier_secret(notifier, "auth_token_secret_ref", "auth_token")
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
             elif auth_type == "basic":
-                user = str(notifier.get("auth_user", ""))
-                password = str(notifier.get("auth_pass", ""))
+                user = self._notifier_secret(notifier, "auth_user_secret_ref", "auth_user")
+                password = self._notifier_secret(notifier, "auth_pass_secret_ref", "auth_pass")
                 raw = f"{user}:{password}".encode("utf-8")
-                headers["Authorization"] = "Basic " + __import__("base64").b64encode(raw).decode("ascii")
+                headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             parsed = urllib.parse.urlparse(url)
             context = None
@@ -1468,6 +1528,10 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                         context.load_verify_locations(cafile=ca_file)
                 else:
                     context = ssl._create_unverified_context()
+                client_cert = str(notifier.get("tls_client_cert_file", ""))
+                client_key = str(notifier.get("tls_client_key_file", ""))
+                if client_cert:
+                    context.load_cert_chain(client_cert, keyfile=client_key or None)
             with urllib.request.urlopen(req, timeout=3, context=context):
                 pass
 
@@ -2048,7 +2112,14 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 write_json(self, HTTPStatus.OK, {"silences": state.list_silences(False)})
                 return
             if self.path == "/monitoring/notifiers":
-                write_json(self, HTTPStatus.OK, {"notifiers": state.list_notifiers()})
+                masked = []
+                for item in state.list_notifiers():
+                    row = dict(item)
+                    row.pop("auth_token", None)
+                    row.pop("auth_user", None)
+                    row.pop("auth_pass", None)
+                    masked.append(row)
+                write_json(self, HTTPStatus.OK, {"notifiers": masked})
                 return
             if self.path == "/monitoring/dead_letters":
                 write_json(self, HTTPStatus.OK, {"dead_letters": state.list_dead_letters(100)})
@@ -2522,11 +2593,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             retry_max_attempts = body.get("retry_max_attempts", 3)
             retry_backoff_seconds = body.get("retry_backoff_seconds", 30)
             auth_type = body.get("auth_type", "none")
-            auth_token = body.get("auth_token", "")
-            auth_user = body.get("auth_user", "")
-            auth_pass = body.get("auth_pass", "")
+            auth_token_secret_ref = body.get("auth_token_secret_ref", "")
+            auth_user_secret_ref = body.get("auth_user_secret_ref", "")
+            auth_pass_secret_ref = body.get("auth_pass_secret_ref", "")
             tls_verify = body.get("tls_verify", True)
             tls_ca_file = body.get("tls_ca_file", "")
+            tls_client_cert_file = body.get("tls_client_cert_file", "")
+            tls_client_key_file = body.get("tls_client_key_file", "")
             if not isinstance(notifier_id, str) or not isinstance(kind, str) or not isinstance(target, str) or not isinstance(enabled, bool):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier fields"})
                 return
@@ -2539,6 +2612,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if not isinstance(tls_verify, bool) or not isinstance(tls_ca_file, str):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier tls fields"})
                 return
+            if not isinstance(auth_token_secret_ref, str) or not isinstance(auth_user_secret_ref, str) or not isinstance(auth_pass_secret_ref, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier secret refs"})
+                return
+            if not isinstance(tls_client_cert_file, str) or not isinstance(tls_client_key_file, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier client tls fields"})
+                return
             if kind not in {"webhook", "alertmanager", "email_spool"}:
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "unsupported notifier kind"})
                 return
@@ -2550,11 +2629,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "retry_max_attempts": max(1, retry_max_attempts),
                 "retry_backoff_seconds": max(1, retry_backoff_seconds),
                 "auth_type": auth_type,
-                "auth_token": str(auth_token),
-                "auth_user": str(auth_user),
-                "auth_pass": str(auth_pass),
+                "auth_token_secret_ref": str(auth_token_secret_ref),
+                "auth_user_secret_ref": str(auth_user_secret_ref),
+                "auth_pass_secret_ref": str(auth_pass_secret_ref),
                 "tls_verify": tls_verify,
                 "tls_ca_file": tls_ca_file,
+                "tls_client_cert_file": tls_client_cert_file,
+                "tls_client_key_file": tls_client_key_file,
             }
             if kind == "email_spool":
                 notifier["email_to"] = str(body.get("email_to", "ops@example.invalid"))
@@ -2612,6 +2693,8 @@ def main() -> int:
     parser.add_argument("--reserve-fee", type=int, default=1000, help="L1 fee used for redemption settlement transactions.")
     parser.add_argument("--cli-path", default="./build/selfcoin-cli", help="Path to selfcoin-cli used for tx construction.")
     parser.add_argument("--notifier-retry-interval-seconds", type=int, default=5, help="Background notifier retry interval.")
+    parser.add_argument("--notifier-secrets-file", default="", help="Optional JSON file mapping notifier secret refs to secret values.")
+    parser.add_argument("--worker-lock-file", default="", help="Optional file lock used to ensure only one process drains delivery jobs.")
     args = parser.parse_args()
 
     operator_keys = parse_operator_keys(args.operator_key)
@@ -2629,6 +2712,8 @@ def main() -> int:
         reserve_fee=args.reserve_fee,
         cli_path=args.cli_path,
         notifier_retry_interval_seconds=max(1, args.notifier_retry_interval_seconds),
+        notifier_secrets_file=Path(args.notifier_secrets_file) if args.notifier_secrets_file else None,
+        worker_lock_file=Path(args.worker_lock_file) if args.worker_lock_file else None,
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
@@ -2636,12 +2721,14 @@ def main() -> int:
     handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id)
     server = ThreadingHTTPServer((args.host, args.port), handler_cls)
     stop_retry = threading.Event()
+    leader_lock = WorkerLeaderLock(config.worker_lock_file)
 
     def retry_loop() -> None:
         retry_handler = handler_cls.__new__(handler_cls)
         while not stop_retry.wait(config.notifier_retry_interval_seconds):
             try:
-                retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
+                if leader_lock.try_acquire():
+                    retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
             except Exception:
                 continue
 
@@ -2656,6 +2743,7 @@ def main() -> int:
         stop_retry.set()
         server.server_close()
         retry_thread.join(timeout=5)
+        leader_lock.release()
     return 0
 
 

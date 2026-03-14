@@ -227,8 +227,11 @@ class MintIntegrationTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
+                secrets_path = Path(td) / "notifier-secrets.json"
+                lock_path = Path(td) / "worker.lock"
                 email_spool = Path(td) / "email-spool"
                 reserve_wallet = Path(td) / "reserve-wallet.json"
+                secrets_path.write_text(json.dumps({"ops_webhook_bearer": "integration-token"}), encoding="utf-8")
                 reserve_privkey = "55" * 32
                 wallet_cmd = [
                     str(CLI),
@@ -308,6 +311,10 @@ class MintIntegrationTests(unittest.TestCase):
                         str(CLI),
                         "--notifier-retry-interval-seconds",
                         "1",
+                        "--notifier-secrets-file",
+                        str(secrets_path),
+                        "--worker-lock-file",
+                        str(lock_path),
                     ],
                     cwd=REPO_ROOT,
                     stdout=subprocess.PIPE,
@@ -426,8 +433,14 @@ class MintIntegrationTests(unittest.TestCase):
                             kind,
                             "--target",
                             target,
-                        ] + extra + (["--auth-type", "bearer", "--auth-token", "integration-token"] if notifier_id == "ops-webhook" else [])
+                        ] + extra + (["--auth-type", "bearer", "--auth-token-secret-ref", "ops_webhook_bearer"] if notifier_id == "ops-webhook" else [])
                         subprocess.run(notifier_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+
+                    notifiers_json = http_get_json(f"http://127.0.0.1:{port}/monitoring/notifiers")
+                    webhook_notifier = next(item for item in notifiers_json["notifiers"] if item["notifier_id"] == "ops-webhook")
+                    self.assertEqual(webhook_notifier["auth_token_secret_ref"], "ops_webhook_bearer")
+                    self.assertNotIn("auth_token", webhook_notifier)
+                    self.assertNotIn("integration-token", state_path.read_text(encoding="utf-8"))
 
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
                     n = int(pubkey["modulus_hex"], 16)

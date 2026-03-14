@@ -87,14 +87,18 @@ class MintStateTests(unittest.TestCase):
                     "kind": "webhook",
                     "target": "http://127.0.0.1:9/hook",
                     "enabled": True,
+                    "auth_type": "bearer",
+                    "auth_token_secret_ref": "ops_token",
                 }
             )
             self.assertEqual(notifier["notifier_id"], "ops-webhook")
+            self.assertEqual(notifier["auth_token_secret_ref"], "ops_token")
 
             reloaded = server.MintState(state_path)
             self.assertEqual(reloaded.list_events(10)[0]["ack_note"], "seen")
             self.assertEqual(reloaded.list_silences(True)[0]["reason"], "maintenance")
             self.assertEqual(reloaded.list_notifiers()[0]["kind"], "webhook")
+            self.assertEqual(reloaded.list_notifiers()[0]["auth_token_secret_ref"], "ops_token")
 
     def test_delivery_jobs_persist_and_reload(self) -> None:
         with tempfile.TemporaryDirectory() as td:

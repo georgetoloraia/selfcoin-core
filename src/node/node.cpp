@@ -1936,6 +1936,7 @@ std::optional<crypto::VrfProof> Node::local_proposer_vrf_locked(std::uint64_t he
   if (!cfg_.network.vrf_proposer_enabled) return std::nullopt;
   const auto active = validators_.active_sorted(height);
   if (active.empty()) return std::nullopt;
+  if (std::find(active.begin(), active.end(), local_key_.public_key) == active.end()) return std::nullopt;
 
   const auto transcript = consensus::proposer_vrf_transcript(cfg_.network, finalized_randomness_, height, round);
   auto proof = crypto::vrf_prove(local_key_.private_key, local_key_.public_key, transcript);

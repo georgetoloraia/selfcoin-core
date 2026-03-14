@@ -53,6 +53,7 @@ Suggested example HTTP endpoints:
 - `GET /reserves`
 - `GET /reserves/consolidate_plan`
 - `GET /policy/redemptions`
+- `GET /monitoring/reserve_health`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -186,10 +187,18 @@ Signed operators may also call `POST /reserves/consolidate` to:
 4. persist the consolidation record for later audit/finalization reporting
 
 Signed operators may call `GET /reserves/consolidate_plan` to inspect the
-selected reserve UTXOs, fee, and output value without broadcasting.
+selected reserve UTXOs, fee, output value, and estimated post-action fragmentation
+without broadcasting.
 
 Signed operators may call `POST /policy/redemptions` to pause or resume new
-redemption creation. `GET /policy/redemptions` exposes the current policy.
+redemption creation. `GET /policy/redemptions` exposes the current policy plus
+auto-pause recommendations and threshold metadata.
+
+`GET /monitoring/reserve_health` returns a compact monitoring/export summary with:
+- status: `healthy|warn|critical`
+- reserve exhaustion / fragmentation / max-input alerts
+- current auto-pause recommendation
+- live reserve inventory counters
 
 ### 6. Reserve and accounting views
 
@@ -258,6 +267,7 @@ selfcoin-cli mint_redemptions_policy --url http://host:port/policy/redemptions
 selfcoin-cli mint_redemptions_pause --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex> --reason "reserve low"
 selfcoin-cli mint_redemptions_resume --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health
 ```
 
 To call the external mint boundary from this repo:

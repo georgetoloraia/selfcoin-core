@@ -24,6 +24,8 @@ RESERVE_MAX_INPUTS = 8
 RESERVE_CONSOLIDATE_UTXO_COUNT = 12
 RESERVE_FRAGMENTATION_ALERT_COUNT = 16
 RESERVE_EXHAUSTION_BUFFER = 10000
+RESERVE_AUTO_PAUSE_LOW_RESERVE = 10000
+RESERVE_AUTO_PAUSE_LOCKED_INPUTS = 6
 
 
 def sha256_hex(parts: list[str]) -> str:
@@ -945,6 +947,101 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "alert_reserve_exhaustion_risk": available_reserve <= RESERVE_EXHAUSTION_BUFFER or utxo_value <= RESERVE_EXHAUSTION_BUFFER,
             }
 
+        def _policy_recommendations(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            reasons: list[str] = []
+            if bool(alerts.get("alert_reserve_exhaustion_risk", False)):
+                reasons.append("reserve exhaustion risk")
+            if int(inventory.get("wallet_locked_utxo_count", 0)) >= RESERVE_AUTO_PAUSE_LOCKED_INPUTS:
+                reasons.append("too many reserve utxos already locked")
+            if int(summary.get("available_reserve", 0)) <= RESERVE_AUTO_PAUSE_LOW_RESERVE:
+                reasons.append("available reserve below operator buffer")
+            return {
+                "auto_pause_recommended": bool(reasons),
+                "auto_pause_reason": ", ".join(reasons),
+                "auto_pause_thresholds": {
+                    "available_reserve_lte": RESERVE_AUTO_PAUSE_LOW_RESERVE,
+                    "wallet_locked_utxo_count_gte": RESERVE_AUTO_PAUSE_LOCKED_INPUTS,
+                    "reserve_exhaustion_buffer": RESERVE_EXHAUSTION_BUFFER,
+                },
+            }
+
+        def _reserve_health_summary(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            policy = self._policy_recommendations(summary, inventory, alerts)
+            status = "healthy"
+            if policy["auto_pause_recommended"] or bool(alerts.get("alert_reserve_exhaustion_risk", False)):
+                status = "critical"
+            elif bool(alerts.get("alert_fragmentation_threshold_breach", False)) or bool(alerts.get("alert_max_inputs_pressure", False)):
+                status = "warn"
+            return {
+                "status": status,
+                "available_reserve": int(summary.get("available_reserve", 0)),
+                "reserve_balance": int(summary.get("reserve_balance", 0)),
+                "wallet_utxo_count": int(inventory.get("wallet_utxo_count", 0)),
+                "wallet_utxo_value": int(inventory.get("wallet_utxo_value", 0)),
+                "wallet_locked_utxo_count": int(inventory.get("wallet_locked_utxo_count", 0)),
+                "wallet_fragment_below_min_change": int(inventory.get("wallet_fragment_below_min_change", 0)),
+                "pending_spend_commitment_count": int(summary.get("pending_spend_commitment_count", 0)),
+                "pending_consolidation_count": int(summary.get("pending_consolidation_count", 0)),
+                "alerts": {
+                    "reserve_exhaustion_risk": bool(alerts.get("alert_reserve_exhaustion_risk", False)),
+                    "fragmentation_threshold_breach": bool(alerts.get("alert_fragmentation_threshold_breach", False)),
+                    "max_inputs_pressure": bool(alerts.get("alert_max_inputs_pressure", False)),
+                    "recommend_consolidation": bool(alerts.get("recommend_consolidation", False)),
+                    "auto_pause_recommended": bool(policy.get("auto_pause_recommended", False)),
+                },
+                "policy": policy,
+                "updated_at": int(time.time()),
+            }
+
+        def _remaining_utxos_after_selection(self, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            selected_keys = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in selected
+                if isinstance(item, dict)
+            }
+            remaining: list[dict[str, Any]] = []
+            for item in self._reserve_raw_utxos():
+                key = (str(item.get("txid", "")), int(item.get("vout", -1)))
+                if key in self._locked_reserve_outpoints() or key in selected_keys:
+                    continue
+                remaining.append(item)
+            return remaining
+
+        def _inventory_metrics_from_values(self, values: list[int]) -> dict[str, Any]:
+            ordered = sorted(values)
+            return {
+                "wallet_utxo_count": len(ordered),
+                "wallet_utxo_value": sum(ordered),
+                "wallet_fragment_smallest": ordered[0] if ordered else 0,
+                "wallet_fragment_largest": ordered[-1] if ordered else 0,
+                "wallet_fragment_below_min_change": sum(1 for value in ordered if value < RESERVE_MIN_CHANGE),
+            }
+
+        def _estimated_post_consolidation(self, selected: list[dict[str, Any]], output_value: int) -> dict[str, Any]:
+            remaining = self._remaining_utxos_after_selection(selected)
+            values = [int(item.get("value", 0)) for item in remaining if int(item.get("value", 0)) > 0]
+            if output_value > 0:
+                values.append(output_value)
+            inventory = self._inventory_metrics_from_values(values)
+            summary = dict(state.reserve_summary())
+            summary.update({
+                "available_reserve": int(summary.get("available_reserve", 0)),
+                "reserve_balance": int(summary.get("reserve_balance", 0)),
+            })
+            alerts = self._reserve_alerts(summary, inventory)
+            return {
+                "wallet_utxo_count": inventory["wallet_utxo_count"],
+                "wallet_utxo_value": inventory["wallet_utxo_value"],
+                "wallet_fragment_smallest": inventory["wallet_fragment_smallest"],
+                "wallet_fragment_largest": inventory["wallet_fragment_largest"],
+                "wallet_fragment_below_min_change": inventory["wallet_fragment_below_min_change"],
+                "alerts": {
+                    "recommend_consolidation": bool(alerts.get("recommend_consolidation", False)),
+                    "alert_fragmentation_threshold_breach": bool(alerts.get("alert_fragmentation_threshold_breach", False)),
+                    "alert_max_inputs_pressure": bool(alerts.get("alert_max_inputs_pressure", False)),
+                },
+            }
+
         def _reserve_inventory(self) -> dict[str, Any]:
             if not config.lightserver_url or not config.reserve_address:
                 return {
@@ -1144,6 +1241,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "total_input_value": total_input_value,
                 "output_value": total_input_value - config.reserve_fee,
                 "fee": config.reserve_fee,
+                "estimated_post_action": self._estimated_post_consolidation(selected, total_input_value - config.reserve_fee),
                 "selected_utxos": [
                     {
                         "txid": str(item["txid"]),
@@ -1187,9 +1285,19 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 summary["mint_id"] = config.mint_id
                 summary["reserve_address"] = config.reserve_address
                 inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
                 summary.update(inventory)
-                summary.update(self._reserve_alerts(summary, inventory))
+                summary.update(alerts)
+                summary.update(self._policy_recommendations(summary, inventory, alerts))
+                summary["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
                 write_json(self, HTTPStatus.OK, summary)
+                return
+            if self.path == "/monitoring/reserve_health":
+                summary = state.reserve_summary()
+                summary["mint_id"] = config.mint_id
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                write_json(self, HTTPStatus.OK, self._reserve_health_summary(summary, inventory, alerts))
                 return
             if self.path == "/accounting/summary":
                 summary = state.accounting_summary()
@@ -1199,7 +1307,10 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if self.path == "/attestations/reserves":
                 inventory = self._reserve_inventory()
                 payload = state.reserve_attestation(config.mint_id, inventory)
-                payload.update(self._reserve_alerts(payload, inventory))
+                alerts = self._reserve_alerts(payload, inventory)
+                payload.update(alerts)
+                payload.update(self._policy_recommendations(payload, inventory, alerts))
+                payload["reserve_health"] = self._reserve_health_summary(payload, inventory, alerts)
                 write_json(
                     self,
                     HTTPStatus.OK,
@@ -1211,7 +1322,10 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     return
                 inventory = self._reserve_inventory()
                 payload = state.audit_export(config.mint_id, inventory)
-                payload["reserves"].update(self._reserve_alerts(payload["reserves"], inventory))
+                alerts = self._reserve_alerts(payload["reserves"], inventory)
+                payload["reserves"].update(alerts)
+                payload["reserves"].update(self._policy_recommendations(payload["reserves"], inventory, alerts))
+                payload["reserves"]["reserve_health"] = self._reserve_health_summary(payload["reserves"], inventory, alerts)
                 write_json(
                     self,
                     HTTPStatus.OK,
@@ -1224,7 +1338,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 write_json(self, HTTPStatus.OK, self._consolidation_plan())
                 return
             if self.path == "/policy/redemptions":
-                write_json(self, HTTPStatus.OK, state.policy())
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                policy = state.policy()
+                policy.update(self._policy_recommendations(summary, inventory, alerts))
+                policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
+                write_json(self, HTTPStatus.OK, policy)
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -1520,6 +1640,11 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid policy fields"})
                 return
             policy = state.update_policy(paused, reason)
+            summary = state.reserve_summary()
+            inventory = self._reserve_inventory()
+            alerts = self._reserve_alerts(summary, inventory)
+            policy.update(self._policy_recommendations(summary, inventory, alerts))
+            policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
             write_json(self, HTTPStatus.OK, {"accepted": True, **policy})
 
     return MintHandler

@@ -36,6 +36,7 @@ It is a narrow scaffold, not a production mint:
 - `GET /reserves`
 - `GET /reserves/consolidate_plan`
 - `GET /policy/redemptions`
+- `GET /monitoring/reserve_health`
 - `GET /accounting/summary`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -115,6 +116,11 @@ python3 services/selfcoin-mint/server.py \
 ```
 
 ```bash
+./build/selfcoin-cli mint_reserve_health \
+  --url http://127.0.0.1:8080/monitoring/reserve_health
+```
+
+```bash
 ./build/selfcoin-cli mint_redemptions_pause \
   --url http://127.0.0.1:8080/policy/redemptions \
   --operator-key-id dev-operator \
@@ -149,6 +155,9 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Redemption batches that cannot yet be funded stay `pending`; operators may reject them, but `broadcast` must go through `/redemptions/approve_broadcast`.
 - `finalized` is derived from observed L1 tx status via the configured lightserver.
 - `/reserves` includes live reserve-wallet UTXO count/value, locked UTXO count/value, simple fragmentation metrics, operator-facing alert fields such as reserve exhaustion risk, max-input pressure, and fragmentation threshold breach, and the active coin-selection thresholds when lightserver + reserve address are configured.
+- `/policy/redemptions` now includes auto-pause recommendations and threshold metadata derived from the current reserve state.
+- `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
+- `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:

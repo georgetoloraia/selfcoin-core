@@ -292,6 +292,8 @@ class MintIntegrationTests(unittest.TestCase):
 
                     policy_before = http_get_json(f"http://127.0.0.1:{port}/policy/redemptions")
                     self.assertFalse(policy_before.get("redemptions_paused", False))
+                    self.assertFalse(policy_before.get("auto_pause_recommended", False))
+                    self.assertEqual(policy_before["reserve_health"]["status"], "healthy")
 
                     pause_cmd = [
                         str(CLI),
@@ -465,6 +467,8 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertFalse(reserves["recommend_consolidation"])
                     self.assertFalse(reserves["alert_fragmentation_threshold_breach"])
                     self.assertTrue(reserves["alert_reserve_exhaustion_risk"])
+                    self.assertTrue(reserves["auto_pause_recommended"])
+                    self.assertEqual(reserves["reserve_health"]["status"], "critical")
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
@@ -512,6 +516,8 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(attest_json["payload"]["wallet_locked_utxo_count"], 0)
                     self.assertEqual(attest_json["payload"]["finalized_redemption_amount"], 100000)
                     self.assertTrue(attest_json["payload"]["alert_reserve_exhaustion_risk"])
+                    self.assertTrue(attest_json["payload"]["auto_pause_recommended"])
+                    self.assertEqual(attest_json["payload"]["reserve_health"]["status"], "critical")
                     self.assertTrue(attest_json["signature_hex"])
 
                     lightserver.utxos_by_scripthash[reserve_scripthash] = [
@@ -549,6 +555,8 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertTrue(consolidation_plan_json["available"])
                     self.assertEqual(consolidation_plan_json["input_count"], 3)
                     self.assertEqual(len(consolidation_plan_json["selected_utxos"]), 3)
+                    self.assertEqual(consolidation_plan_json["estimated_post_action"]["wallet_utxo_count"], 1)
+                    self.assertFalse(consolidation_plan_json["estimated_post_action"]["alerts"]["recommend_consolidation"])
                     consolidate_cmd = [
                         str(CLI),
                         "mint_reserve_consolidate",
@@ -569,6 +577,17 @@ class MintIntegrationTests(unittest.TestCase):
                     reserves_after_consolidation = http_get_json(f"http://127.0.0.1:{port}/reserves")
                     self.assertEqual(reserves_after_consolidation["wallet_utxo_count"], 0)
                     self.assertTrue(reserves_after_consolidation["alert_reserve_exhaustion_risk"])
+
+                    reserve_health_cmd = [
+                        str(CLI),
+                        "mint_reserve_health",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/reserve_health",
+                    ]
+                    reserve_health = subprocess.run(reserve_health_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    reserve_health_json = json.loads(reserve_health.stdout)
+                    self.assertEqual(reserve_health_json["status"], "critical")
+                    self.assertTrue(reserve_health_json["alerts"]["auto_pause_recommended"])
 
                     consolidation_txid = consolidate_json["l1_txid"]
                     lightserver.tip_height = 25

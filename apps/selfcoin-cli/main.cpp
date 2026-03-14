@@ -446,6 +446,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_redeem_update --url http://host:port/path --batch-id <id> --state <broadcast|rejected> [--l1-txid <hex32>] --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_alerts --url http://host:port/path\n"
+              << "  selfcoin-cli mint_reserve_health --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_redemptions_pause --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
@@ -1904,6 +1905,26 @@ int main(int argc, char** argv) {
     auto body = http_get_json(url, &err);
     if (!body) {
       std::cerr << "mint_reserve_alerts failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_reserve_health") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_reserve_health requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_reserve_health failed: " << err << "\n";
       return 1;
     }
     std::cout << *body << "\n";

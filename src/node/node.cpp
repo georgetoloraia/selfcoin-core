@@ -3276,6 +3276,14 @@ void Node::maybe_apply_buffered_sync_blocks_locked() {
       mempool_.prune_against_utxo(utxos_);
       finalized_height_ = blk.header.height;
       finalized_hash_ = bid;
+      finalized_randomness_ = consensus::advance_finalized_randomness(finalized_randomness_, blk.header);
+      if (consensus::committee_epoch_start(finalized_height_ + 1, cfg_.network.vrf_committee_epoch_blocks) ==
+          finalized_height_ + 1) {
+        committee_epoch_randomness_cache_[finalized_height_ + 1] = finalized_randomness_;
+        persist_committee_epoch_snapshot_locked(finalized_height_ + 1, validators_.active_sorted(finalized_height_ + 1),
+                                                finalized_randomness_);
+      }
+      (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
       (void)persist_state_roots(db_, finalized_height_, utxos_, validators_, kFixedValidationRulesVersion);
       last_finalized_progress_ms_ = now_unix() * 1000;
       current_round_ = 0;

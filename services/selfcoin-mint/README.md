@@ -17,6 +17,7 @@ It is a narrow scaffold, not a production mint:
 - automatic redemption settlement using a configured reserve wallet
 - lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
 - HMAC-signed operator admin requests
+- persistent notifier delivery job queue
 - signed reserve attestations / audit exports
 - no federation
 - no multi-operator quorum custody
@@ -44,6 +45,8 @@ It is a narrow scaffold, not a production mint:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /dashboard`
+- `GET /dashboard/incidents`
 - `POST /monitoring/dead_letters/replay`
 - `GET /accounting/summary`
 - `GET /operator/key`
@@ -209,6 +212,9 @@ python3 services/selfcoin-mint/server.py \
   --notifier-id ops-webhook \
   --kind webhook \
   --target http://127.0.0.1:9099/webhook \
+  --auth-type bearer \
+  --auth-token secret-token \
+  --tls-verify true \
   --retry-max-attempts 3 \
   --retry-backoff-seconds 30
 ```
@@ -244,6 +250,7 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/monitoring/notifiers` exposes configured notifier hooks.
 - `/monitoring/dead_letters` exposes failed notifier deliveries that exhausted retries.
 - `/monitoring/incidents/export` exposes a signed incident timeline including events, silences, dead letters, and notifier state.
+- `/dashboard` and `/dashboard/incidents` expose a minimal operator HTML view over reserve health, recent events, queue state, and incident data.
 - `POST /monitoring/dead_letters/replay` requeues a dead-lettered delivery and retries it immediately.
 - `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
 - Notifier hooks currently support:
@@ -253,7 +260,12 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Each notifier supports:
   - `retry_max_attempts`
   - `retry_backoff_seconds`
-- The service also runs a background retry worker (`--notifier-retry-interval-seconds`) so pending notifier deliveries are retried even without external traffic.
+- `webhook` and `alertmanager` notifiers also support:
+  - `auth_type=none|bearer|basic`
+  - bearer/basic credentials
+  - `tls_verify`
+  - `tls_ca_file`
+- The service runs a background retry worker (`--notifier-retry-interval-seconds`) backed by a persisted delivery job queue, so retries survive restart and do not depend on request traffic.
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

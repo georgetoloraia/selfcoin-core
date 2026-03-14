@@ -460,7 +460,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_event_policy --url http://host:port/path\n"
               << "  selfcoin-cli mint_event_policy_update --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]\n"
               << "  selfcoin-cli mint_notifier_list --url http://host:port/path\n"
-              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--email-to <addr>] [--email-from <addr>]\n"
+              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--auth-type none|bearer|basic] [--auth-token <token>] [--auth-user <user>] [--auth-pass <pass>] [--tls-verify true|false] [--tls-ca-file <path>] [--email-to <addr>] [--email-from <addr>]\n"
               << "  selfcoin-cli mint_dead_letters --url http://host:port/path\n"
               << "  selfcoin-cli mint_dead_letter_replay --url http://host:port/path --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_incident_timeline_export --url http://host:port/path\n"
@@ -2115,7 +2115,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "mint_notifier_upsert") {
-    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds;
+    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds, auth_type, auth_token, auth_user, auth_pass, tls_verify, tls_ca_file;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
@@ -2127,6 +2127,12 @@ int main(int argc, char** argv) {
       else if (a == "--enabled" && i + 1 < argc) enabled = argv[++i];
       else if (a == "--retry-max-attempts" && i + 1 < argc) retry_max_attempts = argv[++i];
       else if (a == "--retry-backoff-seconds" && i + 1 < argc) retry_backoff_seconds = argv[++i];
+      else if (a == "--auth-type" && i + 1 < argc) auth_type = argv[++i];
+      else if (a == "--auth-token" && i + 1 < argc) auth_token = argv[++i];
+      else if (a == "--auth-user" && i + 1 < argc) auth_user = argv[++i];
+      else if (a == "--auth-pass" && i + 1 < argc) auth_pass = argv[++i];
+      else if (a == "--tls-verify" && i + 1 < argc) tls_verify = argv[++i];
+      else if (a == "--tls-ca-file" && i + 1 < argc) tls_ca_file = argv[++i];
       else if (a == "--email-to" && i + 1 < argc) email_to = argv[++i];
       else if (a == "--email-from" && i + 1 < argc) email_from = argv[++i];
     }
@@ -2140,6 +2146,12 @@ int main(int argc, char** argv) {
               << "\",\"target\":\"" << target << "\",\"enabled\":" << (enabled_value ? "true" : "false");
     if (!retry_max_attempts.empty()) body_json << ",\"retry_max_attempts\":" << retry_max_attempts;
     if (!retry_backoff_seconds.empty()) body_json << ",\"retry_backoff_seconds\":" << retry_backoff_seconds;
+    if (!auth_type.empty()) body_json << ",\"auth_type\":\"" << auth_type << "\"";
+    if (!auth_token.empty()) body_json << ",\"auth_token\":\"" << auth_token << "\"";
+    if (!auth_user.empty()) body_json << ",\"auth_user\":\"" << auth_user << "\"";
+    if (!auth_pass.empty()) body_json << ",\"auth_pass\":\"" << auth_pass << "\"";
+    if (!tls_verify.empty()) body_json << ",\"tls_verify\":" << ((tls_verify == "true" || tls_verify == "1") ? "true" : "false");
+    if (!tls_ca_file.empty()) body_json << ",\"tls_ca_file\":\"" << tls_ca_file << "\"";
     if (!email_to.empty()) body_json << ",\"email_to\":\"" << email_to << "\"";
     if (!email_from.empty()) body_json << ",\"email_from\":\"" << email_from << "\"";
     body_json << "}";

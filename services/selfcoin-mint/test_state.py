@@ -96,6 +96,23 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(reloaded.list_silences(True)[0]["reason"], "maintenance")
             self.assertEqual(reloaded.list_notifiers()[0]["kind"], "webhook")
 
+    def test_delivery_jobs_persist_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            job = state.enqueue_delivery_job(event["event_id"], "ops-webhook", 123)
+            self.assertEqual(job["status"], "pending")
+            self.assertEqual(len(state.list_due_delivery_jobs(200, 10)), 1)
+            state.update_delivery_job(job["job_id"], "pending", attempts=2, last_error="boom", next_run_at=300)
+
+            reloaded = server.MintState(state_path)
+            jobs = reloaded.list_delivery_jobs(10)
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["notifier_id"], "ops-webhook")
+            self.assertEqual(jobs[0]["attempts"], 2)
+            self.assertEqual(jobs[0]["last_error"], "boom")
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"

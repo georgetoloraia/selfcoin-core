@@ -182,7 +182,13 @@ class FakeNotifierSink:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length)
                 payload = json.loads(raw.decode("utf-8"))
-                outer.received.append({"path": self.path, "payload": payload})
+                outer.received.append(
+                    {
+                        "path": self.path,
+                        "payload": payload,
+                        "authorization": self.headers.get("Authorization", ""),
+                    }
+                )
                 if self.path == "/fail":
                     self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
                     self.send_header("Content-Type", "application/json")
@@ -420,7 +426,7 @@ class MintIntegrationTests(unittest.TestCase):
                             kind,
                             "--target",
                             target,
-                        ] + extra
+                        ] + extra + (["--auth-type", "bearer", "--auth-token", "integration-token"] if notifier_id == "ops-webhook" else [])
                         subprocess.run(notifier_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
 
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
@@ -569,6 +575,8 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertIn("/webhook", {item["path"] for item in notifier.received})
                     self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
                     self.assertIn("/fail", {item["path"] for item in notifier.received})
+                    webhook_call = next(item for item in notifier.received if item["path"] == "/webhook")
+                    self.assertEqual(webhook_call["authorization"], "Bearer integration-token")
                     self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
                     auto_pause_event = alert_history["events"][0]
                     self.assertEqual(auto_pause_event["deliveries"]["ops-fail"]["status"], "dead_letter")
@@ -583,6 +591,12 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertIn("selfcoin_mint_auto_pause_recommended 1", metrics.stdout)
                     self.assertIn("selfcoin_mint_redemptions_paused 1", metrics.stdout)
                     self.assertIn("selfcoin_mint_dead_letter_count 2", metrics.stdout)
+                    self.assertIn("selfcoin_mint_delivery_job_queue_size", metrics.stdout)
+
+                    dashboard = urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=5).read().decode("utf-8")
+                    self.assertIn("selfcoin-mint dashboard", dashboard)
+                    incidents = urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard/incidents", timeout=5).read().decode("utf-8")
+                    self.assertIn("Incident view", incidents)
 
                     ack_cmd = [
                         str(CLI),

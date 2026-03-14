@@ -8,10 +8,12 @@ import json
 import math
 import os
 import random
+import ssl
 import subprocess
 import threading
 import time
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -229,6 +231,7 @@ class MintState:
             "silences": [],
             "notifiers": [],
             "dead_letters": [],
+            "delivery_jobs": [],
             "policy": {
                 "redemptions_paused": False,
                 "pause_reason": "",
@@ -268,6 +271,8 @@ class MintState:
                     self._data["notifiers"] = []
                 if "dead_letters" not in self._data or not isinstance(self._data["dead_letters"], list):
                     self._data["dead_letters"] = []
+                if "delivery_jobs" not in self._data or not isinstance(self._data["delivery_jobs"], list):
+                    self._data["delivery_jobs"] = []
                 policy = self._data.get("policy", {})
                 if isinstance(policy, dict):
                     policy.setdefault("auto_pause_enabled", False)
@@ -598,6 +603,103 @@ class MintState:
                     return removed
             raise KeyError("unknown dead_letter_id")
 
+    def enqueue_delivery_job(self, event_id: str, notifier_id: str, next_run_at: int = 0) -> dict[str, Any]:
+        with self._lock:
+            jobs = self._data.get("delivery_jobs", [])
+            if not isinstance(jobs, list):
+                jobs = []
+            for item in jobs:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("event_id", "")) == event_id and str(item.get("notifier_id", "")) == notifier_id:
+                    if str(item.get("status", "")) in {"pending", "running"}:
+                        return dict(item)
+            now = int(time.time())
+            job = {
+                "job_id": sha256_hex([event_id, notifier_id, str(time.time_ns())]),
+                "event_id": event_id,
+                "notifier_id": notifier_id,
+                "status": "pending",
+                "attempts": 0,
+                "last_error": "",
+                "next_run_at": int(next_run_at),
+                "created_at": now,
+                "updated_at": now,
+            }
+            jobs.append(job)
+            self._data["delivery_jobs"] = jobs[-2048:]
+            self._flush()
+            return dict(job)
+
+    def list_delivery_jobs(self, limit: int = 256) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = self._data.get("delivery_jobs", [])
+            if not isinstance(jobs, list):
+                return []
+            tail = jobs[-max(0, int(limit)):]
+            return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+    def list_due_delivery_jobs(self, now_ts: int, limit: int = 64) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = self._data.get("delivery_jobs", [])
+            if not isinstance(jobs, list):
+                return []
+            out: list[dict[str, Any]] = []
+            for item in jobs:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("status", "")) != "pending":
+                    continue
+                if int(item.get("next_run_at", 0)) > now_ts:
+                    continue
+                out.append(dict(item))
+                if len(out) >= limit:
+                    break
+            return out
+
+    def update_delivery_job(
+        self,
+        job_id: str,
+        status: str,
+        attempts: int | None = None,
+        last_error: str | None = None,
+        next_run_at: int | None = None,
+        delivered_at: int | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            jobs = self._data.get("delivery_jobs", [])
+            if not isinstance(jobs, list):
+                raise KeyError("unknown job_id")
+            for idx, item in enumerate(jobs):
+                if not isinstance(item, dict) or str(item.get("job_id", "")) != job_id:
+                    continue
+                updated = dict(item)
+                updated["status"] = status
+                updated["updated_at"] = int(time.time())
+                if attempts is not None:
+                    updated["attempts"] = int(attempts)
+                if last_error is not None:
+                    updated["last_error"] = last_error
+                if next_run_at is not None:
+                    updated["next_run_at"] = int(next_run_at)
+                if delivered_at is not None:
+                    updated["delivered_at"] = int(delivered_at)
+                jobs[idx] = updated
+                self._data["delivery_jobs"] = jobs
+                self._flush()
+                return dict(updated)
+            raise KeyError("unknown job_id")
+
+    def remove_delivery_job(self, job_id: str) -> None:
+        with self._lock:
+            jobs = self._data.get("delivery_jobs", [])
+            if not isinstance(jobs, list):
+                return
+            self._data["delivery_jobs"] = [
+                item for item in jobs if not (isinstance(item, dict) and str(item.get("job_id", "")) == job_id)
+            ]
+            self._flush()
+
     def acknowledge_event(self, event_id: str, note: str) -> dict[str, Any]:
         with self._lock:
             events = self._data.get("events", [])
@@ -815,6 +917,7 @@ class MintState:
                 "silences": list(self._data.get("silences", [])),
                 "notifiers": list(self._data.get("notifiers", [])),
                 "dead_letters": list(self._data.get("dead_letters", [])),
+                "delivery_jobs": list(self._data.get("delivery_jobs", [])),
                 "policy": dict(self._data.get("policy", {})),
                 "accounting": self._accounting_summary_locked(),
                 "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
@@ -1035,6 +1138,16 @@ def build_redemption_tx(config: MintConfig, utxos: list[dict[str, Any]], redeem_
     if not txid or not tx_hex:
         raise RuntimeError("build_p2pkh_tx did not return txid/tx_hex")
     return txid, tx_hex
+
+
+def _html_escape(value: Any) -> str:
+    text = str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str):
@@ -1318,6 +1431,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 f"selfcoin_mint_dead_letter_count {len(state.list_dead_letters(512))}",
                 "# TYPE selfcoin_mint_pending_notifier_delivery_count gauge",
                 f"selfcoin_mint_pending_notifier_delivery_count {pending_delivery}",
+                "# TYPE selfcoin_mint_delivery_job_queue_size gauge",
+                f"selfcoin_mint_delivery_job_queue_size {len(state.list_delivery_jobs(2048))}",
                 "# TYPE selfcoin_mint_notifier_delivered_count gauge",
                 f"selfcoin_mint_notifier_delivered_count {delivered_count}",
                 "# TYPE selfcoin_mint_notifier_success_rate gauge",
@@ -1327,27 +1442,43 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             ]
             return "\n".join(lines) + "\n"
 
+        def _notifier_request(self, notifier: dict[str, Any], body: bytes, content_type: str) -> None:
+            url = str(notifier.get("target", ""))
+            if not url:
+                return
+            headers = {"Content-Type": content_type}
+            auth_type = str(notifier.get("auth_type", "none"))
+            if auth_type == "bearer":
+                token = str(notifier.get("auth_token", ""))
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+            elif auth_type == "basic":
+                user = str(notifier.get("auth_user", ""))
+                password = str(notifier.get("auth_pass", ""))
+                raw = f"{user}:{password}".encode("utf-8")
+                headers["Authorization"] = "Basic " + __import__("base64").b64encode(raw).decode("ascii")
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            parsed = urllib.parse.urlparse(url)
+            context = None
+            if parsed.scheme == "https":
+                if bool(notifier.get("tls_verify", True)):
+                    context = ssl.create_default_context()
+                    ca_file = str(notifier.get("tls_ca_file", ""))
+                    if ca_file:
+                        context.load_verify_locations(cafile=ca_file)
+                else:
+                    context = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=3, context=context):
+                pass
+
         def _dispatch_notifier(self, notifier: dict[str, Any], event: dict[str, Any]) -> None:
             if not bool(notifier.get("enabled", True)):
                 return
             kind = str(notifier.get("kind", ""))
             if kind == "webhook":
-                url = str(notifier.get("target", ""))
-                if not url:
-                    return
-                req = urllib.request.Request(
-                    url,
-                    data=canonical_json_bytes({"event": event}),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=2):
-                    pass
+                self._notifier_request(notifier, canonical_json_bytes({"event": event}), "application/json")
                 return
             if kind == "alertmanager":
-                url = str(notifier.get("target", ""))
-                if not url:
-                    return
                 payload = [{
                     "labels": {
                         "alertname": str(event.get("event_type", "selfcoin_mint_event")),
@@ -1360,14 +1491,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     },
                     "startsAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(event.get("created_at", 0)))),
                 }]
-                req = urllib.request.Request(
-                    url,
-                    data=canonical_json_bytes({"alerts": payload}),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=2):
-                    pass
+                self._notifier_request(notifier, canonical_json_bytes({"alerts": payload}), "application/json")
                 return
             if kind == "email_spool":
                 spool_dir = str(notifier.get("target", ""))
@@ -1388,22 +1512,24 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 out.write_text(body, encoding="utf-8")
                 return
 
-        def _deliver_event_to_notifier(self, notifier: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+        def _deliver_event_to_notifier(self, notifier: dict[str, Any], event: dict[str, Any], job: dict[str, Any] | None = None) -> dict[str, Any]:
             notifier_id = str(notifier.get("notifier_id", ""))
             existing = event.get("deliveries", {})
-            current = dict(existing.get(notifier_id, {})) if isinstance(existing, dict) else {}
-            attempts = int(current.get("attempts", 0)) + 1
+            attempts = int(job.get("attempts", 0)) + 1 if isinstance(job, dict) else int(dict(existing.get(notifier_id, {})).get("attempts", 0)) + 1
             max_attempts = max(1, int(notifier.get("retry_max_attempts", 3)))
             backoff = max(1, int(notifier.get("retry_backoff_seconds", 30)))
             try:
                 self._dispatch_notifier(notifier, event)
-                return state.update_event_delivery(
+                updated = state.update_event_delivery(
                     str(event.get("event_id", "")),
                     notifier_id,
                     "delivered",
                     attempts,
                     delivered_at=int(time.time()),
                 )
+                if isinstance(job, dict):
+                    state.update_delivery_job(str(job.get("job_id", "")), "done", attempts=attempts, delivered_at=int(time.time()))
+                return updated
             except Exception as exc:
                 last_error = str(exc)
                 if attempts >= max_attempts:
@@ -1418,15 +1544,18 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                             "payload": dict(event.get("payload", {})),
                         }
                     )
-                    return state.update_event_delivery(
+                    updated = state.update_event_delivery(
                         str(event.get("event_id", "")),
                         notifier_id,
                         "dead_letter",
                         attempts,
                         last_error=last_error,
                     )
+                    if isinstance(job, dict):
+                        state.update_delivery_job(str(job.get("job_id", "")), "dead_letter", attempts=attempts, last_error=last_error)
+                    return updated
                 next_retry_at = int(time.time()) + backoff * (2 ** (attempts - 1))
-                return state.update_event_delivery(
+                updated = state.update_event_delivery(
                     str(event.get("event_id", "")),
                     notifier_id,
                     "pending",
@@ -1434,34 +1563,107 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     last_error=last_error,
                     next_retry_at=next_retry_at,
                 )
+                if isinstance(job, dict):
+                    state.update_delivery_job(
+                        str(job.get("job_id", "")),
+                        "pending",
+                        attempts=attempts,
+                        last_error=last_error,
+                        next_run_at=next_retry_at,
+                    )
+                return updated
 
-        def _retry_pending_deliveries(self) -> None:
+        def _process_delivery_jobs(self, limit: int = 32) -> None:
             now = int(time.time())
-            events = state.list_events(256)
+            jobs = state.list_due_delivery_jobs(now, limit)
+            if not jobs:
+                return
             notifiers = {str(item.get("notifier_id", "")): item for item in state.list_notifiers()}
-            for event in events:
-                deliveries = event.get("deliveries", {})
-                if not isinstance(deliveries, dict):
+            events = {str(item.get("event_id", "")): item for item in state.list_events(512)}
+            for job in jobs:
+                job_id = str(job.get("job_id", ""))
+                notifier_id = str(job.get("notifier_id", ""))
+                event_id = str(job.get("event_id", ""))
+                notifier = notifiers.get(notifier_id)
+                event = events.get(event_id)
+                if not isinstance(notifier, dict) or not isinstance(event, dict):
+                    state.update_delivery_job(job_id, "dead_letter", attempts=int(job.get("attempts", 0)), last_error="queue target missing")
                     continue
-                for notifier_id, item in deliveries.items():
-                    if not isinstance(item, dict):
-                        continue
-                    if str(item.get("status", "")) != "pending":
-                        continue
-                    if int(item.get("next_retry_at", 0)) > now:
-                        continue
-                    notifier = notifiers.get(notifier_id)
-                    if not isinstance(notifier, dict):
-                        continue
-                    event = self._deliver_event_to_notifier(notifier, event)
+                state.update_delivery_job(job_id, "running", attempts=int(job.get("attempts", 0)))
+                updated = self._deliver_event_to_notifier(notifier, event, job)
+                deliveries = updated.get("deliveries", {})
+                delivery = dict(deliveries.get(notifier_id, {})) if isinstance(deliveries, dict) else {}
+                if str(delivery.get("status", "")) == "delivered":
+                    state.remove_delivery_job(job_id)
 
         def _record_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
             event = state.append_event(event_type, payload)
             if state.event_silenced(event_type):
                 return event
             for notifier in state.list_notifiers():
-                event = self._deliver_event_to_notifier(notifier, event)
+                notifier_id = str(notifier.get("notifier_id", ""))
+                state.update_event_delivery(str(event.get("event_id", "")), notifier_id, "pending", 0, next_retry_at=0)
+                state.enqueue_delivery_job(str(event.get("event_id", "")), notifier_id, 0)
             return event
+
+        def _dashboard_html(self, title: str, body: str) -> str:
+            return (
+                "<!doctype html><html><head><meta charset='utf-8'><title>"
+                + _html_escape(title)
+                + "</title><style>body{font-family:ui-monospace,monospace;margin:24px;background:#f6f2e8;color:#1f1a14}"
+                  "h1,h2{margin:0 0 12px}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #c7baa6;padding:6px 8px;text-align:left;vertical-align:top}"
+                  ".chip{display:inline-block;padding:2px 8px;border-radius:999px;background:#ddd}.crit{background:#e58f7c}.warn{background:#f2cf7a}.ok{background:#a8d5a2}</style></head><body>"
+                + body
+                + "</body></html>"
+            )
+
+        def _dashboard_index(self) -> str:
+            summary = state.reserve_summary()
+            inventory = self._reserve_inventory()
+            alerts = self._reserve_alerts(summary, inventory)
+            health = self._reserve_health_summary(summary, inventory, alerts)
+            policy = state.policy()
+            jobs = state.list_delivery_jobs(20)
+            events = state.list_events(12)
+            status_class = "ok" if health["status"] == "healthy" else "warn" if health["status"] == "warn" else "crit"
+            body = [
+                "<h1>selfcoin-mint dashboard</h1>",
+                f"<p><span class='chip {status_class}'>{_html_escape(health['status'])}</span> reserve={health['available_reserve']} locked={health['wallet_locked_utxo_count']} paused={_html_escape(policy.get('redemptions_paused', False))}</p>",
+                "<p><a href='/dashboard/incidents'>Incident view</a></p>",
+                "<h2>Recent events</h2><table><tr><th>type</th><th>ack</th><th>created</th></tr>",
+            ]
+            for item in events:
+                body.append(
+                    f"<tr><td>{_html_escape(item.get('event_type',''))}</td><td>{_html_escape(item.get('acknowledged', False))}</td><td>{_html_escape(item.get('created_at',''))}</td></tr>"
+                )
+            body.append("</table><h2>Delivery queue</h2><table><tr><th>notifier</th><th>status</th><th>attempts</th><th>next</th></tr>")
+            for job in jobs:
+                body.append(
+                    f"<tr><td>{_html_escape(job.get('notifier_id',''))}</td><td>{_html_escape(job.get('status',''))}</td><td>{_html_escape(job.get('attempts',''))}</td><td>{_html_escape(job.get('next_run_at',''))}</td></tr>"
+                )
+            body.append("</table>")
+            return self._dashboard_html("selfcoin-mint dashboard", "".join(body))
+
+        def _dashboard_incidents(self) -> str:
+            data = self._incident_timeline_payload()
+            dead_letters = data.get("dead_letters", [])
+            silences = data.get("silences", [])
+            body = [
+                "<h1>Incident view</h1>",
+                "<p><a href='/dashboard'>Back</a></p>",
+                "<h2>Dead letters</h2><table><tr><th>event</th><th>notifier</th><th>error</th></tr>",
+            ]
+            for item in dead_letters:
+                body.append(
+                    f"<tr><td>{_html_escape(item.get('event_type',''))}</td><td>{_html_escape(item.get('notifier_id',''))}</td><td>{_html_escape(item.get('last_error',''))}</td></tr>"
+                )
+            body.append("</table><h2>Silences</h2><table><tr><th>type</th><th>until</th><th>reason</th></tr>")
+            for item in silences:
+                body.append(
+                    f"<tr><td>{_html_escape(item.get('event_type',''))}</td><td>{_html_escape(item.get('until_ts',''))}</td><td>{_html_escape(item.get('reason',''))}</td></tr>"
+                )
+            body.append("</table>")
+            return self._dashboard_html("selfcoin-mint incidents", "".join(body))
 
         def _incident_timeline_payload(self) -> dict[str, Any]:
             return {
@@ -1795,7 +1997,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 )
                 return
             self._reconcile_all_broadcast()
-            self._retry_pending_deliveries()
+            self._process_delivery_jobs()
+            if self.path == "/dashboard":
+                write_text(self, HTTPStatus.OK, self._dashboard_index(), "text/html; charset=utf-8")
+                return
+            if self.path == "/dashboard/incidents":
+                write_text(self, HTTPStatus.OK, self._dashboard_incidents(), "text/html; charset=utf-8")
+                return
             if self.path == "/reserves":
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
@@ -2313,11 +2521,23 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             enabled = body.get("enabled", True)
             retry_max_attempts = body.get("retry_max_attempts", 3)
             retry_backoff_seconds = body.get("retry_backoff_seconds", 30)
+            auth_type = body.get("auth_type", "none")
+            auth_token = body.get("auth_token", "")
+            auth_user = body.get("auth_user", "")
+            auth_pass = body.get("auth_pass", "")
+            tls_verify = body.get("tls_verify", True)
+            tls_ca_file = body.get("tls_ca_file", "")
             if not isinstance(notifier_id, str) or not isinstance(kind, str) or not isinstance(target, str) or not isinstance(enabled, bool):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier fields"})
                 return
             if not isinstance(retry_max_attempts, int) or not isinstance(retry_backoff_seconds, int):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier retry fields"})
+                return
+            if not isinstance(auth_type, str) or auth_type not in {"none", "bearer", "basic"}:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier auth_type"})
+                return
+            if not isinstance(tls_verify, bool) or not isinstance(tls_ca_file, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier tls fields"})
                 return
             if kind not in {"webhook", "alertmanager", "email_spool"}:
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "unsupported notifier kind"})
@@ -2329,6 +2549,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "enabled": enabled,
                 "retry_max_attempts": max(1, retry_max_attempts),
                 "retry_backoff_seconds": max(1, retry_backoff_seconds),
+                "auth_type": auth_type,
+                "auth_token": str(auth_token),
+                "auth_user": str(auth_user),
+                "auth_pass": str(auth_pass),
+                "tls_verify": tls_verify,
+                "tls_ca_file": tls_ca_file,
             }
             if kind == "email_spool":
                 notifier["email_to"] = str(body.get("email_to", "ops@example.invalid"))
@@ -2407,15 +2633,15 @@ def main() -> int:
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
     attestor = BlindSigner.from_seed(config.signing_seed + ":attestation")
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer, attestor, primary_operator_key_id))
+    handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id)
+    server = ThreadingHTTPServer((args.host, args.port), handler_cls)
     stop_retry = threading.Event()
 
     def retry_loop() -> None:
-        url = f"http://{args.host}:{args.port}/monitoring/metrics"
+        retry_handler = handler_cls.__new__(handler_cls)
         while not stop_retry.wait(config.notifier_retry_interval_seconds):
             try:
-                with urllib.request.urlopen(url, timeout=2):
-                    pass
+                retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
             except Exception:
                 continue
 

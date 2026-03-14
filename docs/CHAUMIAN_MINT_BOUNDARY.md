@@ -61,6 +61,8 @@ Suggested example HTTP endpoints:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /dashboard`
+- `GET /dashboard/incidents`
 - `POST /monitoring/dead_letters/replay`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -244,15 +246,21 @@ Supported notifier hooks:
 Notifier configuration includes:
 - `retry_max_attempts`
 - `retry_backoff_seconds`
+- `auth_type=none|bearer|basic`
+- bearer/basic credentials for external targets
+- `tls_verify`
+- `tls_ca_file`
 
 When a notifier fails:
 - the event stores per-notifier delivery status, attempt count, error text, and next retry time
-- a background retry worker retries pending deliveries on a fixed interval
+- a persisted delivery job queue tracks pending/running/done/dead-letter work
+- a background retry worker drains that queue on a fixed interval
 - once the retry budget is exhausted, the delivery is moved into `dead_letters`
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 
 `GET /monitoring/incidents/export` returns a signed incident timeline suitable for audit/ops review.
+`GET /dashboard` and `GET /dashboard/incidents` provide a minimal operator HTML view over the same exported state.
 
 ### 6. Reserve and accounting views
 

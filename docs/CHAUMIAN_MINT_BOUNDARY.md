@@ -54,6 +54,8 @@ Suggested example HTTP endpoints:
 - `GET /reserves/consolidate_plan`
 - `GET /policy/redemptions`
 - `GET /monitoring/reserve_health`
+- `GET /monitoring/alerts/history`
+- `GET /monitoring/metrics`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -200,6 +202,17 @@ auto-pause recommendations and threshold metadata.
 - current auto-pause recommendation
 - live reserve inventory counters
 
+`GET /monitoring/alerts/history` returns the recent persisted alert/policy event log.
+
+`GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
+- available reserve
+- reserve balance
+- wallet UTXO counts
+- pending spends / consolidations
+- alert booleans
+- redemptions paused / auto-pause enabled
+- current health status
+
 ### 6. Reserve and accounting views
 
 `GET /reserves` returns the mint's deposit-backed reserve summary.
@@ -266,8 +279,12 @@ Related operator commands:
 selfcoin-cli mint_redemptions_policy --url http://host:port/policy/redemptions
 selfcoin-cli mint_redemptions_pause --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex> --reason "reserve low"
 selfcoin-cli mint_redemptions_resume --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_redemptions_auto_pause_enable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_redemptions_auto_pause_disable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health
+selfcoin-cli mint_reserve_metrics --url http://host:port/monitoring/metrics
+selfcoin-cli mint_alert_history --url http://host:port/monitoring/alerts/history
 ```
 
 To call the external mint boundary from this repo:

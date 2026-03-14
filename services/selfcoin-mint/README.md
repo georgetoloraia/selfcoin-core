@@ -37,6 +37,8 @@ It is a narrow scaffold, not a production mint:
 - `GET /reserves/consolidate_plan`
 - `GET /policy/redemptions`
 - `GET /monitoring/reserve_health`
+- `GET /monitoring/alerts/history`
+- `GET /monitoring/metrics`
 - `GET /accounting/summary`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -121,6 +123,14 @@ python3 services/selfcoin-mint/server.py \
 ```
 
 ```bash
+./build/selfcoin-cli mint_reserve_metrics \
+  --url http://127.0.0.1:8080/monitoring/metrics
+
+./build/selfcoin-cli mint_alert_history \
+  --url http://127.0.0.1:8080/monitoring/alerts/history
+```
+
+```bash
 ./build/selfcoin-cli mint_redemptions_pause \
   --url http://127.0.0.1:8080/policy/redemptions \
   --operator-key-id dev-operator \
@@ -128,6 +138,16 @@ python3 services/selfcoin-mint/server.py \
   --reason "reserve low"
 
 ./build/selfcoin-cli mint_redemptions_resume \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_redemptions_auto_pause_enable \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_redemptions_auto_pause_disable \
   --url http://127.0.0.1:8080/policy/redemptions \
   --operator-key-id dev-operator \
   --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
@@ -158,6 +178,8 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/policy/redemptions` now includes auto-pause recommendations and threshold metadata derived from the current reserve state.
 - `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
 - `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
+- `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
+- `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:

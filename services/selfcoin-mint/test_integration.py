@@ -336,6 +336,20 @@ class MintIntegrationTests(unittest.TestCase):
                     resumed_json = json.loads(resumed.stdout)
                     self.assertFalse(resumed_json["redemptions_paused"])
 
+                    enable_auto_pause_cmd = [
+                        str(CLI),
+                        "mint_redemptions_auto_pause_enable",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    enabled = subprocess.run(enable_auto_pause_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    enabled_json = json.loads(enabled.stdout)
+                    self.assertTrue(enabled_json["auto_pause_enabled"])
+
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
                     n = int(pubkey["modulus_hex"], 16)
                     e = int(pubkey["public_exponent"])
@@ -469,6 +483,25 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertTrue(reserves["alert_reserve_exhaustion_risk"])
                     self.assertTrue(reserves["auto_pause_recommended"])
                     self.assertEqual(reserves["reserve_health"]["status"], "critical")
+
+                    policy_after_risk = http_get_json(f"http://127.0.0.1:{port}/policy/redemptions")
+                    self.assertTrue(policy_after_risk["redemptions_paused"])
+                    self.assertTrue(policy_after_risk["auto_pause_enabled"])
+                    self.assertIn("auto:", policy_after_risk["pause_reason"])
+
+                    alert_history = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                    self.assertGreaterEqual(len(alert_history["events"]), 1)
+                    self.assertEqual(alert_history["events"][0]["event_type"], "policy.auto_pause")
+
+                    metrics_cmd = [
+                        str(CLI),
+                        "mint_reserve_metrics",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/metrics",
+                    ]
+                    metrics = subprocess.run(metrics_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    self.assertIn("selfcoin_mint_auto_pause_recommended 1", metrics.stdout)
+                    self.assertIn("selfcoin_mint_redemptions_paused 1", metrics.stdout)
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20

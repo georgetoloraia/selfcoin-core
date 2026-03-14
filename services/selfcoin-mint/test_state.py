@@ -56,6 +56,18 @@ class MintStateTests(unittest.TestCase):
                     }
                 )
 
+    def test_event_log_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            self.assertEqual(event["event_type"], "policy.auto_pause")
+
+            reloaded = server.MintState(state_path)
+            events = reloaded.list_events(10)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["payload"]["reason"], "reserve exhaustion risk")
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"

@@ -215,9 +215,11 @@ class MintState:
             "redemptions": {},
             "note_records": {},
             "consolidations": {},
+            "events": [],
             "policy": {
                 "redemptions_paused": False,
                 "pause_reason": "",
+                "auto_pause_enabled": False,
                 "updated_at": 0,
             },
         }
@@ -243,6 +245,12 @@ class MintState:
                         for note, batch_id in self._data["spent_notes"].items()
                     }
                 self._data.pop("spent_notes", None)
+                if "events" not in self._data or not isinstance(self._data["events"], list):
+                    self._data["events"] = []
+                policy = self._data.get("policy", {})
+                if isinstance(policy, dict) and "auto_pause_enabled" not in policy:
+                    policy["auto_pause_enabled"] = False
+                    self._data["policy"] = policy
         except Exception:
             pass
 
@@ -440,15 +448,43 @@ class MintState:
             item = self._data.get("policy", {})
             return dict(item) if isinstance(item, dict) else {}
 
-    def update_policy(self, paused: bool, reason: str) -> dict[str, Any]:
+    def update_policy(self, paused: bool, reason: str, auto_pause_enabled: bool | None = None) -> dict[str, Any]:
         with self._lock:
             item = dict(self._data.get("policy", {}))
             item["redemptions_paused"] = bool(paused)
             item["pause_reason"] = reason if paused else ""
+            if auto_pause_enabled is not None:
+                item["auto_pause_enabled"] = bool(auto_pause_enabled)
+            else:
+                item.setdefault("auto_pause_enabled", False)
             item["updated_at"] = int(time.time())
             self._data["policy"] = item
             self._flush()
             return dict(item)
+
+    def append_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = {
+                "event_id": sha256_hex([event_type, str(time.time_ns()), json.dumps(payload, sort_keys=True)]),
+                "event_type": event_type,
+                "payload": dict(payload),
+                "created_at": int(time.time()),
+            }
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                events = []
+            events.append(item)
+            self._data["events"] = events[-256:]
+            self._flush()
+            return dict(item)
+
+    def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                return []
+            tail = events[-max(0, int(limit)):]
+            return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
 
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
@@ -555,6 +591,8 @@ class MintState:
                 "redemptions": list(self._data["redemptions"].values()),
                 "consolidations": list(self._data["consolidations"].values()),
                 "note_records": list(self._data["note_records"].values()),
+                "events": list(self._data.get("events", [])),
+                "policy": dict(self._data.get("policy", {})),
                 "accounting": self._accounting_summary_locked(),
                 "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
             }
@@ -993,6 +1031,62 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "updated_at": int(time.time()),
             }
 
+        def _metrics_payload(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> str:
+            policy = self._policy_recommendations(summary, inventory, alerts)
+            health = self._reserve_health_summary(summary, inventory, alerts)
+            lines = [
+                "# TYPE selfcoin_mint_available_reserve gauge",
+                f"selfcoin_mint_available_reserve {int(summary.get('available_reserve', 0))}",
+                "# TYPE selfcoin_mint_reserve_balance gauge",
+                f"selfcoin_mint_reserve_balance {int(summary.get('reserve_balance', 0))}",
+                "# TYPE selfcoin_mint_wallet_utxo_count gauge",
+                f"selfcoin_mint_wallet_utxo_count {int(inventory.get('wallet_utxo_count', 0))}",
+                "# TYPE selfcoin_mint_wallet_locked_utxo_count gauge",
+                f"selfcoin_mint_wallet_locked_utxo_count {int(inventory.get('wallet_locked_utxo_count', 0))}",
+                "# TYPE selfcoin_mint_pending_spend_commitment_count gauge",
+                f"selfcoin_mint_pending_spend_commitment_count {int(summary.get('pending_spend_commitment_count', 0))}",
+                "# TYPE selfcoin_mint_pending_consolidation_count gauge",
+                f"selfcoin_mint_pending_consolidation_count {int(summary.get('pending_consolidation_count', 0))}",
+                "# TYPE selfcoin_mint_alert_reserve_exhaustion_risk gauge",
+                f"selfcoin_mint_alert_reserve_exhaustion_risk {1 if bool(alerts.get('alert_reserve_exhaustion_risk', False)) else 0}",
+                "# TYPE selfcoin_mint_alert_fragmentation_threshold_breach gauge",
+                f"selfcoin_mint_alert_fragmentation_threshold_breach {1 if bool(alerts.get('alert_fragmentation_threshold_breach', False)) else 0}",
+                "# TYPE selfcoin_mint_alert_max_inputs_pressure gauge",
+                f"selfcoin_mint_alert_max_inputs_pressure {1 if bool(alerts.get('alert_max_inputs_pressure', False)) else 0}",
+                "# TYPE selfcoin_mint_auto_pause_recommended gauge",
+                f"selfcoin_mint_auto_pause_recommended {1 if bool(policy.get('auto_pause_recommended', False)) else 0}",
+                "# TYPE selfcoin_mint_redemptions_paused gauge",
+                f"selfcoin_mint_redemptions_paused {1 if bool(state.policy().get('redemptions_paused', False)) else 0}",
+                "# TYPE selfcoin_mint_auto_pause_enabled gauge",
+                f"selfcoin_mint_auto_pause_enabled {1 if bool(state.policy().get('auto_pause_enabled', False)) else 0}",
+                "# TYPE selfcoin_mint_health_status gauge",
+                f"selfcoin_mint_health_status {2 if health['status'] == 'critical' else 1 if health['status'] == 'warn' else 0}",
+                "# TYPE selfcoin_mint_event_log_size gauge",
+                f"selfcoin_mint_event_log_size {len(state.list_events(256))}",
+            ]
+            return "\n".join(lines) + "\n"
+
+        def _maybe_apply_auto_pause(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            policy = state.policy()
+            current = dict(policy)
+            recommendation = self._policy_recommendations(summary, inventory, alerts)
+            if not bool(policy.get("auto_pause_enabled", False)):
+                return current
+            if bool(policy.get("redemptions_paused", False)):
+                return current
+            if not bool(recommendation.get("auto_pause_recommended", False)):
+                return current
+            updated = state.update_policy(True, f"auto: {recommendation.get('auto_pause_reason', 'threshold triggered')}")
+            state.append_event(
+                "policy.auto_pause",
+                {
+                    "reason": updated.get("pause_reason", ""),
+                    "available_reserve": int(summary.get("available_reserve", 0)),
+                    "wallet_utxo_value": int(inventory.get("wallet_utxo_value", 0)),
+                },
+            )
+            return updated
+
         def _remaining_utxos_after_selection(self, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
             selected_keys = {
                 (str(item.get("txid", "")), int(item.get("vout", -1)))
@@ -1286,6 +1380,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 summary["reserve_address"] = config.reserve_address
                 inventory = self._reserve_inventory()
                 alerts = self._reserve_alerts(summary, inventory)
+                policy_state = self._maybe_apply_auto_pause(summary, inventory, alerts)
+                if policy_state:
+                    summary["policy_updated_at"] = policy_state.get("updated_at", 0)
                 summary.update(inventory)
                 summary.update(alerts)
                 summary.update(self._policy_recommendations(summary, inventory, alerts))
@@ -1297,7 +1394,27 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 summary["mint_id"] = config.mint_id
                 inventory = self._reserve_inventory()
                 alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
                 write_json(self, HTTPStatus.OK, self._reserve_health_summary(summary, inventory, alerts))
+                return
+            if self.path == "/monitoring/metrics":
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                body = self._metrics_payload(summary, inventory, alerts).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/plain; version=0.0.4")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/monitoring/alerts/history"):
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                write_json(self, HTTPStatus.OK, {"events": state.list_events(100)})
                 return
             if self.path == "/accounting/summary":
                 summary = state.accounting_summary()
@@ -1308,6 +1425,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 inventory = self._reserve_inventory()
                 payload = state.reserve_attestation(config.mint_id, inventory)
                 alerts = self._reserve_alerts(payload, inventory)
+                self._maybe_apply_auto_pause(payload, inventory, alerts)
                 payload.update(alerts)
                 payload.update(self._policy_recommendations(payload, inventory, alerts))
                 payload["reserve_health"] = self._reserve_health_summary(payload, inventory, alerts)
@@ -1323,6 +1441,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 inventory = self._reserve_inventory()
                 payload = state.audit_export(config.mint_id, inventory)
                 alerts = self._reserve_alerts(payload["reserves"], inventory)
+                self._maybe_apply_auto_pause(payload["reserves"], inventory, alerts)
                 payload["reserves"].update(alerts)
                 payload["reserves"].update(self._policy_recommendations(payload["reserves"], inventory, alerts))
                 payload["reserves"]["reserve_health"] = self._reserve_health_summary(payload["reserves"], inventory, alerts)
@@ -1341,6 +1460,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 summary = state.reserve_summary()
                 inventory = self._reserve_inventory()
                 alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
                 policy = state.policy()
                 policy.update(self._policy_recommendations(summary, inventory, alerts))
                 policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
@@ -1636,10 +1756,22 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             paused = body.get("redemptions_paused")
             reason = body.get("pause_reason", "")
+            auto_pause_enabled = body.get("auto_pause_enabled")
             if not isinstance(paused, bool) or not isinstance(reason, str):
                 write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid policy fields"})
                 return
-            policy = state.update_policy(paused, reason)
+            if auto_pause_enabled is not None and not isinstance(auto_pause_enabled, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid auto_pause_enabled"})
+                return
+            policy = state.update_policy(paused, reason, auto_pause_enabled)
+            state.append_event(
+                "policy.operator_update",
+                {
+                    "redemptions_paused": bool(policy.get("redemptions_paused", False)),
+                    "pause_reason": str(policy.get("pause_reason", "")),
+                    "auto_pause_enabled": bool(policy.get("auto_pause_enabled", False)),
+                },
+            )
             summary = state.reserve_summary()
             inventory = self._reserve_inventory()
             alerts = self._reserve_alerts(summary, inventory)

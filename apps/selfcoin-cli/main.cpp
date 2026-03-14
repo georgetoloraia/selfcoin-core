@@ -140,6 +140,7 @@ std::optional<std::string> http_post_json(const std::string& url, const std::str
 std::optional<std::string> http_post_json(const std::string& url, const std::string& body, std::string* err);
 std::optional<std::string> http_get_json(const std::string& url, const std::string& bearer_token, std::string* err);
 std::optional<std::string> http_get_json(const std::string& url, std::string* err);
+std::optional<std::string> http_get_text(const std::string& url, std::string* err);
 using HttpHeaders = std::vector<std::pair<std::string, std::string>>;
 std::optional<std::string> http_post_json_with_headers(const std::string& url, const std::string& body,
                                                        const HttpHeaders& headers, std::string* err);
@@ -299,6 +300,10 @@ std::optional<std::string> http_get_json(const std::string& url, std::string* er
   return http_get_json(url, "", err);
 }
 
+std::optional<std::string> http_get_text(const std::string& url, std::string* err) {
+  return http_get_json_with_headers(url, HttpHeaders{}, err);
+}
+
 std::optional<std::string> rpc_http_post(const std::string& url, const std::string& body, std::string* err) {
   auto parsed = parse_http_url(url);
   if (!parsed || parsed->path != "/rpc") {
@@ -447,10 +452,14 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_reserves --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_alerts --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_health --url http://host:port/path\n"
+              << "  selfcoin-cli mint_reserve_metrics --url http://host:port/path\n"
+              << "  selfcoin-cli mint_alert_history --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_redemptions_pause --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
               << "  selfcoin-cli mint_redemptions_resume --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
+              << "  selfcoin-cli mint_redemptions_auto_pause_enable --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
+              << "  selfcoin-cli mint_redemptions_auto_pause_disable --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_redemptions_policy --url http://host:port/path\n"
               << "  selfcoin-cli mint_accounting_summary --url http://host:port/path\n"
               << "  selfcoin-cli mint_attest_reserves --url http://host:port/path\n"
@@ -1931,6 +1940,46 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (cmd == "mint_reserve_metrics") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_reserve_metrics requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_text(url, &err);
+    if (!body) {
+      std::cerr << "mint_reserve_metrics failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body;
+    return 0;
+  }
+
+  if (cmd == "mint_alert_history") {
+    std::string url;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+    }
+    if (url.empty()) {
+      std::cerr << "mint_alert_history requires --url\n";
+      return 1;
+    }
+    std::string err;
+    auto body = http_get_json(url, &err);
+    if (!body) {
+      std::cerr << "mint_alert_history failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
   if (cmd == "mint_reserve_consolidate") {
     std::string url;
     std::string operator_key_id;
@@ -1990,7 +2039,8 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (cmd == "mint_redemptions_pause" || cmd == "mint_redemptions_resume") {
+  if (cmd == "mint_redemptions_pause" || cmd == "mint_redemptions_resume" ||
+      cmd == "mint_redemptions_auto_pause_enable" || cmd == "mint_redemptions_auto_pause_disable") {
     std::string url;
     std::string operator_key_id;
     std::string operator_secret_hex;
@@ -2007,9 +2057,16 @@ int main(int argc, char** argv) {
       return 1;
     }
     const bool paused = (cmd == "mint_redemptions_pause");
+    const bool auto_pause_enabled =
+        (cmd == "mint_redemptions_auto_pause_enable") ? true :
+        (cmd == "mint_redemptions_auto_pause_disable") ? false : false;
     std::ostringstream body_json;
     body_json << "{\"redemptions_paused\":" << (paused ? "true" : "false")
-              << ",\"pause_reason\":\"" << reason << "\"}";
+              << ",\"pause_reason\":\"" << reason << "\"";
+    if (cmd == "mint_redemptions_auto_pause_enable" || cmd == "mint_redemptions_auto_pause_disable") {
+      body_json << ",\"auto_pause_enabled\":" << (auto_pause_enabled ? "true" : "false");
+    }
+    body_json << "}";
     std::string err;
     auto headers = operator_signed_headers_for_url("POST", url, body_json.str(), operator_key_id, operator_secret_hex, &err);
     if (!headers) {

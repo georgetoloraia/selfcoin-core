@@ -29,14 +29,19 @@ Implemented now in `selfcoin-wallet`:
 - real GUI mint flow for:
   - `SCMINTDEP` deposit build and broadcast
   - deposit registration with `selfcoin-mint`
-  - one-note blind issuance request
-  - redemption creation
+  - denomination-split blind issuance request
+  - exact-subset note redemption creation
   - redemption status polling
+- wallet-local metadata persistence via `storage::DB`
+- persistent local tracking for:
+  - sent txids
+  - wallet event history
+  - mint note inventory
+  - last redemption batch id
 
 Intentionally deferred to the next wallet phase:
 - QR rendering
-- local metadata DB / SQLite layer
-- richer note selection / denomination handling beyond exact-note redemption
+- richer mint UX around multiple deposits, note grouping, and manual note management
 
 ## Product boundary
 The reference wallet should support:
@@ -92,7 +97,6 @@ Suggested modules:
 
 ### External dependencies allowed
 - Qt
-- SQLite for local wallet metadata
 - existing OpenSSL already used in repo, only if needed consistently
 
 ## Required screens
@@ -143,6 +147,7 @@ Entries:
 - sent
 - mint deposit
 - mint redemption
+- local wallet events
 
 Per entry show:
 - type
@@ -220,16 +225,18 @@ Actions:
 6. Wallet shows deposit status until ready.
 
 ### Flow F: Issue private notes
-1. Wallet submits blind payloads to mint.
-2. Wallet stores returned note references / issuance data locally.
-3. Wallet shows issued note balance as separate mint balance.
+1. Wallet derives mint denominations from the requested amount.
+2. Wallet submits blind payloads to mint for each denomination.
+3. Wallet stores returned note references / issuance data locally.
+4. Wallet shows issued note balance as separate mint balance.
 
 ### Flow G: Redeem back to chain
 1. User enters redeem amount and destination address.
-2. Wallet selects notes locally.
+2. Wallet selects an exact subset of active notes locally.
 3. Wallet creates redemption request against mint.
-4. Wallet polls status.
-5. Once finalized, history shows on-chain redemption result.
+4. Wallet stores the redemption batch id and updates local note state.
+5. Wallet polls status.
+6. Once finalized, history shows on-chain redemption result.
 
 ### Flow H: Restore and rescan
 1. User imports key material.
@@ -249,14 +256,13 @@ Store:
 Do not store plaintext private key.
 
 ### Local metadata DB
-Suggested SQLite tables:
-- `settings`
-- `addresses`
-- `transactions`
-- `mint_deposits`
-- `mint_notes`
-- `mint_redemptions`
-- `sync_state`
+Current implementation uses a wallet-local `storage::DB` file adjacent to the keystore file.
+
+Stored record groups:
+- `SENT:*` for locally broadcast txids
+- `EVT:*` for local wallet event history
+- `NOTE:*` for mint note inventory
+- `META:*` for last-known mint metadata such as redemption batch id
 
 ### Transaction record fields
 - local id

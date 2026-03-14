@@ -116,6 +116,7 @@ if(Qt5Widgets_FOUND)
   add_executable(selfcoin-wallet
     apps/selfcoin-wallet/main.cpp
     apps/selfcoin-wallet/wallet_window.cpp
+    apps/selfcoin-wallet/wallet_store.cpp
   )
   target_link_libraries(selfcoin-wallet PRIVATE selfcoin_core Qt5::Widgets)
   if(SELFCOIN_SANITIZE)
@@ -127,6 +128,7 @@ else()
 endif()
 
 add_executable(selfcoin-tests
+  apps/selfcoin-wallet/wallet_store.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
   tests/test_chain_id.cpp
@@ -151,11 +153,13 @@ add_executable(selfcoin-tests
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp
+  tests/test_wallet_store.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp
 )
 target_link_libraries(selfcoin-tests PRIVATE selfcoin_core)
+target_include_directories(selfcoin-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(SELFCOIN_SANITIZE)
   target_compile_options(selfcoin-tests PRIVATE ${SC_SAN_FLAGS})
   target_link_options(selfcoin-tests PRIVATE -fsanitize=address,undefined)

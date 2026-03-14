@@ -8,6 +8,7 @@
 #include <QStringList>
 
 #include "common/types.hpp"
+#include "wallet_store.hpp"
 
 class QLabel;
 class QLineEdit;
@@ -23,6 +24,11 @@ namespace selfcoin::wallet {
 
 class WalletWindow final : public QMainWindow {
  public:
+  struct MintNote {
+    QString note_ref;
+    std::uint64_t amount{0};
+  };
+
   WalletWindow();
 
  private:
@@ -42,11 +48,6 @@ class WalletWindow final : public QMainWindow {
     selfcoin::Bytes script_pubkey;
   };
 
-  struct MintNote {
-    QString note_ref;
-    std::uint64_t amount{0};
-  };
-
   void build_ui();
   void load_settings();
   void save_settings() const;
@@ -55,8 +56,10 @@ class WalletWindow final : public QMainWindow {
   void refresh_chain_state(bool interactive);
   void render_history_view();
   void render_mint_state();
-  void save_wallet_local_state() const;
+  void save_wallet_local_state();
   void load_wallet_local_state();
+  bool open_wallet_store();
+  void append_local_event(const QString& line);
 
   void create_wallet();
   void open_wallet();
@@ -64,7 +67,6 @@ class WalletWindow final : public QMainWindow {
   void export_wallet_secret();
   void save_connection_settings();
   void validate_send_form();
-  void show_mint_info(const QString& action_name);
   void submit_send();
   void submit_mint_deposit();
   void issue_mint_note();
@@ -108,7 +110,8 @@ class WalletWindow final : public QMainWindow {
 
   std::optional<LoadedWallet> wallet_;
   std::vector<WalletUtxo> utxos_;
-  QStringList history_lines_;
+  QStringList local_history_lines_;
+  QStringList chain_history_lines_;
   std::vector<std::string> local_sent_txids_;
   std::uint64_t tip_height_{0};
   QString mint_deposit_ref_;
@@ -116,6 +119,7 @@ class WalletWindow final : public QMainWindow {
   std::uint32_t mint_last_deposit_vout_{0};
   QString mint_last_redemption_batch_id_;
   std::vector<MintNote> mint_notes_;
+  WalletStore store_;
 };
 
 }  // namespace selfcoin::wallet

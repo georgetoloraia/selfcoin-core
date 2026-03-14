@@ -321,6 +321,11 @@ Example split units and env file template live in:
 - [services/selfcoin-mint/systemd/selfcoin-mint.env.example](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.env.example)
 - [services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf)
 - [services/selfcoin-mint/systemd/install_selfcoin_mint.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/install_selfcoin_mint.sh)
+
+The install helper also places:
+
+- [secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
+  as `/usr/local/libexec/selfcoin-mint-secret-helper`
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

@@ -132,6 +132,38 @@ class MintStateTests(unittest.TestCase):
             )
             self.assertEqual(proc.stdout.strip(), "topsecret")
 
+    def test_worker_lease_takeover_on_stale_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "worker.lock"
+            stale = {
+                "owner_pid": 999999,
+                "heartbeat_at": 1,
+                "acquired_at": 1,
+                "mode": "worker",
+                "stale_timeout_seconds": 5,
+            }
+            lock_path.write_text(__import__("json").dumps(stale), encoding="utf-8")
+            lock = server.WorkerLeaderLock(lock_path, stale_timeout_seconds=5)
+            result = lock.acquire_status("worker")
+            self.assertTrue(result["acquired"])
+            self.assertTrue(result["takeover"])
+            self.assertEqual(result["stale_owner_pid"], "999999")
+
+    def test_systemd_packaging_assets_exist(self) -> None:
+        root = Path(__file__).parent / "systemd"
+        server_unit = root / "selfcoin-mint-server.service"
+        worker_unit = root / "selfcoin-mint-worker.service"
+        env_example = root / "selfcoin-mint.env.example"
+        install_script = root / "install_selfcoin_mint.sh"
+        tmpfiles = root / "selfcoin-mint.tmpfiles.conf"
+        self.assertTrue(server_unit.exists())
+        self.assertTrue(worker_unit.exists())
+        self.assertTrue(env_example.exists())
+        self.assertTrue(install_script.exists())
+        self.assertTrue(tmpfiles.exists())
+        self.assertIn("ExecStart=", server_unit.read_text(encoding="utf-8"))
+        self.assertIn("SELFCOIN_MINT_NOTIFIER_SECRET_HELPER_CMD", env_example.read_text(encoding="utf-8"))
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"

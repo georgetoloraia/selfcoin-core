@@ -217,14 +217,39 @@ class MintIntegrationTests(unittest.TestCase):
     def test_worker_stale_lease_takeover_emits_event(self) -> None:
         port = free_port()
         lightserver_port = free_port()
+        notifier_port = free_port()
         lightserver = FakeLightserver(lightserver_port)
+        notifier = FakeNotifierSink(notifier_port)
         lightserver.start()
+        notifier.start()
         operator_key_id = "integration-operator"
         operator_secret_hex = "11" * 32
         try:
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
                 lock_path = Path(td) / "worker.lock"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "notifiers": [
+                                {
+                                    "notifier_id": "ops-takeover",
+                                    "kind": "webhook",
+                                    "target": f"http://127.0.0.1:{notifier_port}/webhook",
+                                    "enabled": True,
+                                    "retry_max_attempts": 2,
+                                    "retry_backoff_seconds": 1,
+                                    "auth_type": "none",
+                                    "tls_verify": True,
+                                    "tls_ca_file": "",
+                                    "tls_client_cert_file": "",
+                                    "tls_client_key_file": "",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 stale_state = {
                     "owner_pid": 424242,
                     "heartbeat_at": 1,
@@ -295,6 +320,11 @@ class MintIntegrationTests(unittest.TestCase):
                         takeover_event = next((item for item in events if item.get("event_type") == "worker.lease_takeover"), None)
                     self.assertIsNotNone(takeover_event)
                     self.assertEqual(takeover_event["payload"]["stale_owner_pid"], "424242")
+                    for _ in range(20):
+                        if "/webhook" in {item["path"] for item in notifier.received}:
+                            break
+                        time.sleep(0.1)
+                    self.assertIn("/webhook", {item["path"] for item in notifier.received})
 
                     worker_status = http_get_json(f"http://127.0.0.1:{port}/monitoring/worker")
                     self.assertEqual(worker_status["takeover_policy"], "allow-after-stale-timeout")
@@ -323,6 +353,7 @@ class MintIntegrationTests(unittest.TestCase):
                         proc.stderr.close()
         finally:
             lightserver.stop()
+            notifier.stop()
 
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()

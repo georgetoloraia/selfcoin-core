@@ -321,6 +321,7 @@ Example split units and env file template live in:
 - [services/selfcoin-mint/systemd/selfcoin-mint.env.example](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.env.example)
 - [services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf)
 - [services/selfcoin-mint/systemd/install_selfcoin_mint.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/install_selfcoin_mint.sh)
+- [services/selfcoin-mint/systemd/smoke_deploy.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/smoke_deploy.sh)
 
 The install helper also places:
 
@@ -340,5 +341,11 @@ The install helper also places:
 
 ```bash
 python3 -m unittest services/selfcoin-mint/test_state.py
+python3 -m unittest services/selfcoin-mint/test_packaging.py
 python3 -m unittest services/selfcoin-mint/test_integration.py
+bash services/selfcoin-mint/systemd/smoke_deploy.sh
 ```
+
+CI wiring for the packaging/deploy checks lives in:
+
+- [.github/workflows/selfcoin-mint-packaging.yml](/home/greendragon/Desktop/selfcoin-core/.github/workflows/selfcoin-mint-packaging.yml)

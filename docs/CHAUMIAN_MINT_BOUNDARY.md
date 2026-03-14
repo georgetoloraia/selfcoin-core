@@ -280,6 +280,8 @@ Deployment helpers:
 - the included helper implementation for `command` backend lives at [services/selfcoin-mint/secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
 - the install script stages that helper as `/usr/local/libexec/selfcoin-mint-secret-helper`
 - a minimal operator guide lives at [docs/SELFCOIN_MINT_RUNBOOK.md](/home/greendragon/Desktop/selfcoin-core/docs/SELFCOIN_MINT_RUNBOOK.md)
+- a local deployment smoke check lives at [services/selfcoin-mint/systemd/smoke_deploy.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/smoke_deploy.sh)
+- CI packaging wiring lives at [.github/workflows/selfcoin-mint-packaging.yml](/home/greendragon/Desktop/selfcoin-core/.github/workflows/selfcoin-mint-packaging.yml)
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 

@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,21 @@ def http_get_json(url: str, headers: dict[str, str] | None = None) -> dict:
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> tuple[int, dict]:
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def load_server_module():
@@ -274,6 +290,50 @@ class MintIntegrationTests(unittest.TestCase):
                     lines = dict(line.split("=", 1) for line in dep.stdout.strip().splitlines())
                     mint_deposit_ref = lines["mint_deposit_ref"]
 
+                    policy_before = http_get_json(f"http://127.0.0.1:{port}/policy/redemptions")
+                    self.assertFalse(policy_before.get("redemptions_paused", False))
+
+                    pause_cmd = [
+                        str(CLI),
+                        "mint_redemptions_pause",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--reason",
+                        "reserve low",
+                    ]
+                    paused = subprocess.run(pause_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    paused_json = json.loads(paused.stdout)
+                    self.assertTrue(paused_json["redemptions_paused"])
+
+                    blocked_status, blocked_body = http_post_json(
+                        f"http://127.0.0.1:{port}/redemptions/create",
+                        {
+                            "notes": ["note-blocked"],
+                            "redeem_address": reserve_address,
+                            "amount": 1000,
+                        },
+                    )
+                    self.assertEqual(blocked_status, HTTPStatus.CONFLICT)
+                    self.assertIn("redemptions paused", blocked_body["error"])
+
+                    resume_cmd = [
+                        str(CLI),
+                        "mint_redemptions_resume",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    resumed = subprocess.run(resume_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    resumed_json = json.loads(resumed.stdout)
+                    self.assertFalse(resumed_json["redemptions_paused"])
+
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
                     n = int(pubkey["modulus_hex"], 16)
                     e = int(pubkey["public_exponent"])
@@ -303,6 +363,21 @@ class MintIntegrationTests(unittest.TestCase):
                     note_ref = note_ref_line.split("=", 1)[1]
                     unblinded = (signed_blind * pow(r, -1, n)) % n
                     self.assertEqual(pow(unblinded, e, n), message)
+
+                    plan_cmd = [
+                        str(CLI),
+                        "mint_reserve_consolidation_plan",
+                        "--url",
+                        f"http://127.0.0.1:{port}/reserves/consolidate_plan",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    plan = subprocess.run(plan_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    plan_json = json.loads(plan.stdout)
+                    self.assertFalse(plan_json["available"])
+                    self.assertIn("no consolidation candidates available", plan_json["reason"])
 
                     accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
                     self.assertEqual(accounting["total_deposited"], 100000)
@@ -381,6 +456,7 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(reserves["available_reserve"], 0)
                     self.assertEqual(reserves["pending_spend_commitment_count"], 1)
                     self.assertEqual(reserves["pending_spend_input_count"], 2)
+                    self.assertEqual(reserves["pending_spend_network_observed_count"], 1)
                     self.assertEqual(reserves["wallet_utxo_count"], 0)
                     self.assertEqual(reserves["wallet_utxo_value"], 0)
                     self.assertEqual(reserves["wallet_locked_utxo_count"], 0)
@@ -398,6 +474,9 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(finalized_lines["state"], "finalized")
                     self.assertEqual(finalized_lines["l1_txid"], l1_txid)
                     self.assertEqual(finalized_lines["amount"], "100000")
+
+                    reserves_after_final = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                    self.assertEqual(reserves_after_final["pending_spend_commitment_count"], 0)
 
                     audit_cmd = [
                         str(CLI),
@@ -465,6 +544,11 @@ class MintIntegrationTests(unittest.TestCase):
                             ("aa" * 32, 2),
                         ]
                     )
+                    consolidation_plan = subprocess.run(plan_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    consolidation_plan_json = json.loads(consolidation_plan.stdout)
+                    self.assertTrue(consolidation_plan_json["available"])
+                    self.assertEqual(consolidation_plan_json["input_count"], 3)
+                    self.assertEqual(len(consolidation_plan_json["selected_utxos"]), 3)
                     consolidate_cmd = [
                         str(CLI),
                         "mint_reserve_consolidate",

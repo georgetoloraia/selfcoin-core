@@ -22,6 +22,40 @@ server = load_server_module()
 
 
 class MintStateTests(unittest.TestCase):
+    def test_policy_persists_and_blocks_redemptions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
+            issuance = state.record_issuance("ref-1", ["aa"], ["bb"], [1000])
+            policy = state.update_policy(True, "reserve low")
+            self.assertTrue(policy["redemptions_paused"])
+            self.assertEqual(policy["pause_reason"], "reserve low")
+
+            reloaded = server.MintState(state_path)
+            self.assertTrue(reloaded.policy()["redemptions_paused"])
+            with self.assertRaises(ValueError):
+                reloaded.create_redemption(
+                    {
+                        "redemption_batch_id": "batch-1",
+                        "notes": issuance["note_refs"],
+                        "redeem_address": "sc1example",
+                        "amount": 1000,
+                        "state": "pending",
+                        "l1_txid": "",
+                    }
+                )
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"

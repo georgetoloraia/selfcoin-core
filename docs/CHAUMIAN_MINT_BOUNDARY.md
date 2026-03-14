@@ -48,8 +48,11 @@ Suggested example HTTP endpoints:
 - `POST /reserves/consolidate`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
+- `POST /policy/redemptions`
 - `GET /accounting/summary`
 - `GET /reserves`
+- `GET /reserves/consolidate_plan`
+- `GET /policy/redemptions`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -182,6 +185,12 @@ Signed operators may also call `POST /reserves/consolidate` to:
 3. broadcast it through lightserver
 4. persist the consolidation record for later audit/finalization reporting
 
+Signed operators may call `GET /reserves/consolidate_plan` to inspect the
+selected reserve UTXOs, fee, and output value without broadcasting.
+
+Signed operators may call `POST /policy/redemptions` to pause or resume new
+redemption creation. `GET /policy/redemptions` exposes the current policy.
+
 ### 6. Reserve and accounting views
 
 `GET /reserves` returns the mint's deposit-backed reserve summary.
@@ -196,6 +205,9 @@ When reserve wallet discovery is configured, it also returns live reserve-wallet
 - `wallet_synced_at`
 
 Broadcasted redemption inputs are removed from spendable reserve inventory. The in-flight commitment is reported explicitly through `pending_spend_commitment_count` and `pending_spend_input_count` during the `broadcast -> finalized` window.
+When the lightserver no longer reports the selected reserve outpoints, the
+service records that network-side spend observation and reports it via
+`pending_spend_network_observed_count` and `pending_consolidation_network_observed_count`.
 
 Recommended coin-selection policy for the external mint:
 - smallest sufficient input set
@@ -238,6 +250,15 @@ selfcoin-cli mint_deposit_create \
 ```
 
 This creates a normal signed L1 transaction with one `SCMINTDEP` output.
+
+Related operator commands:
+
+```bash
+selfcoin-cli mint_redemptions_policy --url http://host:port/policy/redemptions
+selfcoin-cli mint_redemptions_pause --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex> --reason "reserve low"
+selfcoin-cli mint_redemptions_resume --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
+```
 
 To call the external mint boundary from this repo:
 

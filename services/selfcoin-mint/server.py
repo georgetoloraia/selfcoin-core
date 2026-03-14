@@ -213,6 +213,11 @@ class MintState:
             "redemptions": {},
             "note_records": {},
             "consolidations": {},
+            "policy": {
+                "redemptions_paused": False,
+                "pause_reason": "",
+                "updated_at": 0,
+            },
         }
         self._load()
 
@@ -334,6 +339,10 @@ class MintState:
 
     def create_redemption(self, redemption: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            policy = self._data.get("policy", {})
+            if isinstance(policy, dict) and bool(policy.get("redemptions_paused", False)):
+                reason = str(policy.get("pause_reason", "operator pause"))
+                raise ValueError(f"redemptions paused: {reason}")
             outstanding = self._total_deposited_locked() - self._total_reserved_locked()
             if int(redemption["amount"]) > outstanding:
                 raise ValueError("insufficient reserve")
@@ -398,7 +407,8 @@ class MintState:
                 if isinstance(item, dict) and item.get("state") == "broadcast"
             ]
 
-    def update_consolidation(self, consolidation_id: str, new_state: str, l1_txid: str = "") -> dict[str, Any]:
+    def update_consolidation(self, consolidation_id: str, new_state: str, l1_txid: str = "",
+                             metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         allowed = {
             "broadcast": {"finalized", "rejected"},
         }
@@ -407,15 +417,34 @@ class MintState:
             if not isinstance(item, dict):
                 raise KeyError("unknown consolidation_id")
             current = str(item.get("state", "broadcast"))
-            if current == new_state:
+            if current == new_state and not metadata:
                 return dict(item)
             if current not in allowed or new_state not in allowed[current]:
-                raise ValueError("invalid consolidation state transition")
+                if current != new_state:
+                    raise ValueError("invalid consolidation state transition")
             item["state"] = new_state
             item["updated_at"] = int(time.time())
             if l1_txid:
                 item["l1_txid"] = l1_txid
+            if metadata:
+                for key, value in metadata.items():
+                    item[key] = value
             self._data["consolidations"][consolidation_id] = item
+            self._flush()
+            return dict(item)
+
+    def policy(self) -> dict[str, Any]:
+        with self._lock:
+            item = self._data.get("policy", {})
+            return dict(item) if isinstance(item, dict) else {}
+
+    def update_policy(self, paused: bool, reason: str) -> dict[str, Any]:
+        with self._lock:
+            item = dict(self._data.get("policy", {}))
+            item["redemptions_paused"] = bool(paused)
+            item["pause_reason"] = reason if paused else ""
+            item["updated_at"] = int(time.time())
+            self._data["policy"] = item
             self._flush()
             return dict(item)
 
@@ -442,10 +471,11 @@ class MintState:
             if not isinstance(redemption, dict):
                 raise KeyError("unknown redemption_batch_id")
             current = str(redemption.get("state", "pending"))
-            if current == new_state:
+            if current == new_state and not metadata:
                 return dict(redemption)
             if current not in allowed or new_state not in allowed[current]:
-                raise ValueError("invalid redemption state transition")
+                if current != new_state:
+                    raise ValueError("invalid redemption state transition")
             now = int(time.time())
             redemption["state"] = new_state
             redemption["updated_at"] = now
@@ -782,6 +812,17 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if redemption.get("state") != "broadcast":
                 return
+            observed_spent = self._reserve_outpoints_missing_from_lightserver(redemption.get("selected_utxos", []))
+            if observed_spent and not redemption.get("network_spend_observed", False):
+                state.update_redemption(
+                    batch_id,
+                    "broadcast",
+                    str(redemption.get("l1_txid", "")),
+                    {
+                        "network_spend_observed": True,
+                        "network_spend_observed_at": int(time.time()),
+                    },
+                )
             txid = str(redemption.get("l1_txid", ""))
             if not txid:
                 return
@@ -798,6 +839,17 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if item.get("state") != "broadcast":
                 return
+            observed_spent = self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            if observed_spent and not item.get("network_spend_observed", False):
+                state.update_consolidation(
+                    consolidation_id,
+                    "broadcast",
+                    str(item.get("l1_txid", "")),
+                    {
+                        "network_spend_observed": True,
+                        "network_spend_observed_at": int(time.time()),
+                    },
+                )
             txid = str(item.get("l1_txid", ""))
             if not txid:
                 return
@@ -835,6 +887,43 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                         if txid and vout >= 0:
                             locked.add((txid, vout))
             return locked
+
+        def _reserve_raw_utxos(self) -> list[dict[str, Any]]:
+            if not config.lightserver_url or not config.reserve_address:
+                return []
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                return []
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            return lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+
+        def _reserve_outpoints_missing_from_lightserver(self, selected_utxos: list[dict[str, Any]]) -> bool:
+            if not selected_utxos:
+                return False
+            current = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in self._reserve_raw_utxos()
+            }
+            needed = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in selected_utxos
+                if isinstance(item, dict)
+            }
+            return bool(needed) and needed.isdisjoint(current)
+
+        def _pending_network_spend_observation(self) -> dict[str, int]:
+            redemptions = state.list_broadcast_redemptions()
+            consolidations = state.list_broadcast_consolidations()
+            redemption_seen = sum(
+                1 for item in redemptions if self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            )
+            consolidation_seen = sum(
+                1 for item in consolidations if self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            )
+            return {
+                "pending_spend_network_observed_count": redemption_seen,
+                "pending_consolidation_network_observed_count": consolidation_seen,
+            }
 
         def _reserve_alerts(self, summary: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
             utxo_count = int(inventory.get("wallet_utxo_count", 0))
@@ -876,14 +965,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "wallet_synced_at": int(time.time()),
                     "wallet_error": "invalid reserve address",
                 }
-            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
-            raw_utxos = lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+            raw_utxos = self._reserve_raw_utxos()
             locked = self._locked_reserve_outpoints()
             utxos = [
                 item for item in raw_utxos if (str(item.get("txid", "")), int(item.get("vout", -1))) not in locked
             ]
             values = sorted(int(item.get("value", 0)) for item in utxos)
-            return {
+            out = {
                 "wallet_utxo_count": len(utxos),
                 "wallet_utxo_value": sum(values),
                 "wallet_locked_utxo_count": len(raw_utxos) - len(utxos),
@@ -893,6 +981,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "wallet_fragment_below_min_change": sum(1 for value in values if value < RESERVE_MIN_CHANGE),
                 "wallet_synced_at": int(time.time()),
             }
+            out.update(self._pending_network_spend_observation())
+            return out
 
         def _select_reserve_utxos(self, amount_needed: int) -> list[dict[str, Any]]:
             reserve_pkh = decode_selfcoin_address(config.reserve_address)
@@ -1032,6 +1122,38 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 }
             )
 
+        def _consolidation_plan(self) -> dict[str, Any]:
+            selected = self._select_consolidation_utxos()
+            if len(selected) < 2:
+                return {
+                    "available": False,
+                    "reason": "no consolidation candidates available",
+                    "input_count": len(selected),
+                }
+            total_input_value = _sum_utxo_values(selected)
+            if total_input_value <= config.reserve_fee:
+                return {
+                    "available": False,
+                    "reason": "selected utxos do not cover reserve fee",
+                    "input_count": len(selected),
+                }
+            return {
+                "available": True,
+                "coin_selection_policy": "smallest-first-consolidation",
+                "input_count": len(selected),
+                "total_input_value": total_input_value,
+                "output_value": total_input_value - config.reserve_fee,
+                "fee": config.reserve_fee,
+                "selected_utxos": [
+                    {
+                        "txid": str(item["txid"]),
+                        "vout": int(item["vout"]),
+                        "value": int(item["value"]),
+                    }
+                    for item in selected
+                ],
+            }
+
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 write_json(self, HTTPStatus.OK, {"ok": True, "mint_id": config.mint_id})
@@ -1096,6 +1218,14 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
                 return
+            if self.path == "/reserves/consolidate_plan":
+                if not self._require_operator(b""):
+                    return
+                write_json(self, HTTPStatus.OK, self._consolidation_plan())
+                return
+            if self.path == "/policy/redemptions":
+                write_json(self, HTTPStatus.OK, state.policy())
+                return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:
@@ -1136,6 +1266,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/reserves/consolidate":
                 self._handle_reserve_consolidate(raw_body)
+                return
+            if self.path == "/policy/redemptions":
+                self._handle_redemption_policy_update(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1377,6 +1510,17 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "fee": item["fee"],
                 },
             )
+
+        def _handle_redemption_policy_update(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            paused = body.get("redemptions_paused")
+            reason = body.get("pause_reason", "")
+            if not isinstance(paused, bool) or not isinstance(reason, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid policy fields"})
+                return
+            policy = state.update_policy(paused, reason)
+            write_json(self, HTTPStatus.OK, {"accepted": True, **policy})
 
     return MintHandler
 

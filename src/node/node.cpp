@@ -1198,10 +1198,18 @@ void Node::event_loop() {
             if (cfg_.network.vrf_proposer_enabled && local_vrf.has_value()) {
               b->header.vrf_proof = local_vrf->proof;
               b->header.vrf_output = local_vrf->output;
+              auto leader_sig = crypto::ed25519_sign(block_proposal_signing_message(b->header), local_key_.private_key);
+              if (!leader_sig.has_value()) {
+                b.reset();
+              } else {
+                b->header.leader_signature = *leader_sig;
+              }
             }
-            proposed_in_round_[key] = true;
-            candidate_blocks_[b->header.block_id()] = *b;
-            to_propose = *b;
+            if (b.has_value()) {
+              proposed_in_round_[key] = true;
+              candidate_blocks_[b->header.block_id()] = *b;
+              to_propose = *b;
+            }
           }
         }
       }

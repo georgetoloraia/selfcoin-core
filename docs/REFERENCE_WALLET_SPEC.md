@@ -14,6 +14,7 @@ It is a disciplined first wallet that proves:
 
 Implemented now in `selfcoin-wallet`:
 - Qt desktop app target in the main build
+- classic desktop-style light UI with grouped summary panels
 - create wallet
 - open wallet
 - import wallet from 32-byte private key hex
@@ -38,6 +39,10 @@ Implemented now in `selfcoin-wallet`:
   - wallet event history
   - mint note inventory
   - last redemption batch id
+- mint tab rendering for:
+  - grouped private note inventory by denomination
+  - recent deposit list
+  - recent redemption/status list
 
 Intentionally deferred to the next wallet phase:
 - QR rendering

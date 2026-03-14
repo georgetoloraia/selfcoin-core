@@ -102,6 +102,11 @@ class WalletWindow final : public QMainWindow {
   QLabel* mint_notes_label_{nullptr};
   QLabel* mint_redemption_label_{nullptr};
   QLabel* mint_status_label_{nullptr};
+  QLabel* mint_private_balance_label_{nullptr};
+  QLabel* mint_note_count_label_{nullptr};
+  QPlainTextEdit* mint_deposits_view_{nullptr};
+  QPlainTextEdit* mint_notes_view_{nullptr};
+  QPlainTextEdit* mint_redemptions_view_{nullptr};
 
   QLineEdit* lightserver_url_edit_{nullptr};
   QLineEdit* mint_url_edit_{nullptr};

@@ -26,6 +26,7 @@
 #include <QSettings>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QFontDatabase>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -131,6 +132,26 @@ std::vector<std::uint64_t> split_into_denominations(std::uint64_t amount) {
   }
   if (remaining > 0) out.push_back(remaining);
   return out;
+}
+
+QString mono_font_family() {
+  QFont f = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+  return f.family();
+}
+
+QString trim_after_token(const QString& line, const QString& token) {
+  const int pos = line.indexOf(token);
+  if (pos < 0) return {};
+  return line.mid(pos + token.size()).trimmed();
+}
+
+QString extract_field_value(const QString& line, const QString& field) {
+  const QString needle = field + "=";
+  const int pos = line.indexOf(needle);
+  if (pos < 0) return {};
+  int end = line.indexOf(' ', pos + needle.size());
+  if (end < 0) end = line.size();
+  return line.mid(pos + needle.size(), end - (pos + needle.size())).trimmed();
 }
 
 std::optional<std::vector<std::size_t>> choose_note_subset_exact(const std::vector<selfcoin::wallet::WalletWindow::MintNote>& notes,
@@ -264,7 +285,7 @@ void WalletWindow::build_ui() {
   send_form->addRow("", send_actions);
   send_layout->addWidget(send_form_box);
   auto* send_note = new QLabel(
-      "The reference wallet validates inputs here. Transaction building and broadcast should be wired against lightserver in the next wallet phase, not hidden behind a fake send button.",
+      "Transactions are signed locally and broadcast through lightserver. Use Review Send before final submission.",
       send);
   send_note->setWordWrap(true);
   send_layout->addWidget(send_note);
@@ -281,30 +302,56 @@ void WalletWindow::build_ui() {
 
   auto* mint = new QWidget(this);
   auto* mint_layout = new QVBoxLayout(mint);
-  auto* mint_deposit_box = new QGroupBox("Mint Deposit", mint);
+
+  auto* mint_summary_box = new QGroupBox("Mint Summary", mint);
+  auto* mint_summary_grid = new QGridLayout(mint_summary_box);
+  mint_summary_grid->addWidget(new QLabel("Current deposit ref:", mint_summary_box), 0, 0);
+  mint_deposit_ref_label_ = new QLabel("-", mint_summary_box);
+  mint_deposit_ref_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  mint_summary_grid->addWidget(mint_deposit_ref_label_, 0, 1);
+  mint_summary_grid->addWidget(new QLabel("Last redemption batch:", mint_summary_box), 1, 0);
+  mint_redemption_label_ = new QLabel("-", mint_summary_box);
+  mint_redemption_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  mint_summary_grid->addWidget(mint_redemption_label_, 1, 1);
+  mint_summary_grid->addWidget(new QLabel("Private balance:", mint_summary_box), 2, 0);
+  mint_private_balance_label_ = new QLabel("0 SC", mint_summary_box);
+  mint_summary_grid->addWidget(mint_private_balance_label_, 2, 1);
+  mint_summary_grid->addWidget(new QLabel("Active notes:", mint_summary_box), 3, 0);
+  mint_note_count_label_ = new QLabel("0", mint_summary_box);
+  mint_summary_grid->addWidget(mint_note_count_label_, 3, 1);
+  mint_status_label_ = new QLabel("Mint URL not configured yet.", mint_summary_box);
+  mint_status_label_->setWordWrap(true);
+  mint_summary_grid->addWidget(mint_status_label_, 4, 0, 1, 2);
+  mint_layout->addWidget(mint_summary_box);
+
+  auto* mint_ops = new QWidget(mint);
+  auto* mint_ops_layout = new QHBoxLayout(mint_ops);
+  mint_ops_layout->setContentsMargins(0, 0, 0, 0);
+
+  auto* mint_left = new QVBoxLayout();
+  auto* mint_right = new QVBoxLayout();
+
+  auto* mint_deposit_box = new QGroupBox("Deposit To Mint", mint_ops);
   auto* mint_deposit_form = new QFormLayout(mint_deposit_box);
   mint_deposit_amount_edit_ = new QLineEdit(mint_deposit_box);
   auto* mint_deposit_button = new QPushButton("Deposit To Mint", mint_deposit_box);
   mint_deposit_form->addRow("Amount (SC)", mint_deposit_amount_edit_);
-  mint_deposit_ref_label_ = new QLabel("-", mint_deposit_box);
-  mint_deposit_ref_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  mint_deposit_form->addRow("Deposit ref", mint_deposit_ref_label_);
   mint_deposit_form->addRow("", mint_deposit_button);
-  mint_layout->addWidget(mint_deposit_box);
+  mint_left->addWidget(mint_deposit_box);
 
-  auto* mint_issue_box = new QGroupBox("Issue Private Note", mint);
+  auto* mint_issue_box = new QGroupBox("Issue Private Notes", mint_ops);
   auto* mint_issue_form = new QFormLayout(mint_issue_box);
   mint_issue_amount_edit_ = new QLineEdit(mint_issue_box);
-  auto* mint_issue_button = new QPushButton("Issue Note", mint_issue_box);
+  auto* mint_issue_button = new QPushButton("Issue Notes", mint_issue_box);
   mint_notes_label_ = new QLabel("-", mint_issue_box);
   mint_notes_label_->setWordWrap(true);
   mint_notes_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   mint_issue_form->addRow("Issue amount (SC)", mint_issue_amount_edit_);
-  mint_issue_form->addRow("Mint notes", mint_notes_label_);
+  mint_issue_form->addRow("Note mix", mint_notes_label_);
   mint_issue_form->addRow("", mint_issue_button);
-  mint_layout->addWidget(mint_issue_box);
+  mint_left->addWidget(mint_issue_box);
 
-  auto* mint_redeem_box = new QGroupBox("Redeem From Mint", mint);
+  auto* mint_redeem_box = new QGroupBox("Redeem To Wallet", mint_ops);
   auto* mint_redeem_form = new QFormLayout(mint_redeem_box);
   mint_redeem_amount_edit_ = new QLineEdit(mint_redeem_box);
   mint_redeem_address_edit_ = new QLineEdit(mint_redeem_box);
@@ -315,15 +362,37 @@ void WalletWindow::build_ui() {
   mint_redeem_actions->addWidget(mint_redeem_status_button);
   mint_redeem_form->addRow("Amount (SC)", mint_redeem_amount_edit_);
   mint_redeem_form->addRow("Destination address", mint_redeem_address_edit_);
-  mint_redemption_label_ = new QLabel("-", mint_redeem_box);
-  mint_redemption_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  mint_redeem_form->addRow("Redemption batch", mint_redemption_label_);
   mint_redeem_form->addRow("", mint_redeem_actions);
-  mint_layout->addWidget(mint_redeem_box);
+  mint_left->addWidget(mint_redeem_box);
+  mint_left->addStretch(1);
 
-  mint_status_label_ = new QLabel("Mint URL not configured yet.", mint);
-  mint_status_label_->setWordWrap(true);
-  mint_layout->addWidget(mint_status_label_);
+  auto* deposits_box = new QGroupBox("Recent Deposits", mint_ops);
+  auto* deposits_layout = new QVBoxLayout(deposits_box);
+  mint_deposits_view_ = new QPlainTextEdit(deposits_box);
+  mint_deposits_view_->setReadOnly(true);
+  mint_deposits_view_->setMaximumBlockCount(32);
+  deposits_layout->addWidget(mint_deposits_view_);
+  mint_right->addWidget(deposits_box);
+
+  auto* notes_box = new QGroupBox("Note Inventory", mint_ops);
+  auto* notes_layout = new QVBoxLayout(notes_box);
+  mint_notes_view_ = new QPlainTextEdit(notes_box);
+  mint_notes_view_->setReadOnly(true);
+  mint_notes_view_->setMaximumBlockCount(64);
+  notes_layout->addWidget(mint_notes_view_);
+  mint_right->addWidget(notes_box);
+
+  auto* redemption_box = new QGroupBox("Recent Redemptions", mint_ops);
+  auto* redemption_layout = new QVBoxLayout(redemption_box);
+  mint_redemptions_view_ = new QPlainTextEdit(redemption_box);
+  mint_redemptions_view_->setReadOnly(true);
+  mint_redemptions_view_->setMaximumBlockCount(48);
+  redemption_layout->addWidget(mint_redemptions_view_);
+  mint_right->addWidget(redemption_box);
+
+  mint_ops_layout->addLayout(mint_left, 3);
+  mint_ops_layout->addLayout(mint_right, 4);
+  mint_layout->addWidget(mint_ops);
   mint_layout->addStretch(1);
   tabs_->addTab(mint, "Mint");
 
@@ -368,6 +437,12 @@ void WalletWindow::build_ui() {
   connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
   connect(mint_redeem_status_button, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
   connect(save_settings_button, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
+
+  const QString mono = mono_font_family();
+  history_view_->setFont(QFont(mono));
+  mint_deposits_view_->setFont(QFont(mono));
+  mint_notes_view_->setFont(QFont(mono));
+  mint_redemptions_view_->setFont(QFont(mono));
 }
 
 void WalletWindow::load_settings() {
@@ -432,15 +507,54 @@ void WalletWindow::render_history_view() {
 void WalletWindow::render_mint_state() {
   mint_deposit_ref_label_->setText(mint_deposit_ref_.isEmpty() ? "-" : mint_deposit_ref_);
   mint_redemption_label_->setText(mint_last_redemption_batch_id_.isEmpty() ? "-" : mint_last_redemption_batch_id_);
+  std::uint64_t private_total = 0;
+  std::map<std::uint64_t, std::size_t, std::greater<std::uint64_t>> by_amount;
+  for (const auto& note : mint_notes_) {
+    private_total += note.amount;
+    by_amount[note.amount] += 1;
+  }
+  mint_private_balance_label_->setText(format_coin_amount(private_total));
+  mint_note_count_label_->setText(QString::number(mint_notes_.size()));
   if (mint_notes_.empty()) {
     mint_notes_label_->setText("-");
+    mint_notes_view_->setPlainText("No active private notes.");
   } else {
-    QStringList lines;
-    for (const auto& note : mint_notes_) {
-      lines.push_back(QString("%1 (%2)").arg(note.note_ref).arg(format_coin_amount(note.amount)));
+    QStringList summary_lines;
+    QStringList detail_lines;
+    for (const auto& [amount, count] : by_amount) {
+      summary_lines.push_back(QString("%1 x %2").arg(QString::number(count), format_coin_amount(amount)));
     }
-    mint_notes_label_->setText(lines.join("\n"));
+    for (const auto& note : mint_notes_) {
+      detail_lines.push_back(QString("%1  %2").arg(format_coin_amount(note.amount), elide_middle(note.note_ref, 10)));
+    }
+    mint_notes_label_->setText(summary_lines.join("\n"));
+    mint_notes_view_->setPlainText(detail_lines.join("\n"));
   }
+
+  QStringList deposit_lines;
+  QStringList redemption_lines;
+  for (int i = local_history_lines_.size() - 1; i >= 0; --i) {
+    const QString line = local_history_lines_[i];
+    if (line.startsWith("[mint-deposit]")) {
+      deposit_lines.push_back(trim_after_token(line, "[mint-deposit]"));
+    } else if (line.startsWith("[mint-redeem]")) {
+      const QString batch = extract_field_value(line, "batch");
+      const QString amount = extract_field_value(line, "amount");
+      const QString notes = extract_field_value(line, "notes");
+      redemption_lines.push_back(QString("batch=%1  amount=%2  notes=%3").arg(batch, amount, notes));
+    } else if (line.startsWith("[mint-status]")) {
+      const QString batch = extract_field_value(line, "batch");
+      const QString state = extract_field_value(line, "state");
+      const QString txid = extract_field_value(line, "l1_txid");
+      redemption_lines.push_back(QString("batch=%1  state=%2  tx=%3")
+                                     .arg(batch, state, txid.isEmpty() ? "-" : elide_middle(txid, 8)));
+    }
+    if (deposit_lines.size() >= 10 && redemption_lines.size() >= 12) break;
+  }
+  mint_deposits_view_->setPlainText(deposit_lines.isEmpty() ? "No mint deposits recorded yet."
+                                                            : deposit_lines.join("\n"));
+  mint_redemptions_view_->setPlainText(redemption_lines.isEmpty() ? "No redemptions recorded yet."
+                                                                  : redemption_lines.join("\n"));
 }
 
 void WalletWindow::save_wallet_local_state() {

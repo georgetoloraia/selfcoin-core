@@ -334,9 +334,11 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
           req.bond_outpoint = OutPoint{txid, bond_i};
           req.bond_amount = tx.outputs[bond_i].value;
           req.requested_height = h;
-          req.status = ValidatorJoinRequestStatus::REQUESTED;
+          req.status = ValidatorJoinRequestStatus::APPROVED;
+          req.approved_height = h;
           join_requests[txid] = req;
           requested_in_tx.insert(pub);
+          vr.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
           break;
         }
       }
@@ -346,21 +348,6 @@ std::optional<std::vector<PubKey32>> Server::committee_for_height(std::uint64_t 
           if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
           vr.register_bond(pub, OutPoint{txid, i}, h);
           continue;
-        }
-        Hash32 request_txid{};
-        PubKey32 validator_pub{};
-        PubKey32 approver_pub{};
-        Sig64 approval_sig{};
-        if (is_validator_join_approval_script(tx.outputs[i].script_pubkey, &request_txid, &validator_pub, &approver_pub,
-                                              &approval_sig)) {
-          auto it = join_requests.find(request_txid);
-          if (it == join_requests.end()) continue;
-          auto& req = it->second;
-          if (req.validator_pubkey != validator_pub) continue;
-          if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
-          req.status = ValidatorJoinRequestStatus::APPROVED;
-          req.approved_height = h;
-          vr.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
         }
       }
     }

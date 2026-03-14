@@ -133,7 +133,7 @@ The system is operationally deterministic and reproducible from finalized state,
 - State effect on finalize path: spending a bond with slash evidence causes `validators_.ban(pub)` (`Node::apply_validator_state_changes`).
 
 ### Permissionless status
-- Join path is on-chain via bond tx (permissionless at rule level).
+- Join path is on-chain via `SCVALJRQ` + matching bond output; finalized valid join requests are admitted automatically under rule checks and then warm up to active.
 - Effective participation still depends on obtaining stake and surviving warmup/delay rules.
 - Genesis initial validator set is configured at chain boot from genesis document (`Node::init_mainnet_genesis`).
 

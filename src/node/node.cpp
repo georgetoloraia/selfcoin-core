@@ -2523,8 +2523,10 @@ bool Node::load_state() {
             req.bond_outpoint = OutPoint{txid, bond_i};
             req.bond_amount = tx.outputs[bond_i].value;
             req.requested_height = h;
-            req.status = ValidatorJoinRequestStatus::REQUESTED;
+            req.status = ValidatorJoinRequestStatus::APPROVED;
+            req.approved_height = h;
             replay_join_requests[txid] = req;
+            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
             requested_in_tx.insert(pub);
             break;
           }
@@ -2536,21 +2538,6 @@ bool Node::load_state() {
             if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
             replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
             continue;
-          }
-          Hash32 request_txid{};
-          PubKey32 validator_pub{};
-          PubKey32 approver_pub{};
-          Sig64 approval_sig{};
-          if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub,
-                                                &approval_sig)) {
-            auto req_it = replay_join_requests.find(request_txid);
-            if (req_it == replay_join_requests.end()) continue;
-            auto& req = req_it->second;
-            if (req.validator_pubkey != validator_pub) continue;
-            if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
-            req.status = ValidatorJoinRequestStatus::APPROVED;
-            req.approved_height = h;
-            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
           }
         }
       }
@@ -2733,8 +2720,10 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
             req.bond_outpoint = OutPoint{txid, bond_i};
             req.bond_amount = tx.outputs[bond_i].value;
             req.requested_height = h;
-            req.status = ValidatorJoinRequestStatus::REQUESTED;
+            req.status = ValidatorJoinRequestStatus::APPROVED;
+            req.approved_height = h;
             replay_join_requests[txid] = req;
+            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
             requested_in_tx.insert(pub);
             break;
           }
@@ -2746,20 +2735,6 @@ std::vector<PubKey32> Node::committee_for_height_round(std::uint64_t height, std
             if (requested_in_tx.find(pub) != requested_in_tx.end()) continue;
             replay_validators.register_bond(pub, OutPoint{txid, out_i}, h);
             continue;
-          }
-          Hash32 request_txid{};
-          PubKey32 validator_pub{};
-          PubKey32 approver_pub{};
-          Sig64 approval_sig{};
-          if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub, &approval_sig)) {
-            auto req_it = replay_join_requests.find(request_txid);
-            if (req_it == replay_join_requests.end()) continue;
-            auto& req = req_it->second;
-            if (req.validator_pubkey != validator_pub) continue;
-            if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
-            req.status = ValidatorJoinRequestStatus::APPROVED;
-            req.approved_height = h;
-            replay_validators.register_bond(req.validator_pubkey, req.bond_outpoint, h, req.bond_amount);
           }
         }
       }
@@ -2841,15 +2816,6 @@ bool Node::validate_v4_registration_rules(const Block& block, std::uint64_t heig
       const auto& out = tx.outputs[out_i];
       PubKey32 pub{};
       if (!is_validator_register_script(out.script_pubkey, &pub)) continue;
-      bool gated_by_join_request = false;
-      for (const auto& out2 : tx.outputs) {
-        PubKey32 req_pub{};
-        if (is_validator_join_request_script(out2.script_pubkey, &req_pub, nullptr, nullptr) && req_pub == pub) {
-          gated_by_join_request = true;
-          break;
-        }
-      }
-      if (gated_by_join_request) continue;
       if (out.value < validator_bond_min_amount_ || out.value > validator_bond_max_amount_) return false;
 
       std::string err;
@@ -2971,9 +2937,16 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
         req.bond_outpoint = OutPoint{txid, bond_i};
         req.bond_amount = tx.outputs[bond_i].value;
         req.requested_height = height;
-        req.status = ValidatorJoinRequestStatus::REQUESTED;
+        req.status = ValidatorJoinRequestStatus::APPROVED;
+        req.approved_height = height;
         validator_join_requests_[txid] = req;
         (void)db_.put_validator_join_request(txid, req);
+        std::string err;
+        if (validators_.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err)) {
+          if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
+            ++v4_join_count_in_window_;
+          }
+        }
         requested_in_tx.insert(validator_pub);
         break;
       }
@@ -2996,26 +2969,6 @@ void Node::apply_validator_state_changes(const Block& block, const UtxoSet& pre_
         continue;
       }
 
-      Hash32 request_txid{};
-      PubKey32 validator_pub{};
-      PubKey32 approver_pub{};
-      Sig64 approval_sig{};
-      if (is_validator_join_approval_script(out.script_pubkey, &request_txid, &validator_pub, &approver_pub, &approval_sig)) {
-        auto req_it = validator_join_requests_.find(request_txid);
-        if (req_it == validator_join_requests_.end()) continue;
-        auto& req = req_it->second;
-        if (req.validator_pubkey != validator_pub) continue;
-        if (req.status == ValidatorJoinRequestStatus::APPROVED) continue;
-        req.status = ValidatorJoinRequestStatus::APPROVED;
-        req.approved_height = height;
-        (void)db_.put_validator_join_request(request_txid, req);
-        std::string err;
-        if (validators_.register_bond(req.validator_pubkey, req.bond_outpoint, height, req.bond_amount, &err)) {
-          if (v4_active_for_height(height) && v4_join_limit_window_blocks_ > 0) {
-            ++v4_join_count_in_window_;
-          }
-        }
-      }
     }
   }
 

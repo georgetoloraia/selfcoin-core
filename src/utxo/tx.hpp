@@ -128,9 +128,6 @@ bool is_validator_register_script(const Bytes& script, PubKey32* out_pubkey = nu
 bool is_validator_unbond_script(const Bytes& script, PubKey32* out_pubkey = nullptr);
 bool is_validator_join_request_script(const Bytes& script, PubKey32* out_validator_pubkey = nullptr,
                                       PubKey32* out_payout_pubkey = nullptr, Sig64* out_pop = nullptr);
-bool is_validator_join_approval_script(const Bytes& script, Hash32* out_request_txid = nullptr,
-                                       PubKey32* out_validator_pubkey = nullptr,
-                                       PubKey32* out_approver_pubkey = nullptr, Sig64* out_sig = nullptr);
 bool is_burn_script(const Bytes& script, Hash32* out_evidence_hash = nullptr);
 
 enum class ValidatorJoinRequestStatus : std::uint8_t {

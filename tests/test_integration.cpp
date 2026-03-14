@@ -216,22 +216,6 @@ std::optional<Tx> create_join_request_tx_from_validator0(node::Node& node0, cons
   return std::nullopt;
 }
 
-std::optional<Tx> create_join_approval_tx_from_validator0(node::Node& node0, const crypto::KeyPair& validator0,
-                                                          const Hash32& request_txid, const PubKey32& validator_pub,
-                                                          std::uint64_t fee = 0) {
-  const auto sender_pkh = crypto::h160(Bytes(validator0.public_key.begin(), validator0.public_key.end()));
-  auto utxos = node0.find_utxos_by_pubkey_hash_for_test(sender_pkh);
-  if (utxos.empty()) return std::nullopt;
-  for (const auto& [op, out] : utxos) {
-    if (out.value < fee) continue;
-    return build_validator_join_approval_tx(op, out, Bytes(validator0.private_key.begin(), validator0.private_key.end()),
-                                            request_txid, validator_pub,
-                                            Bytes(validator0.private_key.begin(), validator0.private_key.end()),
-                                            address::p2pkh_script_pubkey(sender_pkh), fee);
-  }
-  return std::nullopt;
-}
-
 struct Cluster {
   std::vector<std::unique_ptr<node::Node>> nodes;
 
@@ -2068,7 +2052,7 @@ TEST(test_second_fresh_node_adopts_bootstrap_validator_and_syncs) {
   n0.stop();
 }
 
-TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
+TEST(test_explicit_join_request_auto_activates_validator_on_chain) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const std::string base = "/tmp/selfcoin_it_join_request_approval";
   std::filesystem::remove_all(base);
@@ -2122,18 +2106,6 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
     return blk.has_value();
   }, std::chrono::seconds(60)));
 
-  const auto height_after_request = nodes[0]->status().height;
-  ASSERT_TRUE(wait_for([&]() { return nodes[0]->status().height >= height_after_request + 3; }, std::chrono::seconds(60)));
-
-  for (const auto& n : nodes) {
-    ASSERT_TRUE(!n->validator_info_for_test(new_val.public_key).has_value());
-    ASSERT_EQ(n->active_validators_for_next_height_for_test().size(), 1u);
-  }
-
-  auto approval_tx = create_join_approval_tx_from_validator0(*nodes[0], keys[0], request_txid, new_val.public_key, 0);
-  ASSERT_TRUE(approval_tx.has_value());
-  ASSERT_TRUE(nodes[0]->inject_tx_for_test(*approval_tx, true));
-
   std::uint64_t joined_height = 0;
   ASSERT_TRUE(wait_for([&]() {
     for (const auto& n : nodes) {
@@ -2157,7 +2129,7 @@ TEST(test_explicit_join_request_and_approval_activate_validator_on_chain) {
   }, std::chrono::seconds(120)));
 }
 
-TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot) {
+TEST(test_mid_epoch_auto_admitted_validator_cannot_vote_until_next_committee_snapshot) {
   const auto keys = node::Node::deterministic_test_keypairs();
   const std::string base = "/tmp/selfcoin_it_mid_epoch_vote_snapshot";
   std::filesystem::remove_all(base);
@@ -2174,7 +2146,7 @@ TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot
   cfg.allow_unsafe_genesis_override = true;
   cfg.network.vrf_proposer_enabled = false;
   cfg.network.vrf_committee_enabled = true;
-  cfg.network.vrf_committee_epoch_blocks = 64;
+  cfg.network.vrf_committee_epoch_blocks = 16;
   cfg.network.min_block_interval_ms = 100;
   cfg.network.round_timeout_ms = 200;
   cfg.validator_min_bond_override = 1;
@@ -2205,10 +2177,6 @@ TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot
     return blk.has_value();
   }, std::chrono::seconds(30)));
 
-  auto approval_tx = create_join_approval_tx_from_validator0(n, keys[0], request_txid, new_val.public_key, 0);
-  ASSERT_TRUE(approval_tx.has_value());
-  ASSERT_TRUE(n.inject_tx_for_test(*approval_tx, true));
-
   ASSERT_TRUE(wait_for([&]() {
     auto info = n.validator_info_for_test(new_val.public_key);
     if (!info.has_value()) return false;
@@ -2235,7 +2203,7 @@ TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot
   bad_vote.signature = *bad_sig;
   ASSERT_TRUE(!n.inject_vote_for_test(bad_vote));
 
-  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 64; }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() { return n.status().height >= 16; }, std::chrono::seconds(60)));
 
   const auto committee_after_rollover = n.committee_for_next_height_for_test();
   ASSERT_TRUE(std::find(committee_after_rollover.begin(), committee_after_rollover.end(), new_val.public_key) !=
@@ -2244,7 +2212,7 @@ TEST(test_mid_epoch_approved_validator_cannot_vote_until_next_committee_snapshot
   n.stop();
 }
 
-TEST(test_bootstrap_join_request_without_approval_is_not_auto_approved) {
+TEST(test_bootstrap_join_request_auto_admits_after_finalization) {
   const std::string base = "/tmp/selfcoin_it_bootstrap_joiner_no_approval";
   std::filesystem::remove_all(base);
   std::filesystem::create_directories(base);
@@ -2328,10 +2296,18 @@ TEST(test_bootstrap_join_request_without_approval_is_not_auto_approved) {
   ASSERT_TRUE(wait_for(std::function<bool()>{[&]() { return n0.status().height >= height_after_request + 3; }},
                        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(60))));
 
-  ASSERT_EQ(n0.status().pending_bootstrap_joiners, 1u);
-  ASSERT_TRUE(!n0.validator_info_for_test(joiner_vk.pubkey).has_value());
-  ASSERT_EQ(n0.active_validators_for_next_height_for_test().size(), 1u);
-  ASSERT_EQ(n1.active_validators_for_next_height_for_test().size(), 1u);
+  ASSERT_EQ(n0.status().pending_bootstrap_joiners, 0u);
+  ASSERT_TRUE(wait_for([&]() {
+    auto info0 = n0.validator_info_for_test(joiner_vk.pubkey);
+    auto info1 = n1.validator_info_for_test(joiner_vk.pubkey);
+    if (!info0.has_value() || !info1.has_value()) return false;
+    return (info0->status == consensus::ValidatorStatus::PENDING || info0->status == consensus::ValidatorStatus::ACTIVE) &&
+           (info1->status == consensus::ValidatorStatus::PENDING || info1->status == consensus::ValidatorStatus::ACTIVE);
+  }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() {
+    return n0.active_validators_for_next_height_for_test().size() >= 2u &&
+           n1.active_validators_for_next_height_for_test().size() >= 2u;
+  }, std::chrono::seconds(30)));
 
   n1.stop();
   n0.stop();

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <random>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -33,6 +34,8 @@
 #include "crypto/hash.hpp"
 #include "keystore/validator_keystore.hpp"
 #include "lightserver/client.hpp"
+#include "privacy/mint_client.hpp"
+#include "privacy/mint_scripts.hpp"
 #include "utxo/signing.hpp"
 #include "utxo/tx.hpp"
 
@@ -89,6 +92,19 @@ Hash32 wallet_scripthash_from_address(const std::string& address) {
   auto decoded = selfcoin::address::decode(address);
   if (!decoded) return zero_hash();
   return crypto::sha256(selfcoin::address::p2pkh_script_pubkey(decoded->pubkey_hash));
+}
+
+QString mint_endpoint(const QString& base_url, const QString& path) {
+  QString out = base_url.trimmed();
+  while (out.endsWith('/')) out.chop(1);
+  return out + path;
+}
+
+QString random_hex_string(std::size_t bytes_len) {
+  std::random_device rd;
+  Bytes b(bytes_len, 0);
+  for (auto& v : b) v = static_cast<std::uint8_t>(rd());
+  return QString::fromStdString(hex_encode(b));
 }
 
 }  // namespace
@@ -222,19 +238,41 @@ void WalletWindow::build_ui() {
   auto* mint_deposit_box = new QGroupBox("Mint Deposit", mint);
   auto* mint_deposit_form = new QFormLayout(mint_deposit_box);
   mint_deposit_amount_edit_ = new QLineEdit(mint_deposit_box);
-  auto* mint_deposit_button = new QPushButton("Prepare Deposit", mint_deposit_box);
+  auto* mint_deposit_button = new QPushButton("Deposit To Mint", mint_deposit_box);
   mint_deposit_form->addRow("Amount (SC)", mint_deposit_amount_edit_);
+  mint_deposit_ref_label_ = new QLabel("-", mint_deposit_box);
+  mint_deposit_ref_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  mint_deposit_form->addRow("Deposit ref", mint_deposit_ref_label_);
   mint_deposit_form->addRow("", mint_deposit_button);
   mint_layout->addWidget(mint_deposit_box);
+
+  auto* mint_issue_box = new QGroupBox("Issue Private Note", mint);
+  auto* mint_issue_form = new QFormLayout(mint_issue_box);
+  mint_issue_amount_edit_ = new QLineEdit(mint_issue_box);
+  auto* mint_issue_button = new QPushButton("Issue Note", mint_issue_box);
+  mint_notes_label_ = new QLabel("-", mint_issue_box);
+  mint_notes_label_->setWordWrap(true);
+  mint_notes_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  mint_issue_form->addRow("Issue amount (SC)", mint_issue_amount_edit_);
+  mint_issue_form->addRow("Mint notes", mint_notes_label_);
+  mint_issue_form->addRow("", mint_issue_button);
+  mint_layout->addWidget(mint_issue_box);
 
   auto* mint_redeem_box = new QGroupBox("Redeem From Mint", mint);
   auto* mint_redeem_form = new QFormLayout(mint_redeem_box);
   mint_redeem_amount_edit_ = new QLineEdit(mint_redeem_box);
   mint_redeem_address_edit_ = new QLineEdit(mint_redeem_box);
-  auto* mint_redeem_button = new QPushButton("Prepare Redemption", mint_redeem_box);
+  auto* mint_redeem_actions = new QHBoxLayout();
+  auto* mint_redeem_button = new QPushButton("Redeem", mint_redeem_box);
+  auto* mint_redeem_status_button = new QPushButton("Refresh Redemption", mint_redeem_box);
+  mint_redeem_actions->addWidget(mint_redeem_button);
+  mint_redeem_actions->addWidget(mint_redeem_status_button);
   mint_redeem_form->addRow("Amount (SC)", mint_redeem_amount_edit_);
   mint_redeem_form->addRow("Destination address", mint_redeem_address_edit_);
-  mint_redeem_form->addRow("", mint_redeem_button);
+  mint_redemption_label_ = new QLabel("-", mint_redeem_box);
+  mint_redemption_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  mint_redeem_form->addRow("Redemption batch", mint_redemption_label_);
+  mint_redeem_form->addRow("", mint_redeem_actions);
   mint_layout->addWidget(mint_redeem_box);
 
   mint_status_label_ = new QLabel("Mint URL not configured yet.", mint);
@@ -249,8 +287,10 @@ void WalletWindow::build_ui() {
   auto* settings_form = new QFormLayout(settings_box);
   lightserver_url_edit_ = new QLineEdit(settings_box);
   mint_url_edit_ = new QLineEdit(settings_box);
+  mint_id_edit_ = new QLineEdit(settings_box);
   settings_form->addRow("Lightserver URL", lightserver_url_edit_);
   settings_form->addRow("Mint URL", mint_url_edit_);
+  settings_form->addRow("Mint ID (hex32)", mint_id_edit_);
   auto* save_settings_button = new QPushButton("Save Settings", settings_box);
   settings_form->addRow("", save_settings_button);
   settings_layout->addWidget(settings_box);
@@ -277,8 +317,10 @@ void WalletWindow::build_ui() {
   });
   connect(send_review_button, &QPushButton::clicked, this, [this]() { validate_send_form(); });
   connect(send_button, &QPushButton::clicked, this, [this]() { submit_send(); });
-  connect(mint_deposit_button, &QPushButton::clicked, this, [this]() { show_mint_info("deposit"); });
-  connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { show_mint_info("redemption"); });
+  connect(mint_deposit_button, &QPushButton::clicked, this, [this]() { submit_mint_deposit(); });
+  connect(mint_issue_button, &QPushButton::clicked, this, [this]() { issue_mint_note(); });
+  connect(mint_redeem_button, &QPushButton::clicked, this, [this]() { submit_mint_redemption(); });
+  connect(mint_redeem_status_button, &QPushButton::clicked, this, [this]() { refresh_mint_redemption_status(); });
   connect(save_settings_button, &QPushButton::clicked, this, [this]() { save_connection_settings(); });
 }
 
@@ -286,12 +328,14 @@ void WalletWindow::load_settings() {
   QSettings settings(kSettingsOrg, kSettingsApp);
   lightserver_url_edit_->setText(settings.value("lightserver_url", "http://127.0.0.1:8080").toString());
   mint_url_edit_->setText(settings.value("mint_url", "http://127.0.0.1:8090").toString());
+  mint_id_edit_->setText(settings.value("mint_id", "").toString());
 }
 
 void WalletWindow::save_settings() const {
   QSettings settings(kSettingsOrg, kSettingsApp);
   settings.setValue("lightserver_url", lightserver_url_edit_->text().trimmed());
   settings.setValue("mint_url", mint_url_edit_->text().trimmed());
+  settings.setValue("mint_id", mint_id_edit_->text().trimmed());
 }
 
 void WalletWindow::update_wallet_views() {
@@ -326,6 +370,7 @@ void WalletWindow::update_connection_views() {
           .arg(lightserver.isEmpty() ? "not configured" : lightserver)
           .arg(mint.isEmpty() ? "not configured" : mint));
   mint_status_label_->setText(mint.isEmpty() ? "Mint URL not configured yet." : "Mint endpoint configured: " + mint);
+  render_mint_state();
 }
 
 void WalletWindow::render_history_view() {
@@ -336,12 +381,34 @@ void WalletWindow::render_history_view() {
   history_view_->setPlainText(history_lines_.join("\n"));
 }
 
+void WalletWindow::render_mint_state() {
+  mint_deposit_ref_label_->setText(mint_deposit_ref_.isEmpty() ? "-" : mint_deposit_ref_);
+  mint_redemption_label_->setText(mint_last_redemption_batch_id_.isEmpty() ? "-" : mint_last_redemption_batch_id_);
+  if (mint_notes_.empty()) {
+    mint_notes_label_->setText("-");
+  } else {
+    QStringList lines;
+    for (const auto& note : mint_notes_) {
+      lines.push_back(QString("%1 (%2)").arg(note.note_ref).arg(format_coin_amount(note.amount)));
+    }
+    mint_notes_label_->setText(lines.join("\n"));
+  }
+}
+
 void WalletWindow::save_wallet_local_state() const {
   if (!wallet_) return;
   QSettings settings(kSettingsOrg, kSettingsApp);
   QStringList txids;
   for (const auto& txid : local_sent_txids_) txids.push_back(QString::fromStdString(txid));
   settings.setValue(QString("wallet_state/%1/local_sent_txids").arg(QString::fromStdString(wallet_->file_path)), txids);
+  settings.setValue(QString("wallet_state/%1/mint_deposit_ref").arg(QString::fromStdString(wallet_->file_path)), mint_deposit_ref_);
+  settings.setValue(QString("wallet_state/%1/mint_last_deposit_txid").arg(QString::fromStdString(wallet_->file_path)), mint_last_deposit_txid_);
+  settings.setValue(QString("wallet_state/%1/mint_last_deposit_vout").arg(QString::fromStdString(wallet_->file_path)), mint_last_deposit_vout_);
+  settings.setValue(QString("wallet_state/%1/mint_last_redemption_batch_id").arg(QString::fromStdString(wallet_->file_path)),
+                    mint_last_redemption_batch_id_);
+  QStringList notes;
+  for (const auto& note : mint_notes_) notes.push_back(note.note_ref + "|" + QString::number(note.amount));
+  settings.setValue(QString("wallet_state/%1/mint_notes").arg(QString::fromStdString(wallet_->file_path)), notes);
 }
 
 void WalletWindow::load_wallet_local_state() {
@@ -351,6 +418,28 @@ void WalletWindow::load_wallet_local_state() {
   const auto raw = settings.value(QString("wallet_state/%1/local_sent_txids").arg(QString::fromStdString(wallet_->file_path)))
                        .toStringList();
   for (const auto& txid : raw) local_sent_txids_.push_back(txid.toStdString());
+  mint_deposit_ref_ =
+      settings.value(QString("wallet_state/%1/mint_deposit_ref").arg(QString::fromStdString(wallet_->file_path))).toString();
+  mint_last_deposit_txid_ =
+      settings.value(QString("wallet_state/%1/mint_last_deposit_txid").arg(QString::fromStdString(wallet_->file_path))).toString();
+  mint_last_deposit_vout_ = settings
+                                .value(QString("wallet_state/%1/mint_last_deposit_vout").arg(QString::fromStdString(wallet_->file_path)), 0)
+                                .toUInt();
+  mint_last_redemption_batch_id_ =
+      settings.value(QString("wallet_state/%1/mint_last_redemption_batch_id").arg(QString::fromStdString(wallet_->file_path)))
+          .toString();
+  mint_notes_.clear();
+  const auto note_lines =
+      settings.value(QString("wallet_state/%1/mint_notes").arg(QString::fromStdString(wallet_->file_path))).toStringList();
+  for (const auto& line : note_lines) {
+    const auto parts = line.split('|');
+    if (parts.size() != 2) continue;
+    bool ok = false;
+    const auto amount = parts[1].toULongLong(&ok);
+    if (!ok) continue;
+    mint_notes_.push_back(MintNote{parts[0], amount});
+  }
+  render_mint_state();
 }
 
 void WalletWindow::refresh_chain_state(bool interactive) {
@@ -711,6 +800,246 @@ void WalletWindow::submit_send() {
   render_history_view();
   refresh_chain_state(false);
   statusBar()->showMessage("Transaction broadcasted.", 3000);
+}
+
+void WalletWindow::submit_mint_deposit() {
+  if (!ensure_wallet_loaded("Mint Deposit")) return;
+  const QString rpc_url = lightserver_url_edit_->text().trimmed();
+  const QString mint_url = mint_url_edit_->text().trimmed();
+  const QString mint_id_hex = mint_id_edit_->text().trimmed();
+  if (rpc_url.isEmpty() || mint_url.isEmpty() || mint_id_hex.isEmpty()) {
+    QMessageBox::warning(this, "Mint Deposit", "Configure lightserver URL, mint URL, and mint ID first.");
+    return;
+  }
+  auto mint_id = decode_hex32_string(mint_id_hex.toStdString());
+  if (!mint_id) {
+    QMessageBox::warning(this, "Mint Deposit", "Mint ID must be 32-byte hex.");
+    return;
+  }
+  auto amount_units = parse_coin_amount(mint_deposit_amount_edit_->text());
+  if (!amount_units || *amount_units == 0) {
+    QMessageBox::warning(this, "Mint Deposit", "Enter a valid deposit amount.");
+    return;
+  }
+
+  if (utxos_.empty()) refresh_chain_state(false);
+  std::vector<std::pair<OutPoint, TxOut>> prevs;
+  std::uint64_t selected = 0;
+  for (const auto& utxo : utxos_) {
+    auto txid = decode_hex32_string(utxo.txid_hex);
+    if (!txid) continue;
+    prevs.push_back({OutPoint{*txid, utxo.vout}, TxOut{utxo.value, utxo.script_pubkey}});
+    selected += utxo.value;
+    if (selected >= *amount_units) break;
+  }
+  if (selected < *amount_units) {
+    QMessageBox::warning(this, "Mint Deposit", "Insufficient confirmed UTXOs.");
+    return;
+  }
+
+  std::string err;
+  auto key = load_wallet_key(&err);
+  if (!key) {
+    QMessageBox::warning(this, "Mint Deposit", QString::fromStdString(err));
+    return;
+  }
+  auto own_decoded = selfcoin::address::decode(wallet_->address);
+  if (!own_decoded) {
+    QMessageBox::warning(this, "Mint Deposit", "Wallet address is invalid.");
+    return;
+  }
+  std::vector<TxOut> outputs;
+  outputs.push_back(TxOut{
+      *amount_units, selfcoin::privacy::mint_deposit_script_pubkey(*mint_id, own_decoded->pubkey_hash)});
+  const std::uint64_t change = selected - *amount_units;
+  if (change > 0) outputs.push_back(TxOut{change, selfcoin::address::p2pkh_script_pubkey(own_decoded->pubkey_hash)});
+
+  auto tx = selfcoin::build_signed_p2pkh_tx_multi_input(
+      prevs, selfcoin::Bytes(key->privkey.begin(), key->privkey.end()), outputs, &err);
+  if (!tx) {
+    QMessageBox::warning(this, "Mint Deposit", QString::fromStdString(err));
+    return;
+  }
+  auto broadcast = lightserver::rpc_broadcast_tx(rpc_url.toStdString(), tx->serialize(), &err);
+  if (!broadcast || !broadcast->accepted) {
+    const QString reason = broadcast ? QString::fromStdString(broadcast->error) : QString::fromStdString(err);
+    QMessageBox::warning(this, "Mint Deposit", "Broadcast failed: " + reason);
+    return;
+  }
+
+  selfcoin::privacy::MintDepositRegistrationRequest req;
+  req.chain = "mainnet";
+  req.deposit_txid = tx->txid();
+  req.deposit_vout = 0;
+  req.mint_id = *mint_id;
+  req.recipient_pubkey_hash = own_decoded->pubkey_hash;
+  req.amount = *amount_units;
+  auto reg_body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/deposits/register").toStdString(),
+                                                  selfcoin::privacy::to_json(req), &err);
+  if (!reg_body) {
+    QMessageBox::warning(this, "Mint Deposit", "Mint registration failed: " + QString::fromStdString(err));
+    return;
+  }
+  auto reg = selfcoin::privacy::parse_mint_deposit_registration_response(*reg_body);
+  if (!reg || !reg->accepted) {
+    QMessageBox::warning(this, "Mint Deposit", "Mint registration was rejected.");
+    return;
+  }
+
+  mint_deposit_ref_ = QString::fromStdString(reg->mint_deposit_ref);
+  mint_last_deposit_txid_ = QString::fromStdString(hex_encode32(tx->txid()));
+  mint_last_deposit_vout_ = 0;
+  save_wallet_local_state();
+  render_mint_state();
+  history_lines_.push_back(QString("[mint-deposit] %1 %2 ref=%3")
+                               .arg(format_coin_amount(*amount_units))
+                               .arg(elide_middle(mint_last_deposit_txid_, 12))
+                               .arg(mint_deposit_ref_));
+  render_history_view();
+  refresh_chain_state(false);
+  statusBar()->showMessage("Mint deposit broadcasted and registered.", 3000);
+}
+
+void WalletWindow::issue_mint_note() {
+  if (!ensure_wallet_loaded("Issue Note")) return;
+  const QString mint_url = mint_url_edit_->text().trimmed();
+  if (mint_url.isEmpty() || mint_deposit_ref_.isEmpty()) {
+    QMessageBox::warning(this, "Issue Note", "Create and register a mint deposit first.");
+    return;
+  }
+  auto amount_units = parse_coin_amount(mint_issue_amount_edit_->text());
+  if (!amount_units || *amount_units == 0) {
+    QMessageBox::warning(this, "Issue Note", "Enter a valid issue amount.");
+    return;
+  }
+
+  selfcoin::privacy::MintBlindIssueRequest req;
+  req.mint_deposit_ref = mint_deposit_ref_.toStdString();
+  req.blinded_messages.push_back(random_hex_string(64).toStdString());
+  req.note_amounts.push_back(*amount_units);
+
+  std::string err;
+  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/issuance/blind").toStdString(),
+                                              selfcoin::privacy::to_json(req), &err);
+  if (!body) {
+    QMessageBox::warning(this, "Issue Note", "Mint issuance failed: " + QString::fromStdString(err));
+    return;
+  }
+  auto resp = selfcoin::privacy::parse_mint_blind_issue_response(*body);
+  if (!resp || resp->note_refs.empty()) {
+    QMessageBox::warning(this, "Issue Note", "Mint issuance response was invalid.");
+    return;
+  }
+
+  for (std::size_t i = 0; i < resp->note_refs.size(); ++i) {
+    const std::uint64_t amount = i < resp->note_amounts.size() ? resp->note_amounts[i] : *amount_units;
+    mint_notes_.push_back(MintNote{QString::fromStdString(resp->note_refs[i]), amount});
+  }
+  save_wallet_local_state();
+  render_mint_state();
+  history_lines_.push_back(QString("[mint-issue] issuance=%1 amount=%2")
+                               .arg(QString::fromStdString(resp->issuance_id))
+                               .arg(format_coin_amount(*amount_units)));
+  render_history_view();
+  statusBar()->showMessage("Mint note issued.", 3000);
+}
+
+void WalletWindow::submit_mint_redemption() {
+  if (!ensure_wallet_loaded("Redeem")) return;
+  const QString mint_url = mint_url_edit_->text().trimmed();
+  if (mint_url.isEmpty()) {
+    QMessageBox::warning(this, "Redeem", "Configure a mint URL first.");
+    return;
+  }
+  const QString redeem_address = mint_redeem_address_edit_->text().trimmed();
+  if (!selfcoin::address::decode(redeem_address.toStdString()).has_value()) {
+    QMessageBox::warning(this, "Redeem", "Destination address is invalid.");
+    return;
+  }
+  auto amount_units = parse_coin_amount(mint_redeem_amount_edit_->text());
+  if (!amount_units || *amount_units == 0) {
+    QMessageBox::warning(this, "Redeem", "Enter a valid redemption amount.");
+    return;
+  }
+
+  std::vector<std::string> selected_notes;
+  std::uint64_t selected_amount = 0;
+  for (const auto& note : mint_notes_) {
+    selected_notes.push_back(note.note_ref.toStdString());
+    selected_amount += note.amount;
+    if (selected_amount >= *amount_units) break;
+  }
+  if (selected_amount != *amount_units) {
+    QMessageBox::warning(this, "Redeem", "Current reference wallet can only redeem exact available note amounts.");
+    return;
+  }
+
+  selfcoin::privacy::MintRedemptionRequest req;
+  req.notes = selected_notes;
+  req.redeem_address = redeem_address.toStdString();
+  req.amount = *amount_units;
+  std::string err;
+  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/create").toStdString(),
+                                              selfcoin::privacy::to_json(req), &err);
+  if (!body) {
+    QMessageBox::warning(this, "Redeem", "Mint redemption failed: " + QString::fromStdString(err));
+    return;
+  }
+  auto resp = selfcoin::privacy::parse_mint_redemption_response(*body);
+  if (!resp || !resp->accepted) {
+    QMessageBox::warning(this, "Redeem", "Mint redemption was rejected.");
+    return;
+  }
+
+  mint_last_redemption_batch_id_ = QString::fromStdString(resp->redemption_batch_id);
+  for (const auto& note_ref : selected_notes) {
+    mint_notes_.erase(std::remove_if(mint_notes_.begin(), mint_notes_.end(),
+                                     [&](const MintNote& note) { return note.note_ref.toStdString() == note_ref; }),
+                      mint_notes_.end());
+  }
+  save_wallet_local_state();
+  render_mint_state();
+  history_lines_.push_back(QString("[mint-redeem] batch=%1 amount=%2")
+                               .arg(mint_last_redemption_batch_id_)
+                               .arg(format_coin_amount(*amount_units)));
+  render_history_view();
+  statusBar()->showMessage("Mint redemption created.", 3000);
+}
+
+void WalletWindow::refresh_mint_redemption_status() {
+  if (mint_last_redemption_batch_id_.isEmpty()) {
+    QMessageBox::information(this, "Redemption Status", "No redemption batch has been created yet.");
+    return;
+  }
+  const QString mint_url = mint_url_edit_->text().trimmed();
+  if (mint_url.isEmpty()) {
+    QMessageBox::warning(this, "Redemption Status", "Configure a mint URL first.");
+    return;
+  }
+  std::ostringstream body_json;
+  body_json << "{\"redemption_batch_id\":\"" << mint_last_redemption_batch_id_.toStdString() << "\"}";
+  std::string err;
+  auto body = lightserver::http_post_json_raw(mint_endpoint(mint_url, "/redemptions/status").toStdString(),
+                                              body_json.str(), &err);
+  if (!body) {
+    QMessageBox::warning(this, "Redemption Status", "Status query failed: " + QString::fromStdString(err));
+    return;
+  }
+  auto resp = selfcoin::privacy::parse_mint_redemption_status_response(*body);
+  if (!resp) {
+    QMessageBox::warning(this, "Redemption Status", "Status response was invalid.");
+    return;
+  }
+  mint_status_label_->setText(QString("Redemption %1: state=%2 l1_txid=%3 amount=%4")
+                                  .arg(mint_last_redemption_batch_id_)
+                                  .arg(QString::fromStdString(resp->state))
+                                  .arg(QString::fromStdString(resp->l1_txid))
+                                  .arg(format_coin_amount(resp->amount)));
+  history_lines_.push_back(QString("[mint-status] batch=%1 state=%2 l1_txid=%3")
+                               .arg(mint_last_redemption_batch_id_)
+                               .arg(QString::fromStdString(resp->state))
+                               .arg(elide_middle(QString::fromStdString(resp->l1_txid), 12)));
+  render_history_view();
 }
 
 void WalletWindow::show_mint_info(const QString& action_name) {

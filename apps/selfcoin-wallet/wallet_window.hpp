@@ -42,6 +42,11 @@ class WalletWindow final : public QMainWindow {
     selfcoin::Bytes script_pubkey;
   };
 
+  struct MintNote {
+    QString note_ref;
+    std::uint64_t amount{0};
+  };
+
   void build_ui();
   void load_settings();
   void save_settings() const;
@@ -49,6 +54,7 @@ class WalletWindow final : public QMainWindow {
   void update_connection_views();
   void refresh_chain_state(bool interactive);
   void render_history_view();
+  void render_mint_state();
   void save_wallet_local_state() const;
   void load_wallet_local_state();
 
@@ -60,6 +66,10 @@ class WalletWindow final : public QMainWindow {
   void validate_send_form();
   void show_mint_info(const QString& action_name);
   void submit_send();
+  void submit_mint_deposit();
+  void issue_mint_note();
+  void submit_mint_redemption();
+  void refresh_mint_redemption_status();
 
   std::optional<LoadedWallet> load_wallet_file(const QString& path, const QString& passphrase);
   std::optional<QString> prompt_passphrase(const QString& title, bool confirm) const;
@@ -85,10 +95,15 @@ class WalletWindow final : public QMainWindow {
   QLineEdit* mint_deposit_amount_edit_{nullptr};
   QLineEdit* mint_redeem_amount_edit_{nullptr};
   QLineEdit* mint_redeem_address_edit_{nullptr};
+  QLineEdit* mint_issue_amount_edit_{nullptr};
+  QLabel* mint_deposit_ref_label_{nullptr};
+  QLabel* mint_notes_label_{nullptr};
+  QLabel* mint_redemption_label_{nullptr};
   QLabel* mint_status_label_{nullptr};
 
   QLineEdit* lightserver_url_edit_{nullptr};
   QLineEdit* mint_url_edit_{nullptr};
+  QLineEdit* mint_id_edit_{nullptr};
   QLabel* connection_summary_label_{nullptr};
 
   std::optional<LoadedWallet> wallet_;
@@ -96,6 +111,11 @@ class WalletWindow final : public QMainWindow {
   QStringList history_lines_;
   std::vector<std::string> local_sent_txids_;
   std::uint64_t tip_height_{0};
+  QString mint_deposit_ref_;
+  QString mint_last_deposit_txid_;
+  std::uint32_t mint_last_deposit_vout_{0};
+  QString mint_last_redemption_batch_id_;
+  std::vector<MintNote> mint_notes_;
 };
 
 }  // namespace selfcoin::wallet

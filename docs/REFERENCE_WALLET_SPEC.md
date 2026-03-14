@@ -21,16 +21,22 @@ Implemented now in `selfcoin-wallet`:
 - export backup material by explicit user action
 - receive address display and copy
 - local lightserver / mint URL settings persisted with `QSettings`
+- configurable mint ID persisted with `QSettings`
 - disciplined tab layout: `Home`, `Receive`, `Send`, `History`, `Mint`, `Settings`
 - real lightserver-backed balance sync via `get_status` + `get_utxos`
 - real address activity sync via `get_history` + `get_tx`
 - real GUI transaction build and broadcast for simple on-chain sends
-- local validation shells for mint inputs
+- real GUI mint flow for:
+  - `SCMINTDEP` deposit build and broadcast
+  - deposit registration with `selfcoin-mint`
+  - one-note blind issuance request
+  - redemption creation
+  - redemption status polling
 
 Intentionally deferred to the next wallet phase:
-- mint deposit / issuance / redemption execution from the GUI
 - QR rendering
 - local metadata DB / SQLite layer
+- richer note selection / denomination handling beyond exact-note redemption
 
 ## Product boundary
 The reference wallet should support:

@@ -46,5 +46,6 @@ std::optional<std::vector<HistoryEntry>> rpc_get_history(const std::string& rpc_
                                                          std::string* err);
 std::optional<TxView> rpc_get_tx(const std::string& rpc_url, const Hash32& txid, std::string* err);
 std::optional<BroadcastResult> rpc_broadcast_tx(const std::string& rpc_url, const Bytes& tx_bytes, std::string* err);
+std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body, std::string* err);
 
 }  // namespace selfcoin::lightserver

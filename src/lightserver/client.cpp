@@ -280,4 +280,8 @@ std::optional<BroadcastResult> rpc_broadcast_tx(const std::string& rpc_url, cons
   return out;
 }
 
+std::optional<std::string> http_post_json_raw(const std::string& url, const std::string& body, std::string* err) {
+  return http_post_json(url, body, err);
+}
+
 }  // namespace selfcoin::lightserver

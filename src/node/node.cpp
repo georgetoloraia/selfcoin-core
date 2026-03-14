@@ -1801,20 +1801,50 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
   {
     std::lock_guard<std::mutex> lk(mu_);
     if (from_network && !running_) return false;
-    if (msg.height != finalized_height_ + 1) return false;
-    if (msg.prev_finalized_hash != finalized_hash_) return false;
+    if (msg.height != finalized_height_ + 1) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=unexpected-height local_next=" + std::to_string(finalized_height_ + 1));
+      return false;
+    }
+    if (msg.prev_finalized_hash != finalized_hash_) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=prev-hash-mismatch local_tip=" + short_hash_hex(finalized_hash_) +
+               " remote_prev=" + short_hash_hex(msg.prev_finalized_hash));
+      return false;
+    }
 
     auto blk = Block::parse(msg.block_bytes);
-    if (!blk.has_value()) return false;
-    if (blk->header.height != msg.height || blk->header.round != msg.round) return false;
-    if (!verify_block_proposer_locked(*blk)) return false;
-    if (check_and_record_proposer_equivocation_locked(*blk)) return false;
+    if (!blk.has_value()) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=block-parse-failed");
+      return false;
+    }
+    if (blk->header.height != msg.height || blk->header.round != msg.round) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=header-mismatch block_height=" + std::to_string(blk->header.height) +
+               " block_round=" + std::to_string(blk->header.round));
+      return false;
+    }
+    if (!verify_block_proposer_locked(*blk)) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=invalid-proposer leader=" + short_pub_hex(blk->header.leader_pubkey));
+      return false;
+    }
+    if (check_and_record_proposer_equivocation_locked(*blk)) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=proposer-equivocation");
+      return false;
+    }
 
     std::vector<Bytes> tx_bytes;
     tx_bytes.reserve(blk->txs.size());
     for (const auto& tx : blk->txs) tx_bytes.push_back(tx.serialize());
     auto merkle_root = merkle::compute_merkle_root_from_txs(tx_bytes);
-    if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) return false;
+    if (!merkle_root.has_value() || blk->header.merkle_root != *merkle_root) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=merkle-root-mismatch");
+      return false;
+    }
 
     SpecialValidationContext vctx{
         .validators = &validators_,
@@ -1828,15 +1858,27 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
         }};
     const auto reward_signers = reward_signers_for_height_round(msg.height, msg.round);
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
-    if (!valid.ok) return false;
-    if (!validate_v4_registration_rules(*blk, msg.height)) return false;
+    if (!valid.ok) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=invalid-block-txs");
+      return false;
+    }
+    if (!validate_v4_registration_rules(*blk, msg.height)) {
+      log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+               " reason=v4-registration-rules");
+      return false;
+    }
 
     Hash32 bid = blk->header.block_id();
     if (candidate_blocks_.find(bid) == candidate_blocks_.end()) {
       const std::size_t sz = msg.block_bytes.size();
       std::size_t total = 0;
       for (const auto& [_, s] : candidate_block_sizes_) total += s;
-      if (candidate_blocks_.size() >= kMaxCandidateBlocks || total + sz > kMaxCandidateBlockBytes) return false;
+      if (candidate_blocks_.size() >= kMaxCandidateBlocks || total + sz > kMaxCandidateBlockBytes) {
+        log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+                 " reason=candidate-cache-full");
+        return false;
+      }
       candidate_block_sizes_[bid] = sz;
     }
     candidate_blocks_[bid] = *blk;
@@ -1850,7 +1892,11 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
         voters.find(local_key_.public_key) == voters.end()) {
       Bytes b_id(bid.begin(), bid.end());
       auto sig = crypto::ed25519_sign(b_id, local_key_.private_key);
-      if (!sig.has_value()) return false;
+      if (!sig.has_value()) {
+        log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
+                 " reason=local-vote-sign-failed");
+        return false;
+      }
       maybe_vote = Vote{msg.height, msg.round, bid, local_key_.public_key, *sig};
     }
   }

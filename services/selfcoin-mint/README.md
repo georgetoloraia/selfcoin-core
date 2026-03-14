@@ -17,6 +17,9 @@ It is a narrow scaffold, not a production mint:
 - automatic redemption settlement using a configured reserve wallet
 - lightserver-backed redemption finalization (`pending -> broadcast -> finalized/rejected`)
 - HMAC-signed operator admin requests
+- persistent notifier delivery job queue
+- optional single-worker leader lock for queue draining
+- notifier secret refs resolved through a pluggable secret backend adapter
 - signed reserve attestations / audit exports
 - no federation
 - no multi-operator quorum custody
@@ -44,6 +47,10 @@ It is a narrow scaffold, not a production mint:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /monitoring/worker`
+- `GET /dashboard`
+- `GET /dashboard/incidents`
+- `POST /monitoring/dead_letters/replay`
 - `GET /accounting/summary`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -62,7 +69,32 @@ python3 services/selfcoin-mint/server.py \
   --reserve-privkey 5555555555555555555555555555555555555555555555555555555555555555 \
   --reserve-address sc1... \
   --reserve-fee 1000 \
-  --cli-path ./build/selfcoin-cli
+  --cli-path ./build/selfcoin-cli \
+  --notifier-retry-interval-seconds 5 \
+  --notifier-secrets-file /etc/selfcoin-mint/notifier-secrets.json \
+  --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
+  --notifier-secret-env-prefix SELFCOIN_MINT_SECRET_ \
+  --notifier-secret-backend auto \
+  --notifier-secret-helper-cmd "" \
+  --worker-lock-file /var/lib/selfcoin-mint/worker.lock
+```
+
+Run a separate worker process:
+
+```bash
+python3 services/selfcoin-mint/server.py \
+  --mode worker \
+  --state-file /tmp/selfcoin-mint-state.json \
+  --operator-key dev-operator:1111111111111111111111111111111111111111111111111111111111111111 \
+  --lightserver-url http://127.0.0.1:19444/rpc \
+  --reserve-privkey 5555555555555555555555555555555555555555555555555555555555555555 \
+  --reserve-address sc1... \
+  --cli-path ./build/selfcoin-cli \
+  --notifier-retry-interval-seconds 5 \
+  --notifier-secret-backend auto \
+  --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
+  --worker-lock-file /var/lib/selfcoin-mint/worker.lock \
+  --worker-stale-timeout-seconds 30
 ```
 
 ## Example with selfcoin-cli
@@ -148,6 +180,12 @@ python3 services/selfcoin-mint/server.py \
 
 ./build/selfcoin-cli mint_incident_timeline_export \
   --url http://127.0.0.1:8080/monitoring/incidents/export
+
+./build/selfcoin-cli mint_dead_letter_replay \
+  --url http://127.0.0.1:8080/monitoring/dead_letters/replay \
+  --dead-letter-id <dead-letter-id> \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
 ```
 
 ```bash
@@ -201,6 +239,9 @@ python3 services/selfcoin-mint/server.py \
   --notifier-id ops-webhook \
   --kind webhook \
   --target http://127.0.0.1:9099/webhook \
+  --auth-type bearer \
+  --auth-token-secret-ref ops_webhook_bearer \
+  --tls-verify true \
   --retry-max-attempts 3 \
   --retry-backoff-seconds 30
 ```
@@ -230,12 +271,16 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/policy/redemptions` now includes auto-pause recommendations and threshold metadata derived from the current reserve state.
 - `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
 - `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
+- `/monitoring/worker` exposes worker leadership / lock-owner state.
+- `/monitoring/worker` also exposes stale lease detection and takeover policy.
 - `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
 - `/monitoring/events/policy` exposes event retention/export settings.
 - `/monitoring/events/silences` exposes active and expired silences.
 - `/monitoring/notifiers` exposes configured notifier hooks.
 - `/monitoring/dead_letters` exposes failed notifier deliveries that exhausted retries.
 - `/monitoring/incidents/export` exposes a signed incident timeline including events, silences, dead letters, and notifier state.
+- `/dashboard` and `/dashboard/incidents` expose a minimal operator HTML view over reserve health, recent events, queue state, and incident data.
+- `POST /monitoring/dead_letters/replay` requeues a dead-lettered delivery and retries it immediately.
 - `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
 - Notifier hooks currently support:
   - `webhook`
@@ -244,6 +289,45 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Each notifier supports:
   - `retry_max_attempts`
   - `retry_backoff_seconds`
+- `webhook` and `alertmanager` notifiers also support:
+  - `auth_type=none|bearer|basic`
+  - `auth_token_secret_ref`
+  - `auth_user_secret_ref`
+  - `auth_pass_secret_ref`
+  - `tls_verify`
+  - `tls_ca_file`
+- `tls_client_cert_file`
+- `tls_client_key_file`
+- The service runs a background retry worker (`--notifier-retry-interval-seconds`) backed by a persisted delivery job queue, so retries survive restart and do not depend on request traffic.
+- `--mode server` runs only the HTTP service.
+- `--mode worker` runs only the queue worker.
+- `--mode all` keeps the old combined behavior when needed.
+- If `--worker-lock-file` is configured, the worker uses a renewable lease file with stale-timeout takeover policy.
+- Secret values can come from:
+  - `--notifier-secret-dir` as one file per secret ref
+  - `SELFCOIN_MINT_SECRET_<REF>` environment variables
+  - `--notifier-secrets-file` as a fallback JSON map
+- Or from `--notifier-secret-helper-cmd <cmd>` when `--notifier-secret-backend=command`; the ref is appended as the final argument.
+- A helper implementation is included at [secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py).
+- `--notifier-secret-backend` may be `auto|dir|env|json|command`.
+- The state file stores refs, not the secret values themselves.
+
+## systemd units
+
+Example split units and env file template live in:
+
+- [services/selfcoin-mint/systemd/selfcoin-mint-server.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-server.service)
+- [services/selfcoin-mint/systemd/selfcoin-mint-worker.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-worker.service)
+- [services/selfcoin-mint/systemd/selfcoin-mint.env.example](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.env.example)
+- [services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf)
+- [services/selfcoin-mint/systemd/install_selfcoin_mint.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/install_selfcoin_mint.sh)
+- [services/selfcoin-mint/systemd/smoke_deploy.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/smoke_deploy.sh)
+
+The install helper also places:
+
+- [secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
+  as `/usr/local/libexec/selfcoin-mint-secret-helper`
+- operator steps are documented in [docs/SELFCOIN_MINT_RUNBOOK.md](/home/greendragon/Desktop/selfcoin-core/docs/SELFCOIN_MINT_RUNBOOK.md)
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
@@ -257,5 +341,16 @@ curl http://127.0.0.1:8080/attestations/reserves
 
 ```bash
 python3 -m unittest services/selfcoin-mint/test_state.py
+python3 -m unittest services/selfcoin-mint/test_packaging.py
 python3 -m unittest services/selfcoin-mint/test_integration.py
+bash services/selfcoin-mint/systemd/smoke_deploy.sh
 ```
+
+CI wiring for the packaging/deploy checks lives in:
+
+- [.github/workflows/selfcoin-mint-packaging.yml](/home/greendragon/Desktop/selfcoin-core/.github/workflows/selfcoin-mint-packaging.yml)
+
+That workflow now runs:
+- packaging/state tests
+- temp-prefix install smoke check
+- split server/worker live integration tests

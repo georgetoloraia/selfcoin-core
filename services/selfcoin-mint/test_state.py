@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -87,14 +88,81 @@ class MintStateTests(unittest.TestCase):
                     "kind": "webhook",
                     "target": "http://127.0.0.1:9/hook",
                     "enabled": True,
+                    "auth_type": "bearer",
+                    "auth_token_secret_ref": "ops_token",
                 }
             )
             self.assertEqual(notifier["notifier_id"], "ops-webhook")
+            self.assertEqual(notifier["auth_token_secret_ref"], "ops_token")
 
             reloaded = server.MintState(state_path)
             self.assertEqual(reloaded.list_events(10)[0]["ack_note"], "seen")
             self.assertEqual(reloaded.list_silences(True)[0]["reason"], "maintenance")
             self.assertEqual(reloaded.list_notifiers()[0]["kind"], "webhook")
+            self.assertEqual(reloaded.list_notifiers()[0]["auth_token_secret_ref"], "ops_token")
+
+    def test_delivery_jobs_persist_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            job = state.enqueue_delivery_job(event["event_id"], "ops-webhook", 123)
+            self.assertEqual(job["status"], "pending")
+            self.assertEqual(len(state.list_due_delivery_jobs(200, 10)), 1)
+            state.update_delivery_job(job["job_id"], "pending", attempts=2, last_error="boom", next_run_at=300)
+
+            reloaded = server.MintState(state_path)
+            jobs = reloaded.list_delivery_jobs(10)
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["notifier_id"], "ops-webhook")
+            self.assertEqual(jobs[0]["attempts"], 2)
+            self.assertEqual(jobs[0]["last_error"], "boom")
+
+    def test_secret_helper_resolves_from_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            secret_dir = Path(td) / "secrets"
+            secret_dir.mkdir(parents=True, exist_ok=True)
+            (secret_dir / "ops_token").write_text("topsecret\n", encoding="utf-8")
+            helper = Path(__file__).with_name("secret_helper.py")
+            proc = subprocess.run(
+                ["python3", str(helper), "--dir", str(secret_dir), "ops_token"],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(proc.stdout.strip(), "topsecret")
+
+    def test_worker_lease_takeover_on_stale_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "worker.lock"
+            stale = {
+                "owner_pid": 999999,
+                "heartbeat_at": 1,
+                "acquired_at": 1,
+                "mode": "worker",
+                "stale_timeout_seconds": 5,
+            }
+            lock_path.write_text(__import__("json").dumps(stale), encoding="utf-8")
+            lock = server.WorkerLeaderLock(lock_path, stale_timeout_seconds=5)
+            result = lock.acquire_status("worker")
+            self.assertTrue(result["acquired"])
+            self.assertTrue(result["takeover"])
+            self.assertEqual(result["stale_owner_pid"], "999999")
+
+    def test_systemd_packaging_assets_exist(self) -> None:
+        root = Path(__file__).parent / "systemd"
+        server_unit = root / "selfcoin-mint-server.service"
+        worker_unit = root / "selfcoin-mint-worker.service"
+        env_example = root / "selfcoin-mint.env.example"
+        install_script = root / "install_selfcoin_mint.sh"
+        tmpfiles = root / "selfcoin-mint.tmpfiles.conf"
+        self.assertTrue(server_unit.exists())
+        self.assertTrue(worker_unit.exists())
+        self.assertTrue(env_example.exists())
+        self.assertTrue(install_script.exists())
+        self.assertTrue(tmpfiles.exists())
+        self.assertIn("ExecStart=", server_unit.read_text(encoding="utf-8"))
+        self.assertIn("SELFCOIN_MINT_NOTIFIER_SECRET_HELPER_CMD", env_example.read_text(encoding="utf-8"))
 
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:

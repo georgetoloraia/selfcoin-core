@@ -440,7 +440,6 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli build_p2pkh_multi_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> [--prev-txid ...] --from-privkey <hex32> --to-address <addr> --amount <u64> --fee <u64> [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_bond_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli create_validator_join_request_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --validator-privkey <hex32> [--payout-pubkey <hex32>] [--bond-amount <u64>] [--fee <u64>] [--change-address <addr>]\n"
-              << "  selfcoin-cli create_validator_join_approval_tx --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --funding-privkey <hex32> --approver-privkey <hex32> --request-txid <hex32> --validator-pubkey <hex32> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_create --prev-txid <hex32> --prev-index <u32> --prev-value <u64> --from-privkey <hex32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--fee <u64>] [--change-address <addr>]\n"
               << "  selfcoin-cli mint_deposit_status [--db <dir>] [--mint-id <hex32>] [--recipient-address <addr>] [--tail <n>]\n"
               << "  selfcoin-cli mint_deposit_register --url http://host:port/path --deposit-txid <hex32> --deposit-vout <u32> --mint-id <hex32> --recipient-address <addr> --amount <u64> [--chain mainnet]\n"
@@ -453,6 +452,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_reserve_alerts --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_health --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_metrics --url http://host:port/path\n"
+              << "  selfcoin-cli mint_worker_status --url http://host:port/path\n"
               << "  selfcoin-cli mint_alert_history --url http://host:port/path\n"
               << "  selfcoin-cli mint_alert_ack --url http://host:port/path --event-id <id> --operator-key-id <id> --operator-secret-hex <hex> [--note <text>]\n"
               << "  selfcoin-cli mint_alert_silence --url http://host:port/path --event-type <type> --until <unix> --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]\n"
@@ -460,8 +460,9 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_event_policy --url http://host:port/path\n"
               << "  selfcoin-cli mint_event_policy_update --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]\n"
               << "  selfcoin-cli mint_notifier_list --url http://host:port/path\n"
-              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--email-to <addr>] [--email-from <addr>]\n"
+              << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--auth-type none|bearer|basic] [--auth-token-secret-ref <ref>] [--auth-user-secret-ref <ref>] [--auth-pass-secret-ref <ref>] [--tls-verify true|false] [--tls-ca-file <path>] [--tls-client-cert-file <path>] [--tls-client-key-file <path>] [--email-to <addr>] [--email-from <addr>]\n"
               << "  selfcoin-cli mint_dead_letters --url http://host:port/path\n"
+              << "  selfcoin-cli mint_dead_letter_replay --url http://host:port/path --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_incident_timeline_export --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
@@ -2052,7 +2053,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "mint_alert_silences" || cmd == "mint_event_policy" || cmd == "mint_notifier_list" ||
-      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export") {
+      cmd == "mint_dead_letters" || cmd == "mint_incident_timeline_export" || cmd == "mint_worker_status") {
     std::string url;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
@@ -2114,7 +2115,7 @@ int main(int argc, char** argv) {
   }
 
   if (cmd == "mint_notifier_upsert") {
-    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds;
+    std::string url, operator_key_id, operator_secret_hex, notifier_id, kind, target, enabled, email_to, email_from, retry_max_attempts, retry_backoff_seconds, auth_type, auth_token_secret_ref, auth_user_secret_ref, auth_pass_secret_ref, tls_verify, tls_ca_file, tls_client_cert_file, tls_client_key_file;
     for (int i = 2; i < argc; ++i) {
       std::string a = argv[i];
       if (a == "--url" && i + 1 < argc) url = argv[++i];
@@ -2126,6 +2127,14 @@ int main(int argc, char** argv) {
       else if (a == "--enabled" && i + 1 < argc) enabled = argv[++i];
       else if (a == "--retry-max-attempts" && i + 1 < argc) retry_max_attempts = argv[++i];
       else if (a == "--retry-backoff-seconds" && i + 1 < argc) retry_backoff_seconds = argv[++i];
+      else if (a == "--auth-type" && i + 1 < argc) auth_type = argv[++i];
+      else if (a == "--auth-token-secret-ref" && i + 1 < argc) auth_token_secret_ref = argv[++i];
+      else if (a == "--auth-user-secret-ref" && i + 1 < argc) auth_user_secret_ref = argv[++i];
+      else if (a == "--auth-pass-secret-ref" && i + 1 < argc) auth_pass_secret_ref = argv[++i];
+      else if (a == "--tls-verify" && i + 1 < argc) tls_verify = argv[++i];
+      else if (a == "--tls-ca-file" && i + 1 < argc) tls_ca_file = argv[++i];
+      else if (a == "--tls-client-cert-file" && i + 1 < argc) tls_client_cert_file = argv[++i];
+      else if (a == "--tls-client-key-file" && i + 1 < argc) tls_client_key_file = argv[++i];
       else if (a == "--email-to" && i + 1 < argc) email_to = argv[++i];
       else if (a == "--email-from" && i + 1 < argc) email_from = argv[++i];
     }
@@ -2139,6 +2148,14 @@ int main(int argc, char** argv) {
               << "\",\"target\":\"" << target << "\",\"enabled\":" << (enabled_value ? "true" : "false");
     if (!retry_max_attempts.empty()) body_json << ",\"retry_max_attempts\":" << retry_max_attempts;
     if (!retry_backoff_seconds.empty()) body_json << ",\"retry_backoff_seconds\":" << retry_backoff_seconds;
+    if (!auth_type.empty()) body_json << ",\"auth_type\":\"" << auth_type << "\"";
+    if (!auth_token_secret_ref.empty()) body_json << ",\"auth_token_secret_ref\":\"" << auth_token_secret_ref << "\"";
+    if (!auth_user_secret_ref.empty()) body_json << ",\"auth_user_secret_ref\":\"" << auth_user_secret_ref << "\"";
+    if (!auth_pass_secret_ref.empty()) body_json << ",\"auth_pass_secret_ref\":\"" << auth_pass_secret_ref << "\"";
+    if (!tls_verify.empty()) body_json << ",\"tls_verify\":" << ((tls_verify == "true" || tls_verify == "1") ? "true" : "false");
+    if (!tls_ca_file.empty()) body_json << ",\"tls_ca_file\":\"" << tls_ca_file << "\"";
+    if (!tls_client_cert_file.empty()) body_json << ",\"tls_client_cert_file\":\"" << tls_client_cert_file << "\"";
+    if (!tls_client_key_file.empty()) body_json << ",\"tls_client_key_file\":\"" << tls_client_key_file << "\"";
     if (!email_to.empty()) body_json << ",\"email_to\":\"" << email_to << "\"";
     if (!email_from.empty()) body_json << ",\"email_from\":\"" << email_from << "\"";
     body_json << "}";
@@ -2151,6 +2168,35 @@ int main(int argc, char** argv) {
     auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
     if (!body) {
       std::cerr << "mint_notifier_upsert failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_dead_letter_replay") {
+    std::string url, operator_key_id, operator_secret_hex, dead_letter_id;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+      else if (a == "--dead-letter-id" && i + 1 < argc) dead_letter_id = argv[++i];
+    }
+    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty() || dead_letter_id.empty()) {
+      std::cerr << "mint_dead_letter_replay requires --url, --dead-letter-id, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    const std::string body_json = std::string("{\"dead_letter_id\":\"") + dead_letter_id + "\"}";
+    std::string err;
+    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
+    if (!body) {
+      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
       return 1;
     }
     std::cout << *body << "\n";
@@ -2420,71 +2466,6 @@ int main(int argc, char** argv) {
     std::cout << "bits=" << bits << "\n";
     std::cout << "epoch_bucket=" << tx->hashcash->epoch_bucket << "\n";
     std::cout << "nonce=" << tx->hashcash->nonce << "\n";
-    std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
-    std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
-    return 0;
-  }
-
-  if (cmd == "create_validator_join_approval_tx") {
-    std::string prev_txid_hex;
-    std::uint32_t prev_index = 0;
-    std::uint64_t prev_value = 0;
-    std::string funding_priv_hex;
-    std::string approver_priv_hex;
-    std::string request_txid_hex;
-    std::string validator_pub_hex;
-    std::string change_addr;
-    std::uint64_t fee = 0;
-
-    for (int i = 2; i < argc; ++i) {
-      std::string a = argv[i];
-      if (a == "--prev-txid" && i + 1 < argc) prev_txid_hex = argv[++i];
-      else if (a == "--prev-index" && i + 1 < argc) prev_index = static_cast<std::uint32_t>(std::stoul(argv[++i]));
-      else if (a == "--prev-value" && i + 1 < argc) prev_value = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-      else if (a == "--funding-privkey" && i + 1 < argc) funding_priv_hex = argv[++i];
-      else if (a == "--approver-privkey" && i + 1 < argc) approver_priv_hex = argv[++i];
-      else if (a == "--request-txid" && i + 1 < argc) request_txid_hex = argv[++i];
-      else if (a == "--validator-pubkey" && i + 1 < argc) validator_pub_hex = argv[++i];
-      else if (a == "--change-address" && i + 1 < argc) change_addr = argv[++i];
-      else if (a == "--fee" && i + 1 < argc) fee = static_cast<std::uint64_t>(std::stoull(argv[++i]));
-    }
-
-    auto prev_txid = decode_hex32(prev_txid_hex);
-    auto funding_priv = decode_hex32(funding_priv_hex);
-    auto approver_priv = decode_hex32(approver_priv_hex);
-    auto request_txid = decode_hex32(request_txid_hex);
-    auto validator_pub = decode_hex32(validator_pub_hex);
-    if (!prev_txid || !funding_priv || !approver_priv || !request_txid || !validator_pub) {
-      std::cerr << "invalid required args\n";
-      return 1;
-    }
-
-    auto funding_kp = selfcoin::crypto::keypair_from_seed32(*funding_priv);
-    if (!funding_kp) {
-      std::cerr << "invalid funding private key\n";
-      return 1;
-    }
-    auto funding_pkh = selfcoin::crypto::h160(selfcoin::Bytes(funding_kp->public_key.begin(), funding_kp->public_key.end()));
-    selfcoin::OutPoint op{*prev_txid, prev_index};
-    selfcoin::TxOut prev_out{prev_value, selfcoin::address::p2pkh_script_pubkey(funding_pkh)};
-    selfcoin::Bytes change_spk = selfcoin::address::p2pkh_script_pubkey(funding_pkh);
-    if (!change_addr.empty()) {
-      auto ch = selfcoin::address::decode(change_addr);
-      if (!ch) {
-        std::cerr << "invalid change address\n";
-        return 1;
-      }
-      change_spk = selfcoin::address::p2pkh_script_pubkey(ch->pubkey_hash);
-    }
-
-    std::string err;
-    auto tx = selfcoin::build_validator_join_approval_tx(
-        op, prev_out, selfcoin::Bytes(funding_priv->begin(), funding_priv->end()), *request_txid, *validator_pub,
-        selfcoin::Bytes(approver_priv->begin(), approver_priv->end()), change_spk, fee, &err);
-    if (!tx) {
-      std::cerr << "create join approval tx failed: " << err << "\n";
-      return 1;
-    }
     std::cout << "txid=" << selfcoin::hex_encode32(tx->txid()) << "\n";
     std::cout << "tx_hex=" << selfcoin::hex_encode(tx->serialize()) << "\n";
     return 0;

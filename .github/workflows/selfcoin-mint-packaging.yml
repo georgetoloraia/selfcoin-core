@@ -1,0 +1,46 @@
+name: selfcoin-mint-packaging
+
+on:
+  push:
+    paths:
+      - 'services/selfcoin-mint/**'
+      - 'docs/SELFCOIN_MINT_RUNBOOK.md'
+      - '.github/workflows/selfcoin-mint-packaging.yml'
+  pull_request:
+    paths:
+      - 'services/selfcoin-mint/**'
+      - 'docs/SELFCOIN_MINT_RUNBOOK.md'
+      - '.github/workflows/selfcoin-mint-packaging.yml'
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build CLI
+        run: cmake --build build --target selfcoin-cli -j1
+      - name: Packaging tests
+        run: python3 -m unittest services/selfcoin-mint/test_packaging.py
+      - name: State tests
+        run: python3 -m unittest services/selfcoin-mint/test_state.py
+      - name: Smoke deploy
+        run: bash services/selfcoin-mint/systemd/smoke_deploy.sh
+
+  live-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build CLI
+        run: cmake --build build --target selfcoin-cli -j1
+      - name: Live mint integration
+        run: python3 -m unittest services/selfcoin-mint/test_integration.py

@@ -206,38 +206,6 @@ std::optional<Tx> build_validator_join_request_tx(const OutPoint& prev_outpoint,
   return build_signed_p2pkh_tx_single_input(prev_outpoint, prev_out, funding_privkey_32, outputs, err);
 }
 
-std::optional<Tx> build_validator_join_approval_tx(const OutPoint& prev_outpoint, const TxOut& prev_out,
-                                                   const Bytes& funding_privkey_32, const Hash32& request_txid,
-                                                   const PubKey32& validator_pubkey,
-                                                   const Bytes& approver_privkey_32,
-                                                   const Bytes& change_script_pubkey, std::uint64_t fee,
-                                                   std::string* err) {
-  if (prev_out.value < fee) {
-    if (err) *err = "fee exceeds prev value";
-    return std::nullopt;
-  }
-  auto kp = keypair_from_private_key(approver_privkey_32, err);
-  if (!kp.has_value()) {
-    return std::nullopt;
-  }
-  auto approval_sig = crypto::ed25519_sign(validator_join_approval_message(request_txid, validator_pubkey), approver_privkey_32);
-  if (!approval_sig.has_value()) {
-    if (err) *err = "failed to sign validator join approval";
-    return std::nullopt;
-  }
-
-  Bytes approve_spk{'S', 'C', 'V', 'A', 'L', 'J', 'A', 'P'};
-  approve_spk.insert(approve_spk.end(), request_txid.begin(), request_txid.end());
-  approve_spk.insert(approve_spk.end(), validator_pubkey.begin(), validator_pubkey.end());
-  approve_spk.insert(approve_spk.end(), kp->public_key.begin(), kp->public_key.end());
-  approve_spk.insert(approve_spk.end(), approval_sig->begin(), approval_sig->end());
-
-  std::vector<TxOut> outputs{TxOut{0, approve_spk}};
-  const std::uint64_t change = prev_out.value - fee;
-  if (change > 0) outputs.push_back(TxOut{change, change_script_pubkey});
-  return build_signed_p2pkh_tx_single_input(prev_outpoint, prev_out, funding_privkey_32, outputs, err);
-}
-
 std::optional<Tx> build_slash_tx(const OutPoint& bond_outpoint, std::uint64_t bond_value, const Vote& vote_a,
                                  const Vote& vote_b, std::uint64_t fee, std::string* err) {
   if (bond_value < fee) {

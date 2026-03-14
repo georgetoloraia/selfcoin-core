@@ -61,6 +61,10 @@ Suggested example HTTP endpoints:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `GET /monitoring/worker`
+- `GET /dashboard`
+- `GET /dashboard/incidents`
+- `POST /monitoring/dead_letters/replay`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -221,6 +225,7 @@ The service also exposes:
 - `GET /monitoring/notifiers`
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
+- `POST /monitoring/dead_letters/replay`
 
 `GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
 - available reserve
@@ -233,6 +238,7 @@ The service also exposes:
 - event log size
 - dead-letter count
 - pending notifier delivery count
+- worker leader owned
 
 Supported notifier hooks:
 - `webhook`: POST `{ "event": ... }` JSON to a target URL
@@ -242,13 +248,45 @@ Supported notifier hooks:
 Notifier configuration includes:
 - `retry_max_attempts`
 - `retry_backoff_seconds`
+- `auth_type=none|bearer|basic`
+- `auth_token_secret_ref`
+- `auth_user_secret_ref`
+- `auth_pass_secret_ref`
+- `tls_verify`
+- `tls_ca_file`
+- `tls_client_cert_file`
+- `tls_client_key_file`
 
 When a notifier fails:
 - the event stores per-notifier delivery status, attempt count, error text, and next retry time
-- retries are attempted on subsequent service activity
+- a persisted delivery job queue tracks pending/running/done/dead-letter work
+- a background retry worker drains that queue on a fixed interval
 - once the retry budget is exhausted, the delivery is moved into `dead_letters`
 
+Operationally:
+- the worker may use a leader/lock file so only one process drains notifier jobs
+- the lock is a renewable lease with stale-timeout takeover policy
+- notifier secrets should come from OS-managed files or environment policy first, not the persisted mint state
+- a secret backend adapter can also resolve refs from a helper command for external secret managers
+- TLS contexts are rebuilt per delivery so CA/client certificate file rotation is picked up without restart
+
+Recommended process split:
+- `server` mode: HTTP API only
+- `worker` mode: delivery queue worker only
+- `all` mode: combined development convenience
+
+Deployment helpers:
+- systemd-ready split units live under [services/selfcoin-mint/systemd](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd)
+- the included helper implementation for `command` backend lives at [services/selfcoin-mint/secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
+- the install script stages that helper as `/usr/local/libexec/selfcoin-mint-secret-helper`
+- a minimal operator guide lives at [docs/SELFCOIN_MINT_RUNBOOK.md](/home/greendragon/Desktop/selfcoin-core/docs/SELFCOIN_MINT_RUNBOOK.md)
+- a local deployment smoke check lives at [services/selfcoin-mint/systemd/smoke_deploy.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/smoke_deploy.sh)
+- CI packaging wiring lives at [.github/workflows/selfcoin-mint-packaging.yml](/home/greendragon/Desktop/selfcoin-core/.github/workflows/selfcoin-mint-packaging.yml)
+
+Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
+
 `GET /monitoring/incidents/export` returns a signed incident timeline suitable for audit/ops review.
+`GET /dashboard` and `GET /dashboard/incidents` provide a minimal operator HTML view over the same exported state.
 
 ### 6. Reserve and accounting views
 
@@ -326,6 +364,7 @@ selfcoin-cli mint_event_policy_update --url http://host:port/monitoring/events/p
 selfcoin-cli mint_notifier_list --url http://host:port/monitoring/notifiers
 selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--retry-max-attempts <n>] [--retry-backoff-seconds <n>]
 selfcoin-cli mint_dead_letters --url http://host:port/monitoring/dead_letters
+selfcoin-cli mint_dead_letter_replay --url http://host:port/monitoring/dead_letters/replay --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_incident_timeline_export --url http://host:port/monitoring/incidents/export
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health

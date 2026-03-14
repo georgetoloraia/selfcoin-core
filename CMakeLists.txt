@@ -1,14 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
 project(selfcoin_core LANGUAGES CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 option(SELFCOIN_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
 option(SELFCOIN_BUILD_FUZZ "Build fuzz harness executables" ON)
 option(SELFCOIN_STRICT_WARNINGS "Enable strict warning flags" OFF)
 
 find_package(OpenSSL REQUIRED)
+find_package(Qt5 COMPONENTS Widgets QUIET)
 
 # Optional libs: RocksDB and libsodium. Build falls back gracefully if unavailable.
 find_library(SODIUM_LIB sodium)
@@ -62,6 +68,7 @@ add_library(selfcoin_core
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
+  src/lightserver/client.cpp
   src/lightserver/server.cpp
 )
 
@@ -107,7 +114,48 @@ if(SELFCOIN_SANITIZE)
   target_link_options(selfcoin-lightserver PRIVATE -fsanitize=address,undefined)
 endif()
 
+if(Qt5Widgets_FOUND)
+  add_executable(selfcoin-wallet
+    apps/selfcoin-wallet/main.cpp
+    apps/selfcoin-wallet/wallet_window.cpp
+    apps/selfcoin-wallet/wallet_store.cpp
+  )
+  target_link_libraries(selfcoin-wallet PRIVATE selfcoin_core Qt5::Widgets)
+  if(SELFCOIN_SANITIZE)
+    target_compile_options(selfcoin-wallet PRIVATE ${SC_SAN_FLAGS})
+    target_link_options(selfcoin-wallet PRIVATE -fsanitize=address,undefined)
+  endif()
+
+  set(SELFCOIN_WALLET_DESKTOP_DIR "${CMAKE_INSTALL_DATAROOTDIR}/applications")
+  set(SELFCOIN_WALLET_DOC_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/selfcoin-wallet")
+  set(SELFCOIN_WALLET_ICON_DIR "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps")
+  configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/selfcoin-wallet.desktop.in
+    ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
+    @ONLY
+  )
+
+  install(TARGETS selfcoin-wallet
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  )
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/selfcoin-wallet.desktop
+    DESTINATION ${SELFCOIN_WALLET_DESKTOP_DIR}
+  )
+  install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/packaging/linux/selfcoin-wallet.svg
+    DESTINATION ${SELFCOIN_WALLET_ICON_DIR}
+  )
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/REFERENCE_WALLET_SPEC.md
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/REFERENCE_WALLET_INSTALL.md
+    ${CMAKE_CURRENT_SOURCE_DIR}/docs/SELFCOIN_CORE_CURRENT_BEHAVIOR.md
+    DESTINATION ${SELFCOIN_WALLET_DOC_DIR}
+  )
+else()
+  message(STATUS "Qt5 Widgets not found; skipping selfcoin-wallet target")
+endif()
+
 add_executable(selfcoin-tests
+  apps/selfcoin-wallet/wallet_store.cpp
   tests/test_main.cpp
   tests/test_codec.cpp
   tests/test_chain_id.cpp
@@ -132,11 +180,13 @@ add_executable(selfcoin-tests
   tests/test_genesis.cpp
   tests/test_paths.cpp
   tests/test_keystore.cpp
+  tests/test_wallet_store.cpp
   tests/test_mainnet_characterization.cpp
   tests/test_integration.cpp
   tests/test_lightserver.cpp
 )
 target_link_libraries(selfcoin-tests PRIVATE selfcoin_core)
+target_include_directories(selfcoin-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 if(SELFCOIN_SANITIZE)
   target_compile_options(selfcoin-tests PRIVATE ${SC_SAN_FLAGS})
   target_link_options(selfcoin-tests PRIVATE -fsanitize=address,undefined)
@@ -160,3 +210,12 @@ endif()
 enable_testing()
 add_test(NAME selfcoin-tests COMMAND selfcoin-tests)
 set_tests_properties(selfcoin-tests PROPERTIES RESOURCE_LOCK ports)
+
+set(CPACK_PACKAGE_NAME "selfcoin-wallet")
+set(CPACK_PACKAGE_VENDOR "selfcoin")
+set(CPACK_PACKAGE_CONTACT "selfcoin")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "SelfCoin reference desktop wallet")
+set(CPACK_PACKAGE_VERSION "0.1.0")
+set(CPACK_GENERATOR "TGZ;ZIP")
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}")
+include(CPack)

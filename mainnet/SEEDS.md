@@ -15,7 +15,7 @@ Operator expectations:
 
 Operator run example:
 ```bash
-./build/selfcoin-node --mainnet --public
+./build/selfcoin-node --public
 ```
 
 Default data dir:

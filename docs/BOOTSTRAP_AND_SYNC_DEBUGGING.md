@@ -5,7 +5,7 @@ This document is for debugging the highest-risk runtime path in `selfcoin-core`:
 - bootstrap-template chain formation
 - follower bootstrap-validator adoption
 - finalized-tip/block sync
-- sponsored bootstrap validator join
+- post-bootstrap validator join by funded on-chain bond
 
 The goal is operational debugging, not protocol marketing.
 
@@ -26,8 +26,6 @@ Important functions:
 - `request_finalized_tip(...)`
 - `maybe_request_sync_parent_locked(...)`
 - `maybe_apply_buffered_sync_blocks_locked()`
-- `build_bootstrap_validator_join_tx(...)`
-- `maybe_submit_bootstrap_join()`
 
 ## 2. Happy-path sequence
 
@@ -39,7 +37,7 @@ Important functions:
 6. follower requests finalized tip
 7. follower requests missing blocks
 8. follower applies finalized state
-9. bootstrap node may later sponsor the follower as a validator
+9. a synced follower may later submit its own funded validator join request
 
 ## 3. Relevant P2P messages
 
@@ -105,7 +103,6 @@ Symptoms:
 - new node is not actually voting
 
 Likely control-flow area:
-- `maybe_submit_bootstrap_join()`
 - validator warmup / activation in `ValidatorRegistry::advance_height(...)`
 
 ## 5. Best log insertion points
@@ -129,12 +126,6 @@ Likely control-flow area:
 
 - `finalize_if_quorum(...)`
   - log committee size, quorum threshold, valid signature count
-
-- `build_bootstrap_validator_join_tx(...)`
-  - log when sponsored join tx creation is attempted
-
-- `maybe_submit_bootstrap_join()`
-  - log why a joiner is or is not considered ready
 
 ### In [src/p2p/peer_manager.cpp](./../src/p2p/peer_manager.cpp)
 
@@ -175,7 +166,6 @@ Most relevant:
 - `test_single_node_custom_genesis_bootstraps_and_finalizes`
 - `test_second_fresh_node_adopts_bootstrap_validator_and_syncs`
 - `test_second_node_auto_joins_as_validator_on_chain`
-- `test_bootstrap_joiner_is_not_sponsored_until_synced`
 - `test_late_joiner_requests_finalized_tip_and_catches_up`
 
 These are the best “intended behavior” references for bootstrap-template mode.
@@ -215,8 +205,7 @@ These are the best “intended behavior” references for bootstrap-template mod
    - `apply_validator_state_changes(...)`
    - `apply_block_to_utxo(...)`
 
-9. only then debug validator sponsorship and activation
-   - `maybe_submit_bootstrap_join()`
+9. only then debug funded join-request submission and activation
 
 ## 9. Open questions to recheck directly in code
 
@@ -224,7 +213,7 @@ Current answers from the code path in [src/node/node.cpp](./../src/node/node.cpp
 
 - every peer that reaches `VERACK` is sent `FINALIZED_TIP` and is also asked for `GET_FINALIZED_TIP`
 - bootstrap validator adoption can happen from `VERSION` metadata, with a fallback retry on later `FINALIZED_TIP`
-- sponsored join still waits for a peer claiming the joiner pubkey to be established and at the same finalized tip as the sponsor, which avoids sponsoring a clearly-unsynced joiner
+- funded validator joins still depend on the joiner being fully synced enough to learn finalized chain state and submit a valid on-chain join request
 - plain-text runtime summary now treats `peers` as total live peers and reports outbound separately as `outbound=x/target`, so the counters line up with the debugging checklist
 
 Useful new runtime logs now exist at the critical decision points:
@@ -239,6 +228,6 @@ Useful new runtime logs now exist at the critical decision points:
 
 The pipeline to keep in your head is:
 
-`connect -> handshake -> establish -> adopt bootstrap validator -> request finalized tip -> request blocks -> request missing parents -> replay buffered blocks -> apply finalized state -> optionally sponsor validator join`
+`connect -> handshake -> establish -> adopt bootstrap validator -> request finalized tip -> request blocks -> request missing parents -> replay buffered blocks -> apply finalized state -> optionally submit funded validator join`
 
 If a follower stays at height 0, the bug is almost always somewhere in that exact pipeline.

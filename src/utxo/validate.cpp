@@ -56,7 +56,6 @@ bool is_supported_base_layer_output_script(const Bytes& script_pubkey) {
   return is_p2pkh_script_pubkey(script_pubkey, nullptr) || is_validator_register_script(script_pubkey, nullptr) ||
          is_validator_unbond_script(script_pubkey, nullptr) ||
          is_validator_join_request_script(script_pubkey, nullptr, nullptr, nullptr) ||
-         is_validator_join_approval_script(script_pubkey, nullptr, nullptr, nullptr, nullptr) ||
          is_burn_script(script_pubkey, nullptr) || privacy::is_mint_deposit_script(script_pubkey, nullptr, nullptr);
 }
 
@@ -97,15 +96,6 @@ Bytes validator_join_request_pop_message(const PubKey32& validator_pubkey, const
   w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'R', 'E', 'Q', '-', 'V', '1'});
   w.bytes_fixed(validator_pubkey);
   w.bytes_fixed(payout_pubkey);
-  const Hash32 msg = crypto::sha256d(w.data());
-  return Bytes(msg.begin(), msg.end());
-}
-
-Bytes validator_join_approval_message(const Hash32& request_txid, const PubKey32& validator_pubkey) {
-  codec::ByteWriter w;
-  w.bytes(Bytes{'S', 'C', '-', 'V', 'A', 'L', 'J', 'O', 'I', 'N', 'A', 'P', 'P', '-', 'V', '1'});
-  w.bytes_fixed(request_txid);
-  w.bytes_fixed(validator_pubkey);
   const Hash32 msg = crypto::sha256d(w.data());
   return Bytes(msg.begin(), msg.end());
 }
@@ -184,19 +174,6 @@ TxValidationResult validate_tx(const Tx& tx, size_t tx_index_in_block, const Utx
       if (out.value != 0) return {false, "SCVALJRQ output must have zero value", 0};
       if (!crypto::ed25519_verify(validator_join_request_pop_message(pub, payout), pop, pub)) {
         return {false, "validator join request proof invalid", 0};
-      }
-    }
-    Hash32 req_txid{};
-    PubKey32 approver{};
-    Sig64 approval_sig{};
-    if (is_validator_join_approval_script(out.script_pubkey, &req_txid, &pub, &approver, &approval_sig)) {
-      if (out.value != 0) return {false, "SCVALJAP output must have zero value", 0};
-      if (!ctx || !ctx->validators) return {false, "validator join approval requires validator context", 0};
-      if (!ctx->validators->is_active_for_height(approver, ctx->current_height)) {
-        return {false, "validator join approver not active", 0};
-      }
-      if (!crypto::ed25519_verify(validator_join_approval_message(req_txid, pub), approval_sig, approver)) {
-        return {false, "validator join approval signature invalid", 0};
       }
     }
   }

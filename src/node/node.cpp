@@ -647,8 +647,15 @@ bool Node::bootstrap_template_bind_validator(const PubKey32& pub, bool local_val
   const auto json = genesis::to_json(effective);
   if (!db_.put("G:J", Bytes(json.begin(), json.end()))) return false;
 
+  if (finalized_randomness_ == zero_hash()) {
+    finalized_randomness_ = consensus::initial_finalized_randomness(cfg_.network, chain_id_);
+  }
+  committee_epoch_randomness_cache_[1] = finalized_randomness_;
+  persist_committee_epoch_snapshot_locked(1, std::vector<PubKey32>{pub}, finalized_randomness_);
+
   const UtxoSet empty_utxos;
   (void)persist_state_roots(db_, 0, empty_utxos, validators_, kFixedValidationRulesVersion);
+  (void)db_.put(kFinalizedRandomnessKey, Bytes(finalized_randomness_.begin(), finalized_randomness_.end()));
   if (!db_.flush()) return false;
 
   bootstrap_validator_pubkey_ = pub;

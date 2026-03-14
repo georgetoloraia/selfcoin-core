@@ -462,6 +462,7 @@ int main(int argc, char** argv) {
               << "  selfcoin-cli mint_notifier_list --url http://host:port/path\n"
               << "  selfcoin-cli mint_notifier_upsert --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--enabled true|false] [--retry-max-attempts <n>] [--retry-backoff-seconds <n>] [--email-to <addr>] [--email-from <addr>]\n"
               << "  selfcoin-cli mint_dead_letters --url http://host:port/path\n"
+              << "  selfcoin-cli mint_dead_letter_replay --url http://host:port/path --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_incident_timeline_export --url http://host:port/path\n"
               << "  selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
               << "  selfcoin-cli mint_reserve_consolidate --url http://host:port/path --operator-key-id <id> --operator-secret-hex <hex>\n"
@@ -2151,6 +2152,35 @@ int main(int argc, char** argv) {
     auto body = http_post_json_with_headers(url, body_json.str(), *headers, &err);
     if (!body) {
       std::cerr << "mint_notifier_upsert failed: " << err << "\n";
+      return 1;
+    }
+    std::cout << *body << "\n";
+    return 0;
+  }
+
+  if (cmd == "mint_dead_letter_replay") {
+    std::string url, operator_key_id, operator_secret_hex, dead_letter_id;
+    for (int i = 2; i < argc; ++i) {
+      std::string a = argv[i];
+      if (a == "--url" && i + 1 < argc) url = argv[++i];
+      else if (a == "--operator-key-id" && i + 1 < argc) operator_key_id = argv[++i];
+      else if (a == "--operator-secret-hex" && i + 1 < argc) operator_secret_hex = argv[++i];
+      else if (a == "--dead-letter-id" && i + 1 < argc) dead_letter_id = argv[++i];
+    }
+    if (url.empty() || operator_key_id.empty() || operator_secret_hex.empty() || dead_letter_id.empty()) {
+      std::cerr << "mint_dead_letter_replay requires --url, --dead-letter-id, --operator-key-id, and --operator-secret-hex\n";
+      return 1;
+    }
+    const std::string body_json = std::string("{\"dead_letter_id\":\"") + dead_letter_id + "\"}";
+    std::string err;
+    auto headers = operator_signed_headers_for_url("POST", url, body_json, operator_key_id, operator_secret_hex, &err);
+    if (!headers) {
+      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
+      return 1;
+    }
+    auto body = http_post_json_with_headers(url, body_json, *headers, &err);
+    if (!body) {
+      std::cerr << "mint_dead_letter_replay failed: " << err << "\n";
       return 1;
     }
     std::cout << *body << "\n";

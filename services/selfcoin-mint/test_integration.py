@@ -300,6 +300,8 @@ class MintIntegrationTests(unittest.TestCase):
                         reserve_address,
                         "--cli-path",
                         str(CLI),
+                        "--notifier-retry-interval-seconds",
+                        "1",
                     ],
                     cwd=REPO_ROOT,
                     stdout=subprocess.PIPE,
@@ -657,6 +659,45 @@ class MintIntegrationTests(unittest.TestCase):
                     dead_letters_json = json.loads(dead_letters.stdout)
                     self.assertGreaterEqual(len(dead_letters_json["dead_letters"]), 2)
                     self.assertTrue(all(item["notifier_id"] == "ops-fail" for item in dead_letters_json["dead_letters"]))
+
+                    fix_notifier_cmd = [
+                        str(CLI),
+                        "mint_notifier_upsert",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/notifiers",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--notifier-id",
+                        "ops-fail",
+                        "--kind",
+                        "webhook",
+                        "--target",
+                        f"http://127.0.0.1:{notifier_port}/webhook",
+                        "--retry-max-attempts",
+                        "2",
+                        "--retry-backoff-seconds",
+                        "1",
+                    ]
+                    subprocess.run(fix_notifier_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+
+                    replay_cmd = [
+                        str(CLI),
+                        "mint_dead_letter_replay",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/dead_letters/replay",
+                        "--dead-letter-id",
+                        dead_letters_json["dead_letters"][0]["dead_letter_id"],
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    subprocess.run(replay_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    history_after_replay = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                    replay_event = next(item for item in history_after_replay["events"] if item["event_type"] == "dead_letter.replayed")
+                    self.assertTrue(replay_event["deliveries"]["ops-webhook"]["status"] == "delivered")
 
                     incident_cmd = [
                         str(CLI),

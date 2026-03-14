@@ -61,6 +61,7 @@ Suggested example HTTP endpoints:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `POST /monitoring/dead_letters/replay`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -221,6 +222,7 @@ The service also exposes:
 - `GET /monitoring/notifiers`
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
+- `POST /monitoring/dead_letters/replay`
 
 `GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
 - available reserve
@@ -245,8 +247,10 @@ Notifier configuration includes:
 
 When a notifier fails:
 - the event stores per-notifier delivery status, attempt count, error text, and next retry time
-- retries are attempted on subsequent service activity
+- a background retry worker retries pending deliveries on a fixed interval
 - once the retry budget is exhausted, the delivery is moved into `dead_letters`
+
+Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 
 `GET /monitoring/incidents/export` returns a signed incident timeline suitable for audit/ops review.
 
@@ -326,6 +330,7 @@ selfcoin-cli mint_event_policy_update --url http://host:port/monitoring/events/p
 selfcoin-cli mint_notifier_list --url http://host:port/monitoring/notifiers
 selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--retry-max-attempts <n>] [--retry-backoff-seconds <n>]
 selfcoin-cli mint_dead_letters --url http://host:port/monitoring/dead_letters
+selfcoin-cli mint_dead_letter_replay --url http://host:port/monitoring/dead_letters/replay --dead-letter-id <id> --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_incident_timeline_export --url http://host:port/monitoring/incidents/export
 selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
 selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health

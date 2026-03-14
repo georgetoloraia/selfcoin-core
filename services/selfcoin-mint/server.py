@@ -88,6 +88,7 @@ class MintConfig:
     reserve_address: str
     reserve_fee: int
     cli_path: str
+    notifier_retry_interval_seconds: int
 
 
 _BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
@@ -582,6 +583,20 @@ class MintState:
                 return []
             tail = letters[-max(0, int(limit)):]
             return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+    def remove_dead_letter(self, dead_letter_id: str) -> dict[str, Any]:
+        with self._lock:
+            letters = self._data.get("dead_letters", [])
+            if not isinstance(letters, list):
+                raise KeyError("unknown dead_letter_id")
+            for idx, item in enumerate(letters):
+                if isinstance(item, dict) and str(item.get("dead_letter_id", "")) == dead_letter_id:
+                    removed = dict(item)
+                    del letters[idx]
+                    self._data["dead_letters"] = letters
+                    self._flush()
+                    return removed
+            raise KeyError("unknown dead_letter_id")
 
     def acknowledge_event(self, event_id: str, note: str) -> dict[str, Any]:
         with self._lock:
@@ -1243,14 +1258,33 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             policy = self._policy_recommendations(summary, inventory, alerts)
             health = self._reserve_health_summary(summary, inventory, alerts)
             pending_delivery = 0
+            delivered_count = 0
+            dead_letter_count = 0
+            latency_sum = 0
             for event in state.list_events(256):
                 deliveries = event.get("deliveries", {})
                 if isinstance(deliveries, dict):
-                    pending_delivery += sum(
-                        1
-                        for item in deliveries.values()
-                        if isinstance(item, dict) and str(item.get("status", "")) == "pending"
-                    )
+                    for item in deliveries.values():
+                        if not isinstance(item, dict):
+                            continue
+                        status = str(item.get("status", ""))
+                        if status == "pending":
+                            pending_delivery += 1
+                        elif status == "delivered":
+                            delivered_count += 1
+                            delivered_at = int(item.get("delivered_at", 0))
+                            created_at = int(event.get("created_at", 0))
+                            if delivered_at > 0 and created_at > 0 and delivered_at >= created_at:
+                                latency_sum += delivered_at - created_at
+                        elif status == "dead_letter":
+                            dead_letter_count += 1
+            success_rate = 0.0
+            finished = delivered_count + dead_letter_count
+            if finished > 0:
+                success_rate = delivered_count / float(finished)
+            avg_latency = 0.0
+            if delivered_count > 0:
+                avg_latency = latency_sum / float(delivered_count)
             lines = [
                 "# TYPE selfcoin_mint_available_reserve gauge",
                 f"selfcoin_mint_available_reserve {int(summary.get('available_reserve', 0))}",
@@ -1284,6 +1318,12 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 f"selfcoin_mint_dead_letter_count {len(state.list_dead_letters(512))}",
                 "# TYPE selfcoin_mint_pending_notifier_delivery_count gauge",
                 f"selfcoin_mint_pending_notifier_delivery_count {pending_delivery}",
+                "# TYPE selfcoin_mint_notifier_delivered_count gauge",
+                f"selfcoin_mint_notifier_delivered_count {delivered_count}",
+                "# TYPE selfcoin_mint_notifier_success_rate gauge",
+                f"selfcoin_mint_notifier_success_rate {success_rate:.6f}",
+                "# TYPE selfcoin_mint_notifier_delivery_latency_seconds_avg gauge",
+                f"selfcoin_mint_notifier_delivery_latency_seconds_avg {avg_latency:.6f}",
             ]
             return "\n".join(lines) + "\n"
 
@@ -1432,6 +1472,20 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "dead_letters": state.list_dead_letters(256),
                 "notifiers": state.list_notifiers(),
             }
+
+        def _replay_dead_letter(self, dead_letter_id: str) -> dict[str, Any]:
+            removed = state.remove_dead_letter(dead_letter_id)
+            event_id = str(removed.get("event_id", ""))
+            notifier_id = str(removed.get("notifier_id", ""))
+            event = next((item for item in state.list_events(256) if str(item.get("event_id", "")) == event_id), None)
+            notifier = next((item for item in state.list_notifiers() if str(item.get("notifier_id", "")) == notifier_id), None)
+            if not isinstance(event, dict) or not isinstance(notifier, dict):
+                raise KeyError("replay target missing")
+            state.update_event_delivery(event_id, notifier_id, "pending", 0, next_retry_at=0)
+            event = next((item for item in state.list_events(256) if str(item.get("event_id", "")) == event_id), event)
+            updated = self._deliver_event_to_notifier(notifier, event)
+            self._record_event("dead_letter.replayed", {"dead_letter_id": dead_letter_id, "event_id": event_id, "notifier_id": notifier_id})
+            return updated
 
         def _maybe_apply_auto_pause(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
             policy = state.policy()
@@ -1905,6 +1959,9 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if self.path == "/monitoring/notifiers":
                 self._handle_notifier_upsert(body, raw_body)
                 return
+            if self.path == "/monitoring/dead_letters/replay":
+                self._handle_dead_letter_replay(body, raw_body)
+                return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -2280,6 +2337,20 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             self._record_event("notifier.upsert", {"notifier_id": notifier_id, "kind": kind, "enabled": enabled})
             write_json(self, HTTPStatus.OK, {"accepted": True, "notifier": saved})
 
+        def _handle_dead_letter_replay(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            dead_letter_id = body.get("dead_letter_id")
+            if not isinstance(dead_letter_id, str) or not dead_letter_id:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid dead_letter_id"})
+                return
+            try:
+                event = self._replay_dead_letter(dead_letter_id)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown dead_letter_id"})
+                return
+            write_json(self, HTTPStatus.OK, {"accepted": True, "event": event})
+
     return MintHandler
 
 
@@ -2314,6 +2385,7 @@ def main() -> int:
     parser.add_argument("--reserve-address", default="", help="Reserve wallet address used for change and UTXO discovery.")
     parser.add_argument("--reserve-fee", type=int, default=1000, help="L1 fee used for redemption settlement transactions.")
     parser.add_argument("--cli-path", default="./build/selfcoin-cli", help="Path to selfcoin-cli used for tx construction.")
+    parser.add_argument("--notifier-retry-interval-seconds", type=int, default=5, help="Background notifier retry interval.")
     args = parser.parse_args()
 
     operator_keys = parse_operator_keys(args.operator_key)
@@ -2330,18 +2402,34 @@ def main() -> int:
         reserve_address=args.reserve_address,
         reserve_fee=args.reserve_fee,
         cli_path=args.cli_path,
+        notifier_retry_interval_seconds=max(1, args.notifier_retry_interval_seconds),
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
     attestor = BlindSigner.from_seed(config.signing_seed + ":attestation")
     server = ThreadingHTTPServer((args.host, args.port), make_handler(config, state, signer, attestor, primary_operator_key_id))
+    stop_retry = threading.Event()
+
+    def retry_loop() -> None:
+        url = f"http://{args.host}:{args.port}/monitoring/metrics"
+        while not stop_retry.wait(config.notifier_retry_interval_seconds):
+            try:
+                with urllib.request.urlopen(url, timeout=2):
+                    pass
+            except Exception:
+                continue
+
+    retry_thread = threading.Thread(target=retry_loop, daemon=True)
+    retry_thread.start()
     print(f"selfcoin-mint listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        stop_retry.set()
         server.server_close()
+        retry_thread.join(timeout=5)
     return 0
 
 

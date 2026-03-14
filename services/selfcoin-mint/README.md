@@ -44,6 +44,7 @@ It is a narrow scaffold, not a production mint:
 - `GET /monitoring/dead_letters`
 - `GET /monitoring/incidents/export`
 - `GET /monitoring/metrics`
+- `POST /monitoring/dead_letters/replay`
 - `GET /accounting/summary`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -62,7 +63,8 @@ python3 services/selfcoin-mint/server.py \
   --reserve-privkey 5555555555555555555555555555555555555555555555555555555555555555 \
   --reserve-address sc1... \
   --reserve-fee 1000 \
-  --cli-path ./build/selfcoin-cli
+  --cli-path ./build/selfcoin-cli \
+  --notifier-retry-interval-seconds 5
 ```
 
 ## Example with selfcoin-cli
@@ -148,6 +150,12 @@ python3 services/selfcoin-mint/server.py \
 
 ./build/selfcoin-cli mint_incident_timeline_export \
   --url http://127.0.0.1:8080/monitoring/incidents/export
+
+./build/selfcoin-cli mint_dead_letter_replay \
+  --url http://127.0.0.1:8080/monitoring/dead_letters/replay \
+  --dead-letter-id <dead-letter-id> \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
 ```
 
 ```bash
@@ -236,6 +244,7 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/monitoring/notifiers` exposes configured notifier hooks.
 - `/monitoring/dead_letters` exposes failed notifier deliveries that exhausted retries.
 - `/monitoring/incidents/export` exposes a signed incident timeline including events, silences, dead letters, and notifier state.
+- `POST /monitoring/dead_letters/replay` requeues a dead-lettered delivery and retries it immediately.
 - `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
 - Notifier hooks currently support:
   - `webhook`
@@ -244,6 +253,7 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Each notifier supports:
   - `retry_max_attempts`
   - `retry_backoff_seconds`
+- The service also runs a background retry worker (`--notifier-retry-interval-seconds`) so pending notifier deliveries are retried even without external traffic.
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

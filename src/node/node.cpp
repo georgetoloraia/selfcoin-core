@@ -1860,7 +1860,7 @@ bool Node::handle_propose(const p2p::ProposeMsg& msg, bool from_network) {
     auto valid = validate_block_txs(*blk, utxos_, BLOCK_REWARD, &vctx, &reward_signers);
     if (!valid.ok) {
       log_line("propose-reject height=" + std::to_string(msg.height) + " round=" + std::to_string(msg.round) +
-               " reason=invalid-block-txs");
+               " reason=invalid-block-txs detail=" + valid.error);
       return false;
     }
     if (!validate_v4_registration_rules(*blk, msg.height)) {

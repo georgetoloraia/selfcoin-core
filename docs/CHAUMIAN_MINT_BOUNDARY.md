@@ -279,6 +279,7 @@ Deployment helpers:
 - systemd-ready split units live under [services/selfcoin-mint/systemd](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd)
 - the included helper implementation for `command` backend lives at [services/selfcoin-mint/secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
 - the install script stages that helper as `/usr/local/libexec/selfcoin-mint-secret-helper`
+- a minimal operator guide lives at [docs/SELFCOIN_MINT_RUNBOOK.md](/home/greendragon/Desktop/selfcoin-core/docs/SELFCOIN_MINT_RUNBOOK.md)
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 

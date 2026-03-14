@@ -326,6 +326,7 @@ The install helper also places:
 
 - [secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py)
   as `/usr/local/libexec/selfcoin-mint-secret-helper`
+- operator steps are documented in [docs/SELFCOIN_MINT_RUNBOOK.md](/home/greendragon/Desktop/selfcoin-core/docs/SELFCOIN_MINT_RUNBOOK.md)
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

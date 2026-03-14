@@ -214,6 +214,116 @@ class FakeNotifierSink:
 
 
 class MintIntegrationTests(unittest.TestCase):
+    def test_worker_stale_lease_takeover_emits_event(self) -> None:
+        port = free_port()
+        lightserver_port = free_port()
+        lightserver = FakeLightserver(lightserver_port)
+        lightserver.start()
+        operator_key_id = "integration-operator"
+        operator_secret_hex = "11" * 32
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                state_path = Path(td) / "mint-state.json"
+                lock_path = Path(td) / "worker.lock"
+                stale_state = {
+                    "owner_pid": 424242,
+                    "heartbeat_at": 1,
+                    "acquired_at": 1,
+                    "mode": "worker",
+                    "stale_timeout_seconds": 5,
+                }
+                lock_path.write_text(json.dumps(stale_state), encoding="utf-8")
+                common_args = [
+                    "python3",
+                    str(SERVER),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--state-file",
+                    str(state_path),
+                    "--mint-id",
+                    "22" * 32,
+                    "--signing-seed",
+                    "integration-seed",
+                    "--operator-key",
+                    f"{operator_key_id}:{operator_secret_hex}",
+                    "--lightserver-url",
+                    f"http://127.0.0.1:{lightserver_port}/rpc",
+                    "--worker-lock-file",
+                    str(lock_path),
+                    "--worker-stale-timeout-seconds",
+                    "5",
+                    "--notifier-retry-interval-seconds",
+                    "1",
+                ]
+                proc = subprocess.Popen(
+                    common_args + ["--mode", "server"],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                worker_proc = subprocess.Popen(
+                    common_args + ["--mode", "worker"],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    for _ in range(50):
+                        try:
+                            health = http_get_json(f"http://127.0.0.1:{port}/healthz")
+                            if health.get("ok"):
+                                break
+                        except Exception:
+                            time.sleep(0.1)
+                    else:
+                        self.fail("mint service did not become ready")
+
+                    takeover_event = None
+                    for _ in range(40):
+                        history = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                        takeover_event = next((item for item in history["events"] if item["event_type"] == "worker.lease_takeover"), None)
+                        if takeover_event is not None:
+                            break
+                        time.sleep(0.1)
+                    if takeover_event is None:
+                        raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                        events = raw_state.get("events", [])
+                        takeover_event = next((item for item in events if item.get("event_type") == "worker.lease_takeover"), None)
+                    self.assertIsNotNone(takeover_event)
+                    self.assertEqual(takeover_event["payload"]["stale_owner_pid"], "424242")
+
+                    worker_status = http_get_json(f"http://127.0.0.1:{port}/monitoring/worker")
+                    self.assertEqual(worker_status["takeover_policy"], "allow-after-stale-timeout")
+                    self.assertFalse(worker_status["stale"])
+                    self.assertNotEqual(worker_status["owner_pid"], "424242")
+                finally:
+                    worker_proc.terminate()
+                    try:
+                        worker_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        worker_proc.kill()
+                        worker_proc.wait(timeout=5)
+                    if worker_proc.stdout is not None:
+                        worker_proc.stdout.close()
+                    if worker_proc.stderr is not None:
+                        worker_proc.stderr.close()
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                    if proc.stderr is not None:
+                        proc.stderr.close()
+        finally:
+            lightserver.stop()
+
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()
         lightserver_port = free_port()

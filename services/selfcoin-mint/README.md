@@ -19,7 +19,7 @@ It is a narrow scaffold, not a production mint:
 - HMAC-signed operator admin requests
 - persistent notifier delivery job queue
 - optional single-worker leader lock for queue draining
-- notifier secret refs resolved from an external secrets file
+- notifier secret refs resolved through a pluggable secret backend adapter
 - signed reserve attestations / audit exports
 - no federation
 - no multi-operator quorum custody
@@ -74,6 +74,8 @@ python3 services/selfcoin-mint/server.py \
   --notifier-secrets-file /etc/selfcoin-mint/notifier-secrets.json \
   --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
   --notifier-secret-env-prefix SELFCOIN_MINT_SECRET_ \
+  --notifier-secret-backend auto \
+  --notifier-secret-helper-cmd "" \
   --worker-lock-file /var/lib/selfcoin-mint/worker.lock
 ```
 
@@ -89,8 +91,10 @@ python3 services/selfcoin-mint/server.py \
   --reserve-address sc1... \
   --cli-path ./build/selfcoin-cli \
   --notifier-retry-interval-seconds 5 \
+  --notifier-secret-backend auto \
   --notifier-secret-dir /etc/selfcoin-mint/secrets.d \
-  --worker-lock-file /var/lib/selfcoin-mint/worker.lock
+  --worker-lock-file /var/lib/selfcoin-mint/worker.lock \
+  --worker-stale-timeout-seconds 30
 ```
 
 ## Example with selfcoin-cli
@@ -268,6 +272,7 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
 - `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
 - `/monitoring/worker` exposes worker leadership / lock-owner state.
+- `/monitoring/worker` also exposes stale lease detection and takeover policy.
 - `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
 - `/monitoring/events/policy` exposes event retention/export settings.
 - `/monitoring/events/silences` exposes active and expired silences.
@@ -297,12 +302,22 @@ curl http://127.0.0.1:8080/attestations/reserves
 - `--mode server` runs only the HTTP service.
 - `--mode worker` runs only the queue worker.
 - `--mode all` keeps the old combined behavior when needed.
-- If `--worker-lock-file` is configured, only the process holding that file lock drains delivery jobs.
+- If `--worker-lock-file` is configured, the worker uses a renewable lease file with stale-timeout takeover policy.
 - Secret values can come from:
   - `--notifier-secret-dir` as one file per secret ref
   - `SELFCOIN_MINT_SECRET_<REF>` environment variables
   - `--notifier-secrets-file` as a fallback JSON map
+- Or from `--notifier-secret-helper-cmd <cmd>` when `--notifier-secret-backend=command`; the ref is appended as the final argument.
+- `--notifier-secret-backend` may be `auto|dir|env|json|command`.
 - The state file stores refs, not the secret values themselves.
+
+## systemd units
+
+Example split units and env file template live in:
+
+- [services/selfcoin-mint/systemd/selfcoin-mint-server.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-server.service)
+- [services/selfcoin-mint/systemd/selfcoin-mint-worker.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-worker.service)
+- [services/selfcoin-mint/systemd/selfcoin-mint.env.example](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.env.example)
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

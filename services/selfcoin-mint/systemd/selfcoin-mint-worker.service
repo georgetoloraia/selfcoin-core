@@ -1,0 +1,40 @@
+[Unit]
+Description=selfcoin-mint queue worker
+After=network-online.target selfcoin-mint-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/selfcoin-core
+EnvironmentFile=-/etc/selfcoin-mint/selfcoin-mint.env
+ExecStart=/usr/bin/python3 /opt/selfcoin-core/services/selfcoin-mint/server.py \
+  --mode worker \
+  --state-file ${SELFCOIN_MINT_STATE_FILE} \
+  --mint-id ${SELFCOIN_MINT_MINT_ID} \
+  --signing-seed ${SELFCOIN_MINT_SIGNING_SEED} \
+  --operator-key ${SELFCOIN_MINT_OPERATOR_KEY} \
+  --lightserver-url ${SELFCOIN_MINT_LIGHTSERVER_URL} \
+  --reserve-privkey ${SELFCOIN_MINT_RESERVE_PRIVKEY} \
+  --reserve-address ${SELFCOIN_MINT_RESERVE_ADDRESS} \
+  --reserve-fee ${SELFCOIN_MINT_RESERVE_FEE} \
+  --cli-path ${SELFCOIN_MINT_CLI_PATH} \
+  --notifier-retry-interval-seconds ${SELFCOIN_MINT_NOTIFIER_RETRY_INTERVAL_SECONDS} \
+  --notifier-secret-backend ${SELFCOIN_MINT_SECRET_BACKEND} \
+  --notifier-secrets-file ${SELFCOIN_MINT_NOTIFIER_SECRETS_FILE} \
+  --notifier-secret-dir ${SELFCOIN_MINT_NOTIFIER_SECRET_DIR} \
+  --notifier-secret-env-prefix ${SELFCOIN_MINT_NOTIFIER_SECRET_ENV_PREFIX} \
+  --notifier-secret-helper-cmd ${SELFCOIN_MINT_NOTIFIER_SECRET_HELPER_CMD} \
+  --worker-lock-file ${SELFCOIN_MINT_WORKER_LOCK_FILE} \
+  --worker-stale-timeout-seconds ${SELFCOIN_MINT_WORKER_STALE_TIMEOUT_SECONDS}
+Restart=on-failure
+RestartSec=5
+User=selfcoin
+Group=selfcoin
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/selfcoin-mint /run/selfcoin-mint
+
+[Install]
+WantedBy=multi-user.target

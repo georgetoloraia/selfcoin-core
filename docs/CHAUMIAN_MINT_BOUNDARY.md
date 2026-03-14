@@ -265,13 +265,18 @@ When a notifier fails:
 
 Operationally:
 - the worker may use a leader/lock file so only one process drains notifier jobs
+- the lock is a renewable lease with stale-timeout takeover policy
 - notifier secrets should come from OS-managed files or environment policy first, not the persisted mint state
+- a secret backend adapter can also resolve refs from a helper command for external secret managers
 - TLS contexts are rebuilt per delivery so CA/client certificate file rotation is picked up without restart
 
 Recommended process split:
 - `server` mode: HTTP API only
 - `worker` mode: delivery queue worker only
 - `all` mode: combined development convenience
+
+Deployment helpers:
+- systemd-ready split units live under [services/selfcoin-mint/systemd](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd)
 
 Dead-letter entries may be replayed explicitly through `POST /monitoring/dead_letters/replay`.
 

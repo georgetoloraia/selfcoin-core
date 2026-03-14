@@ -96,7 +96,10 @@ class MintConfig:
     notifier_secrets_file: Path | None
     notifier_secret_dir: Path | None
     notifier_secret_env_prefix: str
+    notifier_secret_backend: str
+    notifier_secret_helper_cmd: str
     worker_lock_file: Path | None
+    worker_stale_timeout_seconds: int
 
 
 _BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
@@ -1098,6 +1101,14 @@ def parse_operator_keys(entries: list[str]) -> dict[str, bytes]:
 def load_notifier_secrets(path: Path | None) -> dict[str, str]:
     if path is None or not path.exists():
         return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+    except Exception:
+        return {}
 
 
 def load_notifier_secret_from_path(secret_dir: Path | None, ref: str) -> str:
@@ -1112,63 +1123,172 @@ def load_notifier_secret_from_path(secret_dir: Path | None, ref: str) -> str:
         return path.read_text(encoding="utf-8").strip()
     except Exception:
         return ""
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {}
-        return {str(k): str(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
-    except Exception:
-        return {}
+
+
+class SecretBackendAdapter:
+    def __init__(self, config: MintConfig) -> None:
+        self._config = config
+
+    def resolve(self, ref: str) -> str:
+        if not ref:
+            return ""
+        backend = self._config.notifier_secret_backend
+        if backend == "dir":
+            return load_notifier_secret_from_path(self._config.notifier_secret_dir, ref)
+        if backend == "env":
+            env_key = f"{self._config.notifier_secret_env_prefix}{ref}".upper()
+            return os.environ.get(env_key, "")
+        if backend == "json":
+            return load_notifier_secrets(self._config.notifier_secrets_file).get(ref, "")
+        if backend == "command":
+            helper = self._config.notifier_secret_helper_cmd.strip()
+            if not helper:
+                return ""
+            try:
+                cmd = helper.split() + [ref]
+                proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+                return proc.stdout.strip()
+            except Exception:
+                return ""
+        # auto
+        value = load_notifier_secret_from_path(self._config.notifier_secret_dir, ref)
+        if value:
+            return value
+        env_key = f"{self._config.notifier_secret_env_prefix}{ref}".upper()
+        value = os.environ.get(env_key, "")
+        if value:
+            return value
+        value = load_notifier_secrets(self._config.notifier_secrets_file).get(ref, "")
+        if value:
+            return value
+        if self._config.notifier_secret_helper_cmd.strip():
+            try:
+                cmd = self._config.notifier_secret_helper_cmd.strip().split() + [ref]
+                proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+                return proc.stdout.strip()
+            except Exception:
+                return ""
+        return ""
 
 
 class WorkerLeaderLock:
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, stale_timeout_seconds: int = 30) -> None:
         self._path = path
-        self._fd: Any = None
+        self._control_path = path.with_suffix(".ctl") if path is not None else None
         self._owned = False
+        self._stale_timeout_seconds = max(5, int(stale_timeout_seconds))
+        self._owner_pid = os.getpid()
+        self._acquired_at = 0
 
-    def try_acquire(self) -> bool:
+    def _with_control_lock(self, fn):
+        if self._control_path is None:
+            return fn()
+        self._control_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._control_path.open("a+", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                return fn()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    def _read_state(self) -> dict[str, Any]:
+        if self._path is None or not self._path.exists():
+            return {}
+        try:
+            with self._path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_state(self, mode: str) -> None:
+        if self._path is None:
+            return
+        now = int(time.time())
+        state = {
+            "owner_pid": self._owner_pid,
+            "heartbeat_at": now,
+            "acquired_at": self._acquired_at or now,
+            "mode": mode,
+            "stale_timeout_seconds": self._stale_timeout_seconds,
+        }
+        tmp = self._path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(state, f, sort_keys=True)
+        os.replace(tmp, self._path)
+
+    def _state_stale(self, state: dict[str, Any], now_ts: int | None = None) -> bool:
+        if not state:
+            return True
+        now = int(time.time()) if now_ts is None else int(now_ts)
+        heartbeat = int(state.get("heartbeat_at", 0))
+        timeout = max(5, int(state.get("stale_timeout_seconds", self._stale_timeout_seconds)))
+        return heartbeat <= 0 or (now - heartbeat) > timeout
+
+    def try_acquire(self, mode: str = "worker") -> bool:
         if self._path is None:
             self._owned = True
+            if self._acquired_at == 0:
+                self._acquired_at = int(time.time())
             return True
-        if self._owned:
-            return True
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = self._path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._fd.seek(0)
-            self._fd.truncate()
-            self._fd.write(str(os.getpid()))
-            self._fd.flush()
+
+        def _acquire() -> bool:
+            state = self._read_state()
+            if state and not self._state_stale(state) and int(state.get("owner_pid", -1)) != self._owner_pid:
+                self._owned = False
+                return False
+            if self._acquired_at == 0:
+                self._acquired_at = int(time.time())
             self._owned = True
-        except OSError:
-            self._owned = False
-        return self._owned
+            self._write_state(mode)
+            return True
+
+        return bool(self._with_control_lock(_acquire))
+
+    def heartbeat(self, mode: str = "worker") -> None:
+        if not self._owned:
+            return
+        if self._path is None:
+            return
+
+        def _heartbeat() -> None:
+            state = self._read_state()
+            if state and int(state.get("owner_pid", -1)) != self._owner_pid and not self._state_stale(state):
+                self._owned = False
+                return
+            self._write_state(mode)
+
+        self._with_control_lock(_heartbeat)
 
     def release(self) -> None:
-        if self._fd is None:
+        if self._path is None:
+            self._owned = False
             return
-        try:
-            if self._owned:
-                fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._fd.close()
-            self._fd = None
+
+        def _release() -> None:
+            state = self._read_state()
+            if state and int(state.get("owner_pid", -1)) == self._owner_pid and self._path is not None and self._path.exists():
+                try:
+                    self._path.unlink()
+                except FileNotFoundError:
+                    pass
             self._owned = False
 
+        self._with_control_lock(_release)
+
     def status(self) -> dict[str, Any]:
-        owner_pid = ""
-        if self._path is not None and self._path.exists():
-            try:
-                owner_pid = self._path.read_text(encoding="utf-8").strip()
-            except Exception:
-                owner_pid = ""
+        state = self._read_state()
+        stale = self._state_stale(state)
         return {
             "lock_file": str(self._path) if self._path is not None else "",
             "owned": self._owned,
-            "owner_pid": owner_pid,
+            "owner_pid": str(state.get("owner_pid", "")),
+            "heartbeat_at": int(state.get("heartbeat_at", 0)) if state else 0,
+            "acquired_at": int(state.get("acquired_at", 0)) if state else 0,
+            "stale": stale,
+            "stale_timeout_seconds": self._stale_timeout_seconds,
+            "takeover_policy": "allow-after-stale-timeout",
+            "mode": str(state.get("mode", "")) if state else "",
         }
 
 
@@ -1234,6 +1354,7 @@ def _html_escape(value: Any) -> str:
 
 
 def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, attestor: BlindSigner, primary_operator_key_id: str, leader_lock: WorkerLeaderLock | None = None):
+    secret_backend = SecretBackendAdapter(config)
     class MintHandler(BaseHTTPRequestHandler):
         server_version = "selfcoin-mint/0.1"
 
@@ -1243,15 +1364,7 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
         def _notifier_secret(self, notifier: dict[str, Any], ref_key: str, direct_key: str) -> str:
             ref = str(notifier.get(ref_key, ""))
             if ref:
-                secret = load_notifier_secret_from_path(config.notifier_secret_dir, ref)
-                if secret:
-                    return secret
-                env_key = f"{config.notifier_secret_env_prefix}{ref}".upper()
-                if config.notifier_secret_env_prefix:
-                    env_value = os.environ.get(env_key, "")
-                    if env_value:
-                        return env_value
-                return load_notifier_secrets(config.notifier_secrets_file).get(ref, "")
+                return secret_backend.resolve(ref)
             return str(notifier.get(direct_key, ""))
 
         def _worker_status(self) -> dict[str, Any]:
@@ -2751,7 +2864,10 @@ def main() -> int:
     parser.add_argument("--notifier-secrets-file", default="", help="Optional JSON file mapping notifier secret refs to secret values.")
     parser.add_argument("--notifier-secret-dir", default="", help="Optional directory containing notifier secrets as individual files keyed by secret ref.")
     parser.add_argument("--notifier-secret-env-prefix", default="SELFCOIN_MINT_SECRET_", help="Optional env prefix used for notifier secret refs.")
+    parser.add_argument("--notifier-secret-backend", choices=["auto", "dir", "env", "json", "command"], default="auto", help="Secret backend used to resolve notifier secret refs.")
+    parser.add_argument("--notifier-secret-helper-cmd", default="", help="Optional helper command used when --notifier-secret-backend=command. The ref is appended as the last arg.")
     parser.add_argument("--worker-lock-file", default="", help="Optional file lock used to ensure only one process drains delivery jobs.")
+    parser.add_argument("--worker-stale-timeout-seconds", type=int, default=30, help="Worker lease timeout before takeover is allowed.")
     parser.add_argument("--mode", choices=["server", "worker", "all"], default="server", help="Run HTTP server, worker loop, or both.")
     args = parser.parse_args()
 
@@ -2773,12 +2889,15 @@ def main() -> int:
         notifier_secrets_file=Path(args.notifier_secrets_file) if args.notifier_secrets_file else None,
         notifier_secret_dir=Path(args.notifier_secret_dir) if args.notifier_secret_dir else None,
         notifier_secret_env_prefix=str(args.notifier_secret_env_prefix),
+        notifier_secret_backend=str(args.notifier_secret_backend),
+        notifier_secret_helper_cmd=str(args.notifier_secret_helper_cmd),
         worker_lock_file=Path(args.worker_lock_file) if args.worker_lock_file else None,
+        worker_stale_timeout_seconds=max(5, int(args.worker_stale_timeout_seconds)),
     )
     state = MintState(config.state_file)
     signer = BlindSigner.from_seed(config.signing_seed)
     attestor = BlindSigner.from_seed(config.signing_seed + ":attestation")
-    leader_lock = WorkerLeaderLock(config.worker_lock_file)
+    leader_lock = WorkerLeaderLock(config.worker_lock_file, config.worker_stale_timeout_seconds)
     handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id, leader_lock)
 
     if args.mode == "worker":
@@ -2788,6 +2907,7 @@ def main() -> int:
             while True:
                 if leader_lock.try_acquire():
                     retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
+                    leader_lock.heartbeat()
                 time.sleep(config.notifier_retry_interval_seconds)
         except KeyboardInterrupt:
             pass
@@ -2806,6 +2926,7 @@ def main() -> int:
                 try:
                     if leader_lock.try_acquire():
                         retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
+                        leader_lock.heartbeat()
                 except Exception:
                     continue
 

@@ -467,6 +467,7 @@ bool Node::init() {
 
   round_started_ms_ = now_unix() * 1000;
   last_finalized_progress_ms_ = now_unix() * 1000;
+  last_finalized_tip_poll_ms_ = 0;
 
   load_persisted_peers();
   load_addrman();
@@ -1168,6 +1169,8 @@ void Node::event_loop() {
 
       const std::uint64_t keepalive_interval_ms =
           std::max<std::uint64_t>(200, static_cast<std::uint64_t>(cfg_.idle_timeout_ms) / 3);
+      const std::uint64_t sync_poll_interval_ms =
+          std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
       for (int peer_id : p2p_.peer_ids()) {
         const auto info = p2p_.get_peer_info(peer_id);
         if (!info.established()) continue;
@@ -1176,6 +1179,17 @@ void Node::event_loop() {
           keepalive_peers.push_back(peer_id);
           last = now_ms;
         }
+      }
+
+      if (!cfg_.disable_p2p && established_peer_count() > 0 &&
+          now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms &&
+          now_ms >= last_finalized_tip_poll_ms_ + sync_poll_interval_ms) {
+        for (int peer_id : p2p_.peer_ids()) {
+          const auto info = p2p_.get_peer_info(peer_id);
+          if (!info.established()) continue;
+          keepalive_peers.push_back(peer_id);
+        }
+        last_finalized_tip_poll_ms_ = now_ms;
       }
 
       std::optional<crypto::VrfProof> local_vrf;
@@ -1222,7 +1236,19 @@ void Node::event_loop() {
       handle_propose(local_msg, false);
     }
 
-    for (int peer_id : keepalive_peers) send_ping(peer_id);
+    {
+      std::sort(keepalive_peers.begin(), keepalive_peers.end());
+      keepalive_peers.erase(std::unique(keepalive_peers.begin(), keepalive_peers.end()), keepalive_peers.end());
+    }
+    for (int peer_id : keepalive_peers) {
+      send_ping(peer_id);
+      const std::uint64_t now_ms = now_unix() * 1000;
+      const std::uint64_t sync_poll_interval_ms =
+          std::max<std::uint64_t>(3000, static_cast<std::uint64_t>(cfg_.network.round_timeout_ms));
+      if (!cfg_.disable_p2p && now_ms >= last_finalized_progress_ms_ + sync_poll_interval_ms) {
+        request_finalized_tip(peer_id);
+      }
+    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     if (!cfg_.disable_p2p) {

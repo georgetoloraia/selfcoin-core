@@ -322,6 +322,7 @@ class Node {
   std::uint64_t last_addrman_save_ms_{0};
   std::uint64_t last_summary_log_ms_{0};
   std::uint64_t last_finalized_progress_ms_{0};
+  std::uint64_t last_finalized_tip_poll_ms_{0};
   std::vector<std::string> bootstrap_peers_;
   std::vector<std::string> dns_seed_peers_;
   std::set<std::string> preflight_checked_seeds_;

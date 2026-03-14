@@ -2375,6 +2375,70 @@ TEST(test_late_joiner_requests_finalized_tip_and_catches_up) {
   n0.stop();
 }
 
+TEST(test_late_joiner_crosses_live_handoff_and_keeps_following) {
+  const std::string base = "/tmp/selfcoin_it_late_joiner_live_handoff";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+  const std::string gpath = base + "/genesis.json";
+  ASSERT_TRUE(write_empty_mainnet_bootstrap_genesis_file(gpath));
+
+  node::NodeConfig cfg0;
+  cfg0.node_id = 0;
+  cfg0.dns_seeds = false;
+  cfg0.db_path = base + "/node0";
+  cfg0.p2p_port = reserve_test_port();
+  if (cfg0.p2p_port == 0) return;
+  cfg0.genesis_path = gpath;
+  cfg0.allow_unsafe_genesis_override = true;
+
+  node::Node n0(cfg0);
+  if (!n0.init()) return;
+  n0.start();
+  const auto port0 = n0.p2p_port_for_test();
+  if (port0 == 0) {
+    n0.stop();
+    return;
+  }
+  ASSERT_TRUE(wait_for_tip(n0, 24, std::chrono::seconds(25)));
+
+  node::NodeConfig cfg1;
+  cfg1.node_id = 1;
+  cfg1.dns_seeds = false;
+  cfg1.db_path = base + "/node1";
+  cfg1.p2p_port = reserve_test_port();
+  if (cfg1.p2p_port == 0) {
+    n0.stop();
+    return;
+  }
+  cfg1.genesis_path = gpath;
+  cfg1.allow_unsafe_genesis_override = true;
+  cfg1.peers = {"127.0.0.1:" + std::to_string(port0)};
+
+  node::Node n1(cfg1);
+  if (!n1.init()) {
+    n0.stop();
+    return;
+  }
+  n1.start();
+
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height >= 24 && s1.height >= 24 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(30)));
+
+  const auto synced = n0.status().height;
+  ASSERT_TRUE(synced >= 24);
+  ASSERT_TRUE(wait_for([&]() {
+    const auto s0 = n0.status();
+    const auto s1 = n1.status();
+    return s0.height >= synced + 4 && s1.height >= synced + 4 && s0.height == s1.height && s0.tip_hash == s1.tip_hash;
+  }, std::chrono::seconds(20)));
+
+  n1.stop();
+  n0.stop();
+}
+
 TEST(test_fresh_joiner_defer_consensus_until_sync_and_still_catches_up) {
   const std::string base = "/tmp/selfcoin_it_joiner_defers_consensus_until_sync";
   std::filesystem::remove_all(base);

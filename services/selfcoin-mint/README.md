@@ -308,6 +308,7 @@ curl http://127.0.0.1:8080/attestations/reserves
   - `SELFCOIN_MINT_SECRET_<REF>` environment variables
   - `--notifier-secrets-file` as a fallback JSON map
 - Or from `--notifier-secret-helper-cmd <cmd>` when `--notifier-secret-backend=command`; the ref is appended as the final argument.
+- A helper implementation is included at [secret_helper.py](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/secret_helper.py).
 - `--notifier-secret-backend` may be `auto|dir|env|json|command`.
 - The state file stores refs, not the secret values themselves.
 
@@ -318,6 +319,8 @@ Example split units and env file template live in:
 - [services/selfcoin-mint/systemd/selfcoin-mint-server.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-server.service)
 - [services/selfcoin-mint/systemd/selfcoin-mint-worker.service](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint-worker.service)
 - [services/selfcoin-mint/systemd/selfcoin-mint.env.example](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.env.example)
+- [services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/selfcoin-mint.tmpfiles.conf)
+- [services/selfcoin-mint/systemd/install_selfcoin_mint.sh](/home/greendragon/Desktop/selfcoin-core/services/selfcoin-mint/systemd/install_selfcoin_mint.sh)
 - Event entries now include per-notifier delivery status in their `deliveries` map.
 - Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
 - Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.

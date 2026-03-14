@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -116,6 +117,20 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(jobs[0]["notifier_id"], "ops-webhook")
             self.assertEqual(jobs[0]["attempts"], 2)
             self.assertEqual(jobs[0]["last_error"], "boom")
+
+    def test_secret_helper_resolves_from_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            secret_dir = Path(td) / "secrets"
+            secret_dir.mkdir(parents=True, exist_ok=True)
+            (secret_dir / "ops_token").write_text("topsecret\n", encoding="utf-8")
+            helper = Path(__file__).with_name("secret_helper.py")
+            proc = subprocess.run(
+                ["python3", str(helper), "--dir", str(secret_dir), "ops_token"],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(proc.stdout.strip(), "topsecret")
 
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:

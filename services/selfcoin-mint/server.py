@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import shlex
 import ssl
 import subprocess
 import threading
@@ -1145,7 +1146,7 @@ class SecretBackendAdapter:
             if not helper:
                 return ""
             try:
-                cmd = helper.split() + [ref]
+                cmd = shlex.split(helper) + [ref]
                 proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
                 return proc.stdout.strip()
             except Exception:
@@ -1163,7 +1164,7 @@ class SecretBackendAdapter:
             return value
         if self._config.notifier_secret_helper_cmd.strip():
             try:
-                cmd = self._config.notifier_secret_helper_cmd.strip().split() + [ref]
+                cmd = shlex.split(self._config.notifier_secret_helper_cmd.strip()) + [ref]
                 proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
                 return proc.stdout.strip()
             except Exception:
@@ -1225,25 +1226,37 @@ class WorkerLeaderLock:
         timeout = max(5, int(state.get("stale_timeout_seconds", self._stale_timeout_seconds)))
         return heartbeat <= 0 or (now - heartbeat) > timeout
 
-    def try_acquire(self, mode: str = "worker") -> bool:
+    def acquire_status(self, mode: str = "worker") -> dict[str, Any]:
         if self._path is None:
-            self._owned = True
             if self._acquired_at == 0:
                 self._acquired_at = int(time.time())
-            return True
+            self._owned = True
+            return {"acquired": True, "takeover": False, "stale_owner_pid": "", "reason": "no-lock-file"}
 
-        def _acquire() -> bool:
+        def _acquire() -> dict[str, Any]:
             state = self._read_state()
-            if state and not self._state_stale(state) and int(state.get("owner_pid", -1)) != self._owner_pid:
+            stale = self._state_stale(state)
+            current_owner = int(state.get("owner_pid", -1)) if state else -1
+            stale_owner_pid = str(state.get("owner_pid", "")) if stale and state else ""
+            if state and not stale and current_owner != self._owner_pid:
                 self._owned = False
-                return False
+                return {"acquired": False, "takeover": False, "stale_owner_pid": "", "reason": "lease-held"}
+            takeover = bool(state) and stale and current_owner != self._owner_pid
             if self._acquired_at == 0:
                 self._acquired_at = int(time.time())
             self._owned = True
             self._write_state(mode)
-            return True
+            return {
+                "acquired": True,
+                "takeover": takeover,
+                "stale_owner_pid": stale_owner_pid,
+                "reason": "takeover" if takeover else "acquired",
+            }
 
-        return bool(self._with_control_lock(_acquire))
+        return dict(self._with_control_lock(_acquire))
+
+    def try_acquire(self, mode: str = "worker") -> bool:
+        return bool(self.acquire_status(mode).get("acquired", False))
 
     def heartbeat(self, mode: str = "worker") -> None:
         if not self._owned:
@@ -2829,6 +2842,26 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
     return MintHandler
 
 
+def emit_worker_lease_events(handler: Any, state: MintState, acquire_info: dict[str, Any], mode: str, seen_takeover: set[str]) -> None:
+    if not bool(acquire_info.get("acquired", False)):
+        return
+    stale_owner = str(acquire_info.get("stale_owner_pid", ""))
+    if bool(acquire_info.get("takeover", False)):
+        key = f"{mode}:{stale_owner}"
+        if key in seen_takeover:
+            return
+        seen_takeover.add(key)
+        handler._record_event(  # type: ignore[attr-defined]
+            "worker.lease_takeover",
+            {
+                "mode": mode,
+                "stale_owner_pid": stale_owner,
+                "lock_file": handler._worker_status().get("lock_file", ""),  # type: ignore[attr-defined]
+                "takeover_policy": "allow-after-stale-timeout",
+            },
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal selfcoin-mint boundary service")
     parser.add_argument("--host", default="127.0.0.1")
@@ -2900,12 +2933,16 @@ def main() -> int:
     leader_lock = WorkerLeaderLock(config.worker_lock_file, config.worker_stale_timeout_seconds)
     handler_cls = make_handler(config, state, signer, attestor, primary_operator_key_id, leader_lock)
 
+    seen_takeover: set[str] = set()
+
     if args.mode == "worker":
         retry_handler = handler_cls.__new__(handler_cls)
         print("selfcoin-mint worker started", flush=True)
         try:
             while True:
-                if leader_lock.try_acquire():
+                acquire_info = leader_lock.acquire_status("worker")
+                if acquire_info.get("acquired", False):
+                    emit_worker_lease_events(retry_handler, state, acquire_info, "worker", seen_takeover)
                     retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
                     leader_lock.heartbeat()
                 time.sleep(config.notifier_retry_interval_seconds)
@@ -2924,7 +2961,9 @@ def main() -> int:
             retry_handler = handler_cls.__new__(handler_cls)
             while not stop_retry.wait(config.notifier_retry_interval_seconds):
                 try:
-                    if leader_lock.try_acquire():
+                    acquire_info = leader_lock.acquire_status("all")
+                    if acquire_info.get("acquired", False):
+                        emit_worker_lease_events(retry_handler, state, acquire_info, "all", seen_takeover)
                         retry_handler._process_delivery_jobs()  # type: ignore[attr-defined]
                         leader_lock.heartbeat()
                 except Exception:

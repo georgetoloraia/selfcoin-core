@@ -349,6 +349,7 @@ class MintIntegrationTests(unittest.TestCase):
                     worker_status = http_get_json(f"http://127.0.0.1:{port}/monitoring/worker")
                     self.assertEqual(worker_status["lock_file"], str(lock_path))
                     self.assertTrue(worker_status["owner_pid"])
+                    self.assertEqual(worker_status["takeover_policy"], "allow-after-stale-timeout")
 
                     deposit_cmd = [
                         str(CLI),
@@ -750,6 +751,7 @@ class MintIntegrationTests(unittest.TestCase):
                             break
                         time.sleep(0.1)
                     self.assertIsNotNone(replay_event)
+                    self.assertTrue(all(item["event_type"] != "worker.lease_takeover" for item in history_after_replay["events"]))
 
                     incident_cmd = [
                         str(CLI),

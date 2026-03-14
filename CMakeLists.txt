@@ -4,11 +4,15 @@ project(selfcoin_core LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 option(SELFCOIN_SANITIZE "Enable ASan/UBSan instrumentation" OFF)
 option(SELFCOIN_BUILD_FUZZ "Build fuzz harness executables" ON)
 option(SELFCOIN_STRICT_WARNINGS "Enable strict warning flags" OFF)
 
 find_package(OpenSSL REQUIRED)
+find_package(Qt5 COMPONENTS Widgets QUIET)
 
 # Optional libs: RocksDB and libsodium. Build falls back gracefully if unavailable.
 find_library(SODIUM_LIB sodium)
@@ -62,6 +66,7 @@ add_library(selfcoin_core
   src/p2p/messages.cpp
   src/p2p/peer_manager.cpp
   src/node/node.cpp
+  src/lightserver/client.cpp
   src/lightserver/server.cpp
 )
 
@@ -105,6 +110,20 @@ target_link_libraries(selfcoin-lightserver PRIVATE selfcoin_core)
 if(SELFCOIN_SANITIZE)
   target_compile_options(selfcoin-lightserver PRIVATE ${SC_SAN_FLAGS})
   target_link_options(selfcoin-lightserver PRIVATE -fsanitize=address,undefined)
+endif()
+
+if(Qt5Widgets_FOUND)
+  add_executable(selfcoin-wallet
+    apps/selfcoin-wallet/main.cpp
+    apps/selfcoin-wallet/wallet_window.cpp
+  )
+  target_link_libraries(selfcoin-wallet PRIVATE selfcoin_core Qt5::Widgets)
+  if(SELFCOIN_SANITIZE)
+    target_compile_options(selfcoin-wallet PRIVATE ${SC_SAN_FLAGS})
+    target_link_options(selfcoin-wallet PRIVATE -fsanitize=address,undefined)
+  endif()
+else()
+  message(STATUS "Qt5 Widgets not found; skipping selfcoin-wallet target")
 endif()
 
 add_executable(selfcoin-tests

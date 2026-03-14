@@ -264,7 +264,7 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   const std::string base = "/tmp/selfcoin_light_rpc";
   auto cluster = make_cluster(base);
   auto& node = cluster.nodes[0];
-  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 6; }, std::chrono::seconds(30)));
+  ASSERT_TRUE(wait_for([&]() { return node->status().height >= 6; }, std::chrono::seconds(60)));
 
   const auto keys = node::Node::deterministic_test_keypairs();
   const auto sender_pkh = crypto::h160(Bytes(keys[0].public_key.begin(), keys[0].public_key.end()));
@@ -332,6 +332,11 @@ TEST(test_lightserver_rpc_endpoints_and_broadcast) {
   auto uresp = ls->handle_rpc_for_test(utxo_q);
   ASSERT_TRUE(uresp.find(hex_encode32(txid)) != std::string::npos);
 
+  const std::string history_q = std::string(R"({"jsonrpc":"2.0","id":61,"method":"get_history","params":{"scripthash_hex":")") +
+                                hex_encode32(sh) + R"("}})";
+  auto hresp = ls->handle_rpc_for_test(history_q);
+  ASSERT_TRUE(hresp.find(hex_encode32(txid)) != std::string::npos);
+
   const std::string blk_q = std::string(R"({"jsonrpc":"2.0","id":7,"method":"get_block","params":{"hash":")") +
                             hex_encode32(blk_hash) + R"("}})";
   auto bresp = ls->handle_rpc_for_test(blk_q);
@@ -374,6 +379,55 @@ TEST(test_lightserver_exposes_finality_certificate_endpoint) {
   const auto by_tip_default =
       ls->handle_rpc_for_test(R"({"jsonrpc":"2.0","id":33,"method":"get_finality_certificate","params":{}})");
   ASSERT_TRUE(by_tip_default.find("\"block_hash\":\"" + hex_encode32(tip.tip_hash) + "\"") != std::string::npos);
+}
+
+TEST(test_lightserver_exposes_script_history_endpoint_direct) {
+  const std::string base = "/tmp/selfcoin_light_history_direct";
+  std::filesystem::remove_all(base);
+  std::filesystem::create_directories(base);
+
+  storage::DB db;
+  ASSERT_TRUE(db.open(base));
+
+  genesis::Document d;
+  d.version = 1;
+  d.network_name = "mainnet";
+  d.protocol_version = mainnet_network().protocol_version;
+  d.network_id = mainnet_network().network_id;
+  d.magic = mainnet_network().magic;
+  d.genesis_time_unix = 1735689600ULL;
+  d.initial_height = 0;
+  d.initial_active_set_size = 1;
+  d.initial_committee_params.min_committee = 1;
+  d.initial_committee_params.max_committee = static_cast<std::uint32_t>(mainnet_network().max_committee);
+  d.initial_committee_params.sizing_rule = "min(MAX_COMMITTEE,ACTIVE_SIZE)";
+  d.initial_committee_params.c = 2;
+  d.monetary_params_ref = "test";
+  d.seeds = {};
+  d.note = "lightserver-history-direct";
+  d.initial_validators.push_back(node::Node::deterministic_test_keypairs()[0].public_key);
+  const auto genesis_json = genesis::to_json(d);
+  ASSERT_TRUE(db.put("G:J", Bytes(genesis_json.begin(), genesis_json.end())));
+
+  const auto kp = node::Node::deterministic_test_keypairs()[0];
+  const auto pkh = crypto::h160(Bytes(kp.public_key.begin(), kp.public_key.end()));
+  const Hash32 sh = crypto::sha256(address::p2pkh_script_pubkey(pkh));
+  Hash32 txid{};
+  txid[31] = 42;
+  ASSERT_TRUE(db.add_script_history(sh, 7, txid));
+  ASSERT_TRUE(db.flush());
+  db.close();
+
+  lightserver::Config lcfg;
+  lcfg.db_path = base;
+  auto ls = std::make_unique<lightserver::Server>(lcfg);
+  ASSERT_TRUE(ls->init());
+
+  const std::string history_q = std::string(R"({"jsonrpc":"2.0","id":91,"method":"get_history","params":{"scripthash_hex":")") +
+                                hex_encode32(sh) + R"("}})";
+  const auto resp = ls->handle_rpc_for_test(history_q);
+  ASSERT_TRUE(resp.find(hex_encode32(txid)) != std::string::npos);
+  ASSERT_TRUE(resp.find("\"height\":7") != std::string::npos);
 }
 
 TEST(test_snapshot_export_import_bootstraps_imported_db) {

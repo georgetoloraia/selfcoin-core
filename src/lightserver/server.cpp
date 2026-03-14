@@ -646,6 +646,22 @@ std::string Server::handle_rpc_body(const std::string& body) {
     return make_result(id, oss.str());
   }
 
+  if (*method == "get_history") {
+    auto sh_hex = find_string(body, "scripthash_hex");
+    if (!sh_hex) return make_error(id, -32602, "missing scripthash_hex");
+    auto sh = parse_hex32(*sh_hex);
+    if (!sh) return make_error(id, -32602, "bad scripthash");
+    auto history = db_.get_script_history(*sh);
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < history.size(); ++i) {
+      if (i) oss << ",";
+      oss << "{\"txid\":\"" << hex_encode32(history[i].txid) << "\",\"height\":" << history[i].height << "}";
+    }
+    oss << "]";
+    return make_result(id, oss.str());
+  }
+
   if (*method == "get_committee") {
     auto h = find_u64(body, "height");
     if (!h) return make_error(id, -32602, "missing height");

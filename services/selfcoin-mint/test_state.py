@@ -22,6 +22,80 @@ server = load_server_module()
 
 
 class MintStateTests(unittest.TestCase):
+    def test_policy_persists_and_blocks_redemptions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            state.register_deposit(
+                {
+                    "chain": "mainnet",
+                    "deposit_txid": "11" * 32,
+                    "deposit_vout": 1,
+                    "mint_id": "22" * 32,
+                    "recipient_pubkey_hash": "33" * 20,
+                    "amount": 1000,
+                    "mint_deposit_ref": "ref-1",
+                }
+            )
+            issuance = state.record_issuance("ref-1", ["aa"], ["bb"], [1000])
+            policy = state.update_policy(True, "reserve low")
+            self.assertTrue(policy["redemptions_paused"])
+            self.assertEqual(policy["pause_reason"], "reserve low")
+
+            reloaded = server.MintState(state_path)
+            self.assertTrue(reloaded.policy()["redemptions_paused"])
+            with self.assertRaises(ValueError):
+                reloaded.create_redemption(
+                    {
+                        "redemption_batch_id": "batch-1",
+                        "notes": issuance["note_refs"],
+                        "redeem_address": "sc1example",
+                        "amount": 1000,
+                        "state": "pending",
+                        "l1_txid": "",
+                    }
+                )
+
+    def test_event_log_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            self.assertEqual(event["event_type"], "policy.auto_pause")
+
+            reloaded = server.MintState(state_path)
+            events = reloaded.list_events(10)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["payload"]["reason"], "reserve exhaustion risk")
+
+    def test_event_ack_silence_and_notifier_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            event = state.append_event("policy.auto_pause", {"reason": "reserve exhaustion risk"})
+            acked = state.acknowledge_event(event["event_id"], "seen")
+            self.assertTrue(acked["acknowledged"])
+            self.assertEqual(acked["ack_note"], "seen")
+
+            silence = state.add_silence("policy.auto_pause", 4102444800, "maintenance")
+            self.assertEqual(silence["event_type"], "policy.auto_pause")
+            self.assertTrue(state.event_silenced("policy.auto_pause"))
+
+            notifier = state.upsert_notifier(
+                {
+                    "notifier_id": "ops-webhook",
+                    "kind": "webhook",
+                    "target": "http://127.0.0.1:9/hook",
+                    "enabled": True,
+                }
+            )
+            self.assertEqual(notifier["notifier_id"], "ops-webhook")
+
+            reloaded = server.MintState(state_path)
+            self.assertEqual(reloaded.list_events(10)[0]["ack_note"], "seen")
+            self.assertEqual(reloaded.list_silences(True)[0]["reason"], "maintenance")
+            self.assertEqual(reloaded.list_notifiers()[0]["kind"], "webhook")
+
     def test_register_deposit_persists_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_path = Path(td) / "state.json"
@@ -174,6 +248,32 @@ class MintStateTests(unittest.TestCase):
             self.assertEqual(len(audit["issuances"]), 1)
             self.assertEqual(attest["mint_id"], "22" * 32)
             self.assertTrue(attest["state_hash"])
+
+    def test_consolidation_persists_and_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_path = Path(td) / "state.json"
+            state = server.MintState(state_path)
+            item = state.record_consolidation(
+                {
+                    "consolidation_id": "cons-1",
+                    "state": "broadcast",
+                    "l1_txid": "44" * 32,
+                    "selected_utxos": [{"txid": "55" * 32, "vout": 0, "value": 2000}],
+                    "total_input_value": 2000,
+                    "output_value": 1000,
+                    "fee": 1000,
+                    "coin_selection_policy": "smallest-first-consolidation",
+                }
+            )
+            self.assertEqual(item["state"], "broadcast")
+            reloaded = server.MintState(state_path)
+            got = reloaded.get_consolidation("cons-1")
+            self.assertIsNotNone(got)
+            self.assertEqual(got["l1_txid"], "44" * 32)
+            reloaded.update_consolidation("cons-1", "finalized", "44" * 32)
+            audit = reloaded.audit_export("22" * 32)
+            self.assertEqual(len(audit["consolidations"]), 1)
+            self.assertEqual(audit["consolidations"][0]["state"], "finalized")
 
     def test_blind_signer_signs_and_verifies(self) -> None:
         signer = server.BlindSigner.from_seed("seed-x", bits=256)

@@ -45,10 +45,22 @@ Suggested example HTTP endpoints:
 - `POST /issuance/blind`
 - `POST /redemptions/create`
 - `POST /redemptions/approve_broadcast`
+- `POST /reserves/consolidate`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
+- `POST /policy/redemptions`
 - `GET /accounting/summary`
 - `GET /reserves`
+- `GET /reserves/consolidate_plan`
+- `GET /policy/redemptions`
+- `GET /monitoring/reserve_health`
+- `GET /monitoring/alerts/history`
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
+- `GET /monitoring/metrics`
 - `GET /operator/key`
 - `GET /attestations/reserves`
 - `GET /audit/export`
@@ -175,6 +187,69 @@ then signed operators can call `POST /redemptions/approve_broadcast` to:
 
 Later `POST /redemptions/status` and the reserve/audit views reconcile `broadcast -> finalized` via observed L1 confirmation depth.
 
+Signed operators may also call `POST /reserves/consolidate` to:
+1. select a bounded set of small reserve UTXOs using the consolidation policy
+2. build a self-transfer consolidation transaction back to the reserve address
+3. broadcast it through lightserver
+4. persist the consolidation record for later audit/finalization reporting
+
+Signed operators may call `GET /reserves/consolidate_plan` to inspect the
+selected reserve UTXOs, fee, output value, and estimated post-action fragmentation
+without broadcasting.
+
+Signed operators may call `POST /policy/redemptions` to pause or resume new
+redemption creation. `GET /policy/redemptions` exposes the current policy plus
+auto-pause recommendations and threshold metadata.
+
+`GET /monitoring/reserve_health` returns a compact monitoring/export summary with:
+- status: `healthy|warn|critical`
+- reserve exhaustion / fragmentation / max-input alerts
+- current auto-pause recommendation
+- live reserve inventory counters
+
+`GET /monitoring/alerts/history` returns the recent persisted alert/policy event log.
+
+Signed operators may call:
+- `POST /monitoring/events/ack` to acknowledge an event
+- `POST /monitoring/events/silence` to silence an event type until a timestamp
+- `POST /monitoring/events/policy` to update retention/export policy
+- `POST /monitoring/notifiers` to upsert notifier hooks
+
+The service also exposes:
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
+
+`GET /monitoring/metrics` returns Prometheus-style counters/gauges for:
+- available reserve
+- reserve balance
+- wallet UTXO counts
+- pending spends / consolidations
+- alert booleans
+- redemptions paused / auto-pause enabled
+- current health status
+- event log size
+- dead-letter count
+- pending notifier delivery count
+
+Supported notifier hooks:
+- `webhook`: POST `{ "event": ... }` JSON to a target URL
+- `alertmanager`: POST alert-style JSON to a target URL
+- `email_spool`: write `.eml` files into a configured spool directory
+
+Notifier configuration includes:
+- `retry_max_attempts`
+- `retry_backoff_seconds`
+
+When a notifier fails:
+- the event stores per-notifier delivery status, attempt count, error text, and next retry time
+- retries are attempted on subsequent service activity
+- once the retry budget is exhausted, the delivery is moved into `dead_letters`
+
+`GET /monitoring/incidents/export` returns a signed incident timeline suitable for audit/ops review.
+
 ### 6. Reserve and accounting views
 
 `GET /reserves` returns the mint's deposit-backed reserve summary.
@@ -189,6 +264,9 @@ When reserve wallet discovery is configured, it also returns live reserve-wallet
 - `wallet_synced_at`
 
 Broadcasted redemption inputs are removed from spendable reserve inventory. The in-flight commitment is reported explicitly through `pending_spend_commitment_count` and `pending_spend_input_count` during the `broadcast -> finalized` window.
+When the lightserver no longer reports the selected reserve outpoints, the
+service records that network-side spend observation and reports it via
+`pending_spend_network_observed_count` and `pending_consolidation_network_observed_count`.
 
 Recommended coin-selection policy for the external mint:
 - smallest sufficient input set
@@ -231,6 +309,29 @@ selfcoin-cli mint_deposit_create \
 ```
 
 This creates a normal signed L1 transaction with one `SCMINTDEP` output.
+
+Related operator commands:
+
+```bash
+selfcoin-cli mint_redemptions_policy --url http://host:port/policy/redemptions
+selfcoin-cli mint_redemptions_pause --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex> --reason "reserve low"
+selfcoin-cli mint_redemptions_resume --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_redemptions_auto_pause_enable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_redemptions_auto_pause_disable --url http://host:port/policy/redemptions --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_alert_ack --url http://host:port/monitoring/events/ack --event-id <id> --operator-key-id <id> --operator-secret-hex <hex> [--note <text>]
+selfcoin-cli mint_alert_silence --url http://host:port/monitoring/events/silence --event-type <type> --until <unix> --operator-key-id <id> --operator-secret-hex <hex> [--reason <text>]
+selfcoin-cli mint_alert_silences --url http://host:port/monitoring/events/silences
+selfcoin-cli mint_event_policy --url http://host:port/monitoring/events/policy
+selfcoin-cli mint_event_policy_update --url http://host:port/monitoring/events/policy --operator-key-id <id> --operator-secret-hex <hex> [--retention-limit <n>] [--export-include-acknowledged true|false]
+selfcoin-cli mint_notifier_list --url http://host:port/monitoring/notifiers
+selfcoin-cli mint_notifier_upsert --url http://host:port/monitoring/notifiers --operator-key-id <id> --operator-secret-hex <hex> --notifier-id <id> --kind webhook|alertmanager|email_spool --target <value> [--retry-max-attempts <n>] [--retry-backoff-seconds <n>]
+selfcoin-cli mint_dead_letters --url http://host:port/monitoring/dead_letters
+selfcoin-cli mint_incident_timeline_export --url http://host:port/monitoring/incidents/export
+selfcoin-cli mint_reserve_consolidation_plan --url http://host:port/reserves/consolidate_plan --operator-key-id <id> --operator-secret-hex <hex>
+selfcoin-cli mint_reserve_health --url http://host:port/monitoring/reserve_health
+selfcoin-cli mint_reserve_metrics --url http://host:port/monitoring/metrics
+selfcoin-cli mint_alert_history --url http://host:port/monitoring/alerts/history
+```
 
 To call the external mint boundary from this repo:
 

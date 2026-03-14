@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,21 @@ def http_get_json(url: str, headers: dict[str, str] | None = None) -> dict:
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def http_post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> tuple[int, dict]:
+    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def load_server_module():
@@ -148,17 +164,64 @@ class FakeLightserver:
         self._thread.join(timeout=5)
 
 
+class FakeNotifierSink:
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.received: list[dict] = []
+        self._server = ThreadingHTTPServer(("127.0.0.1", port), self._make_handler())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    def _make_handler(self):
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt: str, *args) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                payload = json.loads(raw.decode("utf-8"))
+                outer.received.append({"path": self.path, "payload": payload})
+                if self.path == "/fail":
+                    self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    return
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        return Handler
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
 class MintIntegrationTests(unittest.TestCase):
     def test_cli_roundtrip_against_live_service(self) -> None:
         port = free_port()
         lightserver_port = free_port()
+        notifier_port = free_port()
         lightserver = FakeLightserver(lightserver_port)
+        notifier = FakeNotifierSink(notifier_port)
         lightserver.start()
+        notifier.start()
         operator_key_id = "integration-operator"
         operator_secret_hex = "11" * 32
         try:
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
+                email_spool = Path(td) / "email-spool"
                 reserve_wallet = Path(td) / "reserve-wallet.json"
                 reserve_privkey = "55" * 32
                 wallet_cmd = [
@@ -274,6 +337,90 @@ class MintIntegrationTests(unittest.TestCase):
                     lines = dict(line.split("=", 1) for line in dep.stdout.strip().splitlines())
                     mint_deposit_ref = lines["mint_deposit_ref"]
 
+                    policy_before = http_get_json(f"http://127.0.0.1:{port}/policy/redemptions")
+                    self.assertFalse(policy_before.get("redemptions_paused", False))
+                    self.assertFalse(policy_before.get("auto_pause_recommended", False))
+                    self.assertEqual(policy_before["reserve_health"]["status"], "healthy")
+
+                    pause_cmd = [
+                        str(CLI),
+                        "mint_redemptions_pause",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--reason",
+                        "reserve low",
+                    ]
+                    paused = subprocess.run(pause_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    paused_json = json.loads(paused.stdout)
+                    self.assertTrue(paused_json["redemptions_paused"])
+
+                    blocked_status, blocked_body = http_post_json(
+                        f"http://127.0.0.1:{port}/redemptions/create",
+                        {
+                            "notes": ["note-blocked"],
+                            "redeem_address": reserve_address,
+                            "amount": 1000,
+                        },
+                    )
+                    self.assertEqual(blocked_status, HTTPStatus.CONFLICT)
+                    self.assertIn("redemptions paused", blocked_body["error"])
+
+                    resume_cmd = [
+                        str(CLI),
+                        "mint_redemptions_resume",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    resumed = subprocess.run(resume_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    resumed_json = json.loads(resumed.stdout)
+                    self.assertFalse(resumed_json["redemptions_paused"])
+
+                    enable_auto_pause_cmd = [
+                        str(CLI),
+                        "mint_redemptions_auto_pause_enable",
+                        "--url",
+                        f"http://127.0.0.1:{port}/policy/redemptions",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    enabled = subprocess.run(enable_auto_pause_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    enabled_json = json.loads(enabled.stdout)
+                    self.assertTrue(enabled_json["auto_pause_enabled"])
+
+                    for notifier_id, kind, target, extra in [
+                        ("ops-webhook", "webhook", f"http://127.0.0.1:{notifier_port}/webhook", []),
+                        ("ops-alertmanager", "alertmanager", f"http://127.0.0.1:{notifier_port}/alertmanager", []),
+                        ("ops-email", "email_spool", str(email_spool), ["--email-to", "ops@example.test", "--email-from", "mint@example.test"]),
+                        ("ops-fail", "webhook", f"http://127.0.0.1:{notifier_port}/fail", ["--retry-max-attempts", "1", "--retry-backoff-seconds", "1"]),
+                    ]:
+                        notifier_cmd = [
+                            str(CLI),
+                            "mint_notifier_upsert",
+                            "--url",
+                            f"http://127.0.0.1:{port}/monitoring/notifiers",
+                            "--operator-key-id",
+                            operator_key_id,
+                            "--operator-secret-hex",
+                            operator_secret_hex,
+                            "--notifier-id",
+                            notifier_id,
+                            "--kind",
+                            kind,
+                            "--target",
+                            target,
+                        ] + extra
+                        subprocess.run(notifier_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+
                     pubkey = http_get_json(f"http://127.0.0.1:{port}/mint/key")
                     n = int(pubkey["modulus_hex"], 16)
                     e = int(pubkey["public_exponent"])
@@ -303,6 +450,21 @@ class MintIntegrationTests(unittest.TestCase):
                     note_ref = note_ref_line.split("=", 1)[1]
                     unblinded = (signed_blind * pow(r, -1, n)) % n
                     self.assertEqual(pow(unblinded, e, n), message)
+
+                    plan_cmd = [
+                        str(CLI),
+                        "mint_reserve_consolidation_plan",
+                        "--url",
+                        f"http://127.0.0.1:{port}/reserves/consolidate_plan",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    plan = subprocess.run(plan_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    plan_json = json.loads(plan.stdout)
+                    self.assertFalse(plan_json["available"])
+                    self.assertIn("no consolidation candidates available", plan_json["reason"])
 
                     accounting = http_get_json(f"http://127.0.0.1:{port}/accounting/summary")
                     self.assertEqual(accounting["total_deposited"], 100000)
@@ -381,6 +543,7 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(reserves["available_reserve"], 0)
                     self.assertEqual(reserves["pending_spend_commitment_count"], 1)
                     self.assertEqual(reserves["pending_spend_input_count"], 2)
+                    self.assertEqual(reserves["pending_spend_network_observed_count"], 1)
                     self.assertEqual(reserves["wallet_utxo_count"], 0)
                     self.assertEqual(reserves["wallet_utxo_value"], 0)
                     self.assertEqual(reserves["wallet_locked_utxo_count"], 0)
@@ -389,6 +552,123 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertFalse(reserves["recommend_consolidation"])
                     self.assertFalse(reserves["alert_fragmentation_threshold_breach"])
                     self.assertTrue(reserves["alert_reserve_exhaustion_risk"])
+                    self.assertTrue(reserves["auto_pause_recommended"])
+                    self.assertEqual(reserves["reserve_health"]["status"], "critical")
+
+                    policy_after_risk = http_get_json(f"http://127.0.0.1:{port}/policy/redemptions")
+                    self.assertTrue(policy_after_risk["redemptions_paused"])
+                    self.assertTrue(policy_after_risk["auto_pause_enabled"])
+                    self.assertIn("auto:", policy_after_risk["pause_reason"])
+
+                    alert_history = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                    self.assertGreaterEqual(len(alert_history["events"]), 1)
+                    self.assertEqual(alert_history["events"][0]["event_type"], "policy.auto_pause")
+                    self.assertGreaterEqual(len(notifier.received), 2)
+                    self.assertIn("/webhook", {item["path"] for item in notifier.received})
+                    self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
+                    self.assertIn("/fail", {item["path"] for item in notifier.received})
+                    self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
+                    auto_pause_event = alert_history["events"][0]
+                    self.assertEqual(auto_pause_event["deliveries"]["ops-fail"]["status"], "dead_letter")
+
+                    metrics_cmd = [
+                        str(CLI),
+                        "mint_reserve_metrics",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/metrics",
+                    ]
+                    metrics = subprocess.run(metrics_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    self.assertIn("selfcoin_mint_auto_pause_recommended 1", metrics.stdout)
+                    self.assertIn("selfcoin_mint_redemptions_paused 1", metrics.stdout)
+                    self.assertIn("selfcoin_mint_dead_letter_count 2", metrics.stdout)
+
+                    ack_cmd = [
+                        str(CLI),
+                        "mint_alert_ack",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/ack",
+                        "--event-id",
+                        alert_history["events"][0]["event_id"],
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--note",
+                        "seen",
+                    ]
+                    subprocess.run(ack_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    history_after_ack = http_get_json(f"http://127.0.0.1:{port}/monitoring/alerts/history")
+                    acked = next(item for item in history_after_ack["events"] if item["event_id"] == alert_history["events"][0]["event_id"])
+                    self.assertTrue(acked["acknowledged"])
+
+                    silence_cmd = [
+                        str(CLI),
+                        "mint_alert_silence",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/silence",
+                        "--event-type",
+                        "policy.auto_pause",
+                        "--until",
+                        "4102444800",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--reason",
+                        "maintenance",
+                    ]
+                    subprocess.run(silence_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    silences_cmd = [
+                        str(CLI),
+                        "mint_alert_silences",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/silences",
+                    ]
+                    silences = subprocess.run(silences_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    silences_json = json.loads(silences.stdout)
+                    self.assertEqual(silences_json["silences"][0]["event_type"], "policy.auto_pause")
+
+                    event_policy_update_cmd = [
+                        str(CLI),
+                        "mint_event_policy_update",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/events/policy",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                        "--retention-limit",
+                        "64",
+                        "--export-include-acknowledged",
+                        "false",
+                    ]
+                    subprocess.run(event_policy_update_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    event_policy = http_get_json(f"http://127.0.0.1:{port}/monitoring/events/policy")
+                    self.assertEqual(event_policy["event_retention_limit"], 64)
+                    self.assertFalse(event_policy["export_include_acknowledged"])
+
+                    dead_letters_cmd = [
+                        str(CLI),
+                        "mint_dead_letters",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/dead_letters",
+                    ]
+                    dead_letters = subprocess.run(dead_letters_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    dead_letters_json = json.loads(dead_letters.stdout)
+                    self.assertGreaterEqual(len(dead_letters_json["dead_letters"]), 2)
+                    self.assertTrue(all(item["notifier_id"] == "ops-fail" for item in dead_letters_json["dead_letters"]))
+
+                    incident_cmd = [
+                        str(CLI),
+                        "mint_incident_timeline_export",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/incidents/export",
+                    ]
+                    incident = subprocess.run(incident_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    incident_json = json.loads(incident.stdout)
+                    self.assertTrue(incident_json["signature_hex"])
+                    self.assertGreaterEqual(len(incident_json["payload"]["dead_letters"]), 1)
+                    self.assertGreaterEqual(len(incident_json["payload"]["events"]), 1)
                     l1_txid = status_lines["l1_txid"]
                     lightserver.tip_height = 20
                     lightserver.tx_heights[l1_txid] = 20
@@ -398,6 +678,9 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(finalized_lines["state"], "finalized")
                     self.assertEqual(finalized_lines["l1_txid"], l1_txid)
                     self.assertEqual(finalized_lines["amount"], "100000")
+
+                    reserves_after_final = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                    self.assertEqual(reserves_after_final["pending_spend_commitment_count"], 0)
 
                     audit_cmd = [
                         str(CLI),
@@ -433,7 +716,88 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertEqual(attest_json["payload"]["wallet_locked_utxo_count"], 0)
                     self.assertEqual(attest_json["payload"]["finalized_redemption_amount"], 100000)
                     self.assertTrue(attest_json["payload"]["alert_reserve_exhaustion_risk"])
+                    self.assertTrue(attest_json["payload"]["auto_pause_recommended"])
+                    self.assertEqual(attest_json["payload"]["reserve_health"]["status"], "critical")
                     self.assertTrue(attest_json["signature_hex"])
+
+                    lightserver.utxos_by_scripthash[reserve_scripthash] = [
+                        {
+                            "txid": "88" * 32,
+                            "vout": 0,
+                            "value": 500,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                        {
+                            "txid": "99" * 32,
+                            "vout": 1,
+                            "value": 700,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                        {
+                            "txid": "aa" * 32,
+                            "vout": 2,
+                            "value": 3000,
+                            "height": 2,
+                            "script_pubkey_hex": "",
+                        },
+                    ]
+                    lightserver.broadcast_spend_queue.append(
+                        [
+                            ("88" * 32, 0),
+                            ("99" * 32, 1),
+                            ("aa" * 32, 2),
+                        ]
+                    )
+                    consolidation_plan = subprocess.run(plan_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    consolidation_plan_json = json.loads(consolidation_plan.stdout)
+                    self.assertTrue(consolidation_plan_json["available"])
+                    self.assertEqual(consolidation_plan_json["input_count"], 3)
+                    self.assertEqual(len(consolidation_plan_json["selected_utxos"]), 3)
+                    self.assertEqual(consolidation_plan_json["estimated_post_action"]["wallet_utxo_count"], 1)
+                    self.assertFalse(consolidation_plan_json["estimated_post_action"]["alerts"]["recommend_consolidation"])
+                    consolidate_cmd = [
+                        str(CLI),
+                        "mint_reserve_consolidate",
+                        "--url",
+                        f"http://127.0.0.1:{port}/reserves/consolidate",
+                        "--operator-key-id",
+                        operator_key_id,
+                        "--operator-secret-hex",
+                        operator_secret_hex,
+                    ]
+                    consolidate = subprocess.run(consolidate_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    consolidate_json = json.loads(consolidate.stdout)
+                    self.assertTrue(consolidate_json["accepted"])
+                    self.assertEqual(consolidate_json["input_count"], 3)
+                    self.assertEqual(consolidate_json["total_input_value"], 4200)
+                    self.assertEqual(consolidate_json["output_value"], 3200)
+
+                    reserves_after_consolidation = http_get_json(f"http://127.0.0.1:{port}/reserves")
+                    self.assertEqual(reserves_after_consolidation["wallet_utxo_count"], 0)
+                    self.assertTrue(reserves_after_consolidation["alert_reserve_exhaustion_risk"])
+
+                    reserve_health_cmd = [
+                        str(CLI),
+                        "mint_reserve_health",
+                        "--url",
+                        f"http://127.0.0.1:{port}/monitoring/reserve_health",
+                    ]
+                    reserve_health = subprocess.run(reserve_health_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    reserve_health_json = json.loads(reserve_health.stdout)
+                    self.assertEqual(reserve_health_json["status"], "critical")
+                    self.assertTrue(reserve_health_json["alerts"]["auto_pause_recommended"])
+
+                    consolidation_txid = consolidate_json["l1_txid"]
+                    lightserver.tip_height = 25
+                    lightserver.tx_heights[consolidation_txid] = 25
+
+                    final_audit = subprocess.run(audit_cmd, cwd=REPO_ROOT, check=True, text=True, capture_output=True)
+                    final_audit_json = json.loads(final_audit.stdout)
+                    self.assertEqual(len(final_audit_json["payload"]["consolidations"]), 1)
+                    self.assertEqual(final_audit_json["payload"]["consolidations"][0]["state"], "finalized")
+                    self.assertEqual(final_audit_json["payload"]["consolidations"][0]["coin_selection_policy"], "smallest-first-consolidation")
 
                     operator_pub = http_get_json(f"http://127.0.0.1:{port}/operator/key")
                     self.assertEqual(operator_pub["operator_key_id"], operator_key_id)
@@ -450,6 +814,7 @@ class MintIntegrationTests(unittest.TestCase):
                         proc.stderr.close()
         finally:
             lightserver.stop()
+            notifier.stop()
 
 
 if __name__ == "__main__":

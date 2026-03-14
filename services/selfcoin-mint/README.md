@@ -27,11 +27,23 @@ It is a narrow scaffold, not a production mint:
 - `POST /issuance/blind`
 - `POST /redemptions/create`
 - `POST /redemptions/approve_broadcast`
+- `POST /reserves/consolidate`
 - `POST /redemptions/status`
 - `POST /redemptions/update`
+- `POST /policy/redemptions`
 - `GET /healthz`
 - `GET /mint/key`
 - `GET /reserves`
+- `GET /reserves/consolidate_plan`
+- `GET /policy/redemptions`
+- `GET /monitoring/reserve_health`
+- `GET /monitoring/alerts/history`
+- `GET /monitoring/events/policy`
+- `GET /monitoring/events/silences`
+- `GET /monitoring/notifiers`
+- `GET /monitoring/dead_letters`
+- `GET /monitoring/incidents/export`
+- `GET /monitoring/metrics`
 - `GET /accounting/summary`
 - `GET /operator/key`
 - `GET /attestations/reserves`
@@ -97,6 +109,103 @@ python3 services/selfcoin-mint/server.py \
 ```
 
 ```bash
+./build/selfcoin-cli mint_reserve_consolidate \
+  --url http://127.0.0.1:8080/reserves/consolidate \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+```
+
+```bash
+./build/selfcoin-cli mint_reserve_consolidation_plan \
+  --url http://127.0.0.1:8080/reserves/consolidate_plan \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+```
+
+```bash
+./build/selfcoin-cli mint_reserve_health \
+  --url http://127.0.0.1:8080/monitoring/reserve_health
+```
+
+```bash
+./build/selfcoin-cli mint_reserve_metrics \
+  --url http://127.0.0.1:8080/monitoring/metrics
+
+./build/selfcoin-cli mint_alert_history \
+  --url http://127.0.0.1:8080/monitoring/alerts/history
+
+./build/selfcoin-cli mint_event_policy \
+  --url http://127.0.0.1:8080/monitoring/events/policy
+
+./build/selfcoin-cli mint_alert_silences \
+  --url http://127.0.0.1:8080/monitoring/events/silences
+
+./build/selfcoin-cli mint_notifier_list \
+  --url http://127.0.0.1:8080/monitoring/notifiers
+
+./build/selfcoin-cli mint_dead_letters \
+  --url http://127.0.0.1:8080/monitoring/dead_letters
+
+./build/selfcoin-cli mint_incident_timeline_export \
+  --url http://127.0.0.1:8080/monitoring/incidents/export
+```
+
+```bash
+./build/selfcoin-cli mint_redemptions_pause \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --reason "reserve low"
+
+./build/selfcoin-cli mint_redemptions_resume \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_redemptions_auto_pause_enable \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_redemptions_auto_pause_disable \
+  --url http://127.0.0.1:8080/policy/redemptions \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111
+
+./build/selfcoin-cli mint_alert_ack \
+  --url http://127.0.0.1:8080/monitoring/events/ack \
+  --event-id <event-id> \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --note "seen"
+
+./build/selfcoin-cli mint_alert_silence \
+  --url http://127.0.0.1:8080/monitoring/events/silence \
+  --event-type policy.auto_pause \
+  --until 4102444800 \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --reason "maintenance"
+
+./build/selfcoin-cli mint_event_policy_update \
+  --url http://127.0.0.1:8080/monitoring/events/policy \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --retention-limit 128 \
+  --export-include-acknowledged false
+
+./build/selfcoin-cli mint_notifier_upsert \
+  --url http://127.0.0.1:8080/monitoring/notifiers \
+  --operator-key-id dev-operator \
+  --operator-secret-hex 1111111111111111111111111111111111111111111111111111111111111111 \
+  --notifier-id ops-webhook \
+  --kind webhook \
+  --target http://127.0.0.1:9099/webhook \
+  --retry-max-attempts 3 \
+  --retry-backoff-seconds 30
+```
+
+```bash
 curl http://127.0.0.1:8080/accounting/summary
 curl http://127.0.0.1:8080/reserves
 curl http://127.0.0.1:8080/operator/key
@@ -117,7 +226,27 @@ curl http://127.0.0.1:8080/attestations/reserves
 - Coin selection uses `smallest-sufficient-non-dust-change` with `min_change=1000` and `max_inputs=8`; if no non-dust change set can be formed within the max-input budget, the redemption stays `pending`.
 - Redemption batches that cannot yet be funded stay `pending`; operators may reject them, but `broadcast` must go through `/redemptions/approve_broadcast`.
 - `finalized` is derived from observed L1 tx status via the configured lightserver.
-- `/reserves` includes live reserve-wallet UTXO count/value, locked UTXO count/value, simple fragmentation metrics, and operator-facing alert fields such as reserve exhaustion risk, max-input pressure, and fragmentation threshold breach when lightserver + reserve address are configured.
+- `/reserves` includes live reserve-wallet UTXO count/value, locked UTXO count/value, simple fragmentation metrics, operator-facing alert fields such as reserve exhaustion risk, max-input pressure, and fragmentation threshold breach, and the active coin-selection thresholds when lightserver + reserve address are configured.
+- `/policy/redemptions` now includes auto-pause recommendations and threshold metadata derived from the current reserve state.
+- `/reserves/consolidate_plan` includes an `estimated_post_action` section so operators can see expected post-consolidation fragmentation before broadcasting.
+- `/monitoring/reserve_health` provides a compact monitoring/export summary with `healthy|warn|critical` status, current alert booleans, and the current auto-pause recommendation.
+- `/monitoring/alerts/history` provides the recent persisted operator/auto-pause event log.
+- `/monitoring/events/policy` exposes event retention/export settings.
+- `/monitoring/events/silences` exposes active and expired silences.
+- `/monitoring/notifiers` exposes configured notifier hooks.
+- `/monitoring/dead_letters` exposes failed notifier deliveries that exhausted retries.
+- `/monitoring/incidents/export` exposes a signed incident timeline including events, silences, dead letters, and notifier state.
+- `/monitoring/metrics` exports Prometheus-style reserve, pause, and alert counters.
+- Notifier hooks currently support:
+  - `webhook`
+  - `alertmanager`
+  - `email_spool` for local `.eml` drop delivery
+- Each notifier supports:
+  - `retry_max_attempts`
+  - `retry_backoff_seconds`
+- Event entries now include per-notifier delivery status in their `deliveries` map.
+- Signed operators can explicitly trigger reserve consolidation; the service persists consolidation records and includes them in audit export.
+- Signed operators can pause new redemptions and inspect a dry-run consolidation plan before broadcasting reserve actions.
 - `POST /redemptions/update` and `GET /audit/export` require signed operator headers:
   - `X-Selfcoin-Operator-Key`
   - `X-Selfcoin-Timestamp`

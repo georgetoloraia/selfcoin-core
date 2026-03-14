@@ -24,6 +24,8 @@ RESERVE_MAX_INPUTS = 8
 RESERVE_CONSOLIDATE_UTXO_COUNT = 12
 RESERVE_FRAGMENTATION_ALERT_COUNT = 16
 RESERVE_EXHAUSTION_BUFFER = 10000
+RESERVE_AUTO_PAUSE_LOW_RESERVE = 10000
+RESERVE_AUTO_PAUSE_LOCKED_INPUTS = 6
 
 
 def sha256_hex(parts: list[str]) -> str:
@@ -55,6 +57,15 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def write_text(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str, content_type: str) -> None:
+    data = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -212,6 +223,19 @@ class MintState:
             "issuances": {},
             "redemptions": {},
             "note_records": {},
+            "consolidations": {},
+            "events": [],
+            "silences": [],
+            "notifiers": [],
+            "dead_letters": [],
+            "policy": {
+                "redemptions_paused": False,
+                "pause_reason": "",
+                "auto_pause_enabled": False,
+                "event_retention_limit": 256,
+                "export_include_acknowledged": True,
+                "updated_at": 0,
+            },
         }
         self._load()
 
@@ -235,6 +259,20 @@ class MintState:
                         for note, batch_id in self._data["spent_notes"].items()
                     }
                 self._data.pop("spent_notes", None)
+                if "events" not in self._data or not isinstance(self._data["events"], list):
+                    self._data["events"] = []
+                if "silences" not in self._data or not isinstance(self._data["silences"], list):
+                    self._data["silences"] = []
+                if "notifiers" not in self._data or not isinstance(self._data["notifiers"], list):
+                    self._data["notifiers"] = []
+                if "dead_letters" not in self._data or not isinstance(self._data["dead_letters"], list):
+                    self._data["dead_letters"] = []
+                policy = self._data.get("policy", {})
+                if isinstance(policy, dict):
+                    policy.setdefault("auto_pause_enabled", False)
+                    policy.setdefault("event_retention_limit", 256)
+                    policy.setdefault("export_include_acknowledged", True)
+                    self._data["policy"] = policy
         except Exception:
             pass
 
@@ -333,6 +371,10 @@ class MintState:
 
     def create_redemption(self, redemption: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            policy = self._data.get("policy", {})
+            if isinstance(policy, dict) and bool(policy.get("redemptions_paused", False)):
+                reason = str(policy.get("pause_reason", "operator pause"))
+                raise ValueError(f"redemptions paused: {reason}")
             outstanding = self._total_deposited_locked() - self._total_reserved_locked()
             if int(redemption["amount"]) > outstanding:
                 raise ValueError("insufficient reserve")
@@ -374,6 +416,273 @@ class MintState:
                 if isinstance(item, dict) and item.get("state") == "broadcast"
             ]
 
+    def record_consolidation(self, consolidation: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = dict(consolidation)
+            now = int(time.time())
+            item.setdefault("created_at", now)
+            item.setdefault("updated_at", now)
+            self._data["consolidations"][item["consolidation_id"]] = item
+            self._flush()
+            return dict(item)
+
+    def get_consolidation(self, consolidation_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            item = self._data["consolidations"].get(consolidation_id)
+            return dict(item) if isinstance(item, dict) else None
+
+    def list_broadcast_consolidations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(item)
+                for item in self._data["consolidations"].values()
+                if isinstance(item, dict) and item.get("state") == "broadcast"
+            ]
+
+    def update_consolidation(self, consolidation_id: str, new_state: str, l1_txid: str = "",
+                             metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        allowed = {
+            "broadcast": {"finalized", "rejected"},
+        }
+        with self._lock:
+            item = self._data["consolidations"].get(consolidation_id)
+            if not isinstance(item, dict):
+                raise KeyError("unknown consolidation_id")
+            current = str(item.get("state", "broadcast"))
+            if current == new_state and not metadata:
+                return dict(item)
+            if current not in allowed or new_state not in allowed[current]:
+                if current != new_state:
+                    raise ValueError("invalid consolidation state transition")
+            item["state"] = new_state
+            item["updated_at"] = int(time.time())
+            if l1_txid:
+                item["l1_txid"] = l1_txid
+            if metadata:
+                for key, value in metadata.items():
+                    item[key] = value
+            self._data["consolidations"][consolidation_id] = item
+            self._flush()
+            return dict(item)
+
+    def policy(self) -> dict[str, Any]:
+        with self._lock:
+            item = self._data.get("policy", {})
+            return dict(item) if isinstance(item, dict) else {}
+
+    def update_policy(
+        self,
+        paused: bool,
+        reason: str,
+        auto_pause_enabled: bool | None = None,
+        event_retention_limit: int | None = None,
+        export_include_acknowledged: bool | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            item = dict(self._data.get("policy", {}))
+            item["redemptions_paused"] = bool(paused)
+            item["pause_reason"] = reason if paused else ""
+            if auto_pause_enabled is not None:
+                item["auto_pause_enabled"] = bool(auto_pause_enabled)
+            else:
+                item.setdefault("auto_pause_enabled", False)
+            if event_retention_limit is not None:
+                item["event_retention_limit"] = max(16, min(int(event_retention_limit), 5000))
+            else:
+                item.setdefault("event_retention_limit", 256)
+            if export_include_acknowledged is not None:
+                item["export_include_acknowledged"] = bool(export_include_acknowledged)
+            else:
+                item.setdefault("export_include_acknowledged", True)
+            item["updated_at"] = int(time.time())
+            self._data["policy"] = item
+            self._flush()
+            return dict(item)
+
+    def append_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = {
+                "event_id": sha256_hex([event_type, str(time.time_ns()), json.dumps(payload, sort_keys=True)]),
+                "event_type": event_type,
+                "payload": dict(payload),
+                "deliveries": {},
+                "acknowledged": False,
+                "acknowledged_at": 0,
+                "ack_note": "",
+                "created_at": int(time.time()),
+            }
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                events = []
+            events.append(item)
+            retention_limit = int(self._data.get("policy", {}).get("event_retention_limit", 256))
+            retention_limit = max(16, min(retention_limit, 5000))
+            self._data["events"] = events[-retention_limit:]
+            self._flush()
+            return dict(item)
+
+    def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                return []
+            tail = events[-max(0, int(limit)):]
+            return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+    def update_event_delivery(
+        self,
+        event_id: str,
+        notifier_id: str,
+        status: str,
+        attempts: int,
+        last_error: str = "",
+        next_retry_at: int = 0,
+        delivered_at: int = 0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                raise KeyError("unknown event_id")
+            for idx, item in enumerate(events):
+                if not isinstance(item, dict) or str(item.get("event_id", "")) != event_id:
+                    continue
+                updated = dict(item)
+                deliveries = dict(updated.get("deliveries", {}))
+                deliveries[notifier_id] = {
+                    "status": status,
+                    "attempts": int(attempts),
+                    "last_error": last_error,
+                    "next_retry_at": int(next_retry_at),
+                    "delivered_at": int(delivered_at),
+                    "updated_at": int(time.time()),
+                }
+                updated["deliveries"] = deliveries
+                events[idx] = updated
+                self._data["events"] = events
+                self._flush()
+                return dict(updated)
+            raise KeyError("unknown event_id")
+
+    def append_dead_letter(self, item: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            entry = dict(item)
+            entry.setdefault("created_at", int(time.time()))
+            letters = self._data.get("dead_letters", [])
+            if not isinstance(letters, list):
+                letters = []
+            letters.append(entry)
+            self._data["dead_letters"] = letters[-512:]
+            self._flush()
+            return dict(entry)
+
+    def list_dead_letters(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            letters = self._data.get("dead_letters", [])
+            if not isinstance(letters, list):
+                return []
+            tail = letters[-max(0, int(limit)):]
+            return [dict(item) for item in reversed(tail) if isinstance(item, dict)]
+
+    def acknowledge_event(self, event_id: str, note: str) -> dict[str, Any]:
+        with self._lock:
+            events = self._data.get("events", [])
+            if not isinstance(events, list):
+                raise KeyError("unknown event_id")
+            for idx, item in enumerate(events):
+                if isinstance(item, dict) and str(item.get("event_id", "")) == event_id:
+                    updated = dict(item)
+                    updated["acknowledged"] = True
+                    updated["acknowledged_at"] = int(time.time())
+                    updated["ack_note"] = note
+                    events[idx] = updated
+                    self._data["events"] = events
+                    self._flush()
+                    return dict(updated)
+            raise KeyError("unknown event_id")
+
+    def add_silence(self, event_type: str, until_ts: int, reason: str) -> dict[str, Any]:
+        with self._lock:
+            item = {
+                "silence_id": sha256_hex([event_type, str(until_ts), reason, str(time.time_ns())]),
+                "event_type": event_type,
+                "until_ts": int(until_ts),
+                "reason": reason,
+                "created_at": int(time.time()),
+                "active": True,
+            }
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                silences = []
+            silences.append(item)
+            self._data["silences"] = silences[-256:]
+            self._flush()
+            return dict(item)
+
+    def list_silences(self, active_only: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                return []
+            now = int(time.time())
+            out = []
+            for item in silences:
+                if not isinstance(item, dict):
+                    continue
+                active = bool(item.get("active", True)) and int(item.get("until_ts", 0)) > now
+                row = dict(item)
+                row["active"] = active
+                if active_only and not active:
+                    continue
+                out.append(row)
+            return list(reversed(out))
+
+    def event_silenced(self, event_type: str) -> bool:
+        now = int(time.time())
+        with self._lock:
+            silences = self._data.get("silences", [])
+            if not isinstance(silences, list):
+                return False
+            for item in silences:
+                if not isinstance(item, dict):
+                    continue
+                if not bool(item.get("active", True)):
+                    continue
+                if str(item.get("event_type", "")) != event_type:
+                    continue
+                if int(item.get("until_ts", 0)) > now:
+                    return True
+            return False
+
+    def upsert_notifier(self, notifier: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            item = dict(notifier)
+            item["updated_at"] = int(time.time())
+            item.setdefault("retry_max_attempts", 3)
+            item.setdefault("retry_backoff_seconds", 30)
+            notifiers = self._data.get("notifiers", [])
+            if not isinstance(notifiers, list):
+                notifiers = []
+            notifier_id = str(item.get("notifier_id", ""))
+            replaced = False
+            for idx, existing in enumerate(notifiers):
+                if isinstance(existing, dict) and str(existing.get("notifier_id", "")) == notifier_id:
+                    notifiers[idx] = item
+                    replaced = True
+                    break
+            if not replaced:
+                item.setdefault("created_at", int(time.time()))
+                notifiers.append(item)
+            self._data["notifiers"] = notifiers[-128:]
+            self._flush()
+            return dict(item)
+
+    def list_notifiers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            notifiers = self._data.get("notifiers", [])
+            if not isinstance(notifiers, list):
+                return []
+            return [dict(item) for item in notifiers if isinstance(item, dict)]
+
     def note_already_spent(self, note: str) -> bool:
         with self._lock:
             record = self._data["note_records"].get(note)
@@ -397,10 +706,11 @@ class MintState:
             if not isinstance(redemption, dict):
                 raise KeyError("unknown redemption_batch_id")
             current = str(redemption.get("state", "pending"))
-            if current == new_state:
+            if current == new_state and not metadata:
                 return dict(redemption)
             if current not in allowed or new_state not in allowed[current]:
-                raise ValueError("invalid redemption state transition")
+                if current != new_state:
+                    raise ValueError("invalid redemption state transition")
             now = int(time.time())
             redemption["state"] = new_state
             redemption["updated_at"] = now
@@ -476,7 +786,21 @@ class MintState:
                 "deposits": list(self._data["deposits"].values()),
                 "issuances": list(self._data["issuances"].values()),
                 "redemptions": list(self._data["redemptions"].values()),
+                "consolidations": list(self._data["consolidations"].values()),
                 "note_records": list(self._data["note_records"].values()),
+                "events": [
+                    dict(item)
+                    for item in self._data.get("events", [])
+                    if isinstance(item, dict)
+                    and (
+                        bool(self._data.get("policy", {}).get("export_include_acknowledged", True))
+                        or not bool(item.get("acknowledged", False))
+                    )
+                ],
+                "silences": list(self._data.get("silences", [])),
+                "notifiers": list(self._data.get("notifiers", [])),
+                "dead_letters": list(self._data.get("dead_letters", [])),
+                "policy": dict(self._data.get("policy", {})),
                 "accounting": self._accounting_summary_locked(),
                 "reserves": {**self._reserve_summary_locked(), **(inventory or {})},
             }
@@ -504,6 +828,11 @@ class MintState:
             for item in self._data["redemptions"].values()
             if isinstance(item, dict) and item.get("state") == "broadcast"
         ]
+        consolidations = [
+            item
+            for item in self._data["consolidations"].values()
+            if isinstance(item, dict) and item.get("state") == "broadcast"
+        ]
         return {
             "total_deposited": total_deposited,
             "reserved_redemption_amount": reserved,
@@ -512,6 +841,8 @@ class MintState:
             "available_reserve": total_deposited - reserved,
             "pending_spend_commitment_count": len(spend_commitments),
             "pending_spend_input_count": sum(len(item.get("selected_utxos", [])) for item in spend_commitments),
+            "pending_consolidation_count": len(consolidations),
+            "pending_consolidation_input_count": sum(len(item.get("selected_utxos", [])) for item in consolidations),
         }
 
     def _accounting_summary_locked(self) -> dict[str, Any]:
@@ -729,6 +1060,17 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if redemption.get("state") != "broadcast":
                 return
+            observed_spent = self._reserve_outpoints_missing_from_lightserver(redemption.get("selected_utxos", []))
+            if observed_spent and not redemption.get("network_spend_observed", False):
+                state.update_redemption(
+                    batch_id,
+                    "broadcast",
+                    str(redemption.get("l1_txid", "")),
+                    {
+                        "network_spend_observed": True,
+                        "network_spend_observed_at": int(time.time()),
+                    },
+                )
             txid = str(redemption.get("l1_txid", ""))
             if not txid:
                 return
@@ -739,11 +1081,42 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if confirmations >= config.confirmations_required:
                 state.update_redemption(batch_id, "finalized", txid)
 
+        def _reconcile_consolidation(self, consolidation_id: str) -> None:
+            item = state.get_consolidation(consolidation_id)
+            if not isinstance(item, dict):
+                return
+            if item.get("state") != "broadcast":
+                return
+            observed_spent = self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            if observed_spent and not item.get("network_spend_observed", False):
+                state.update_consolidation(
+                    consolidation_id,
+                    "broadcast",
+                    str(item.get("l1_txid", "")),
+                    {
+                        "network_spend_observed": True,
+                        "network_spend_observed_at": int(time.time()),
+                    },
+                )
+            txid = str(item.get("l1_txid", ""))
+            if not txid:
+                return
+            observed = lightserver_confirmations(config.lightserver_url, txid)
+            if observed is None:
+                return
+            _, confirmations = observed
+            if confirmations >= config.confirmations_required:
+                state.update_consolidation(consolidation_id, "finalized", txid)
+
         def _reconcile_all_broadcast(self) -> None:
             for redemption in state.list_broadcast_redemptions():
                 batch_id = redemption.get("redemption_batch_id")
                 if isinstance(batch_id, str):
                     self._reconcile_redemption(batch_id)
+            for consolidation in state.list_broadcast_consolidations():
+                consolidation_id = consolidation.get("consolidation_id")
+                if isinstance(consolidation_id, str):
+                    self._reconcile_consolidation(consolidation_id)
 
         def _locked_reserve_outpoints(self) -> set[tuple[str, int]]:
             locked: set[tuple[str, int]] = set()
@@ -754,7 +1127,51 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                         vout = int(utxo.get("vout", -1))
                         if txid and vout >= 0:
                             locked.add((txid, vout))
+            for consolidation in state.list_broadcast_consolidations():
+                for utxo in consolidation.get("selected_utxos", []):
+                    if isinstance(utxo, dict):
+                        txid = str(utxo.get("txid", ""))
+                        vout = int(utxo.get("vout", -1))
+                        if txid and vout >= 0:
+                            locked.add((txid, vout))
             return locked
+
+        def _reserve_raw_utxos(self) -> list[dict[str, Any]]:
+            if not config.lightserver_url or not config.reserve_address:
+                return []
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                return []
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            return lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+
+        def _reserve_outpoints_missing_from_lightserver(self, selected_utxos: list[dict[str, Any]]) -> bool:
+            if not selected_utxos:
+                return False
+            current = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in self._reserve_raw_utxos()
+            }
+            needed = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in selected_utxos
+                if isinstance(item, dict)
+            }
+            return bool(needed) and needed.isdisjoint(current)
+
+        def _pending_network_spend_observation(self) -> dict[str, int]:
+            redemptions = state.list_broadcast_redemptions()
+            consolidations = state.list_broadcast_consolidations()
+            redemption_seen = sum(
+                1 for item in redemptions if self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            )
+            consolidation_seen = sum(
+                1 for item in consolidations if self._reserve_outpoints_missing_from_lightserver(item.get("selected_utxos", []))
+            )
+            return {
+                "pending_spend_network_observed_count": redemption_seen,
+                "pending_consolidation_network_observed_count": consolidation_seen,
+            }
 
         def _reserve_alerts(self, summary: dict[str, Any], inventory: dict[str, Any]) -> dict[str, Any]:
             utxo_count = int(inventory.get("wallet_utxo_count", 0))
@@ -774,6 +1191,316 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "alert_max_inputs_pressure": utxo_count > RESERVE_MAX_INPUTS,
                 "alert_fragmentation_threshold_breach": utxo_count >= RESERVE_FRAGMENTATION_ALERT_COUNT,
                 "alert_reserve_exhaustion_risk": available_reserve <= RESERVE_EXHAUSTION_BUFFER or utxo_value <= RESERVE_EXHAUSTION_BUFFER,
+            }
+
+        def _policy_recommendations(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            reasons: list[str] = []
+            if bool(alerts.get("alert_reserve_exhaustion_risk", False)):
+                reasons.append("reserve exhaustion risk")
+            if int(inventory.get("wallet_locked_utxo_count", 0)) >= RESERVE_AUTO_PAUSE_LOCKED_INPUTS:
+                reasons.append("too many reserve utxos already locked")
+            if int(summary.get("available_reserve", 0)) <= RESERVE_AUTO_PAUSE_LOW_RESERVE:
+                reasons.append("available reserve below operator buffer")
+            return {
+                "auto_pause_recommended": bool(reasons),
+                "auto_pause_reason": ", ".join(reasons),
+                "auto_pause_thresholds": {
+                    "available_reserve_lte": RESERVE_AUTO_PAUSE_LOW_RESERVE,
+                    "wallet_locked_utxo_count_gte": RESERVE_AUTO_PAUSE_LOCKED_INPUTS,
+                    "reserve_exhaustion_buffer": RESERVE_EXHAUSTION_BUFFER,
+                },
+            }
+
+        def _reserve_health_summary(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            policy = self._policy_recommendations(summary, inventory, alerts)
+            status = "healthy"
+            if policy["auto_pause_recommended"] or bool(alerts.get("alert_reserve_exhaustion_risk", False)):
+                status = "critical"
+            elif bool(alerts.get("alert_fragmentation_threshold_breach", False)) or bool(alerts.get("alert_max_inputs_pressure", False)):
+                status = "warn"
+            return {
+                "status": status,
+                "available_reserve": int(summary.get("available_reserve", 0)),
+                "reserve_balance": int(summary.get("reserve_balance", 0)),
+                "wallet_utxo_count": int(inventory.get("wallet_utxo_count", 0)),
+                "wallet_utxo_value": int(inventory.get("wallet_utxo_value", 0)),
+                "wallet_locked_utxo_count": int(inventory.get("wallet_locked_utxo_count", 0)),
+                "wallet_fragment_below_min_change": int(inventory.get("wallet_fragment_below_min_change", 0)),
+                "pending_spend_commitment_count": int(summary.get("pending_spend_commitment_count", 0)),
+                "pending_consolidation_count": int(summary.get("pending_consolidation_count", 0)),
+                "alerts": {
+                    "reserve_exhaustion_risk": bool(alerts.get("alert_reserve_exhaustion_risk", False)),
+                    "fragmentation_threshold_breach": bool(alerts.get("alert_fragmentation_threshold_breach", False)),
+                    "max_inputs_pressure": bool(alerts.get("alert_max_inputs_pressure", False)),
+                    "recommend_consolidation": bool(alerts.get("recommend_consolidation", False)),
+                    "auto_pause_recommended": bool(policy.get("auto_pause_recommended", False)),
+                },
+                "policy": policy,
+                "updated_at": int(time.time()),
+            }
+
+        def _metrics_payload(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> str:
+            policy = self._policy_recommendations(summary, inventory, alerts)
+            health = self._reserve_health_summary(summary, inventory, alerts)
+            pending_delivery = 0
+            for event in state.list_events(256):
+                deliveries = event.get("deliveries", {})
+                if isinstance(deliveries, dict):
+                    pending_delivery += sum(
+                        1
+                        for item in deliveries.values()
+                        if isinstance(item, dict) and str(item.get("status", "")) == "pending"
+                    )
+            lines = [
+                "# TYPE selfcoin_mint_available_reserve gauge",
+                f"selfcoin_mint_available_reserve {int(summary.get('available_reserve', 0))}",
+                "# TYPE selfcoin_mint_reserve_balance gauge",
+                f"selfcoin_mint_reserve_balance {int(summary.get('reserve_balance', 0))}",
+                "# TYPE selfcoin_mint_wallet_utxo_count gauge",
+                f"selfcoin_mint_wallet_utxo_count {int(inventory.get('wallet_utxo_count', 0))}",
+                "# TYPE selfcoin_mint_wallet_locked_utxo_count gauge",
+                f"selfcoin_mint_wallet_locked_utxo_count {int(inventory.get('wallet_locked_utxo_count', 0))}",
+                "# TYPE selfcoin_mint_pending_spend_commitment_count gauge",
+                f"selfcoin_mint_pending_spend_commitment_count {int(summary.get('pending_spend_commitment_count', 0))}",
+                "# TYPE selfcoin_mint_pending_consolidation_count gauge",
+                f"selfcoin_mint_pending_consolidation_count {int(summary.get('pending_consolidation_count', 0))}",
+                "# TYPE selfcoin_mint_alert_reserve_exhaustion_risk gauge",
+                f"selfcoin_mint_alert_reserve_exhaustion_risk {1 if bool(alerts.get('alert_reserve_exhaustion_risk', False)) else 0}",
+                "# TYPE selfcoin_mint_alert_fragmentation_threshold_breach gauge",
+                f"selfcoin_mint_alert_fragmentation_threshold_breach {1 if bool(alerts.get('alert_fragmentation_threshold_breach', False)) else 0}",
+                "# TYPE selfcoin_mint_alert_max_inputs_pressure gauge",
+                f"selfcoin_mint_alert_max_inputs_pressure {1 if bool(alerts.get('alert_max_inputs_pressure', False)) else 0}",
+                "# TYPE selfcoin_mint_auto_pause_recommended gauge",
+                f"selfcoin_mint_auto_pause_recommended {1 if bool(policy.get('auto_pause_recommended', False)) else 0}",
+                "# TYPE selfcoin_mint_redemptions_paused gauge",
+                f"selfcoin_mint_redemptions_paused {1 if bool(state.policy().get('redemptions_paused', False)) else 0}",
+                "# TYPE selfcoin_mint_auto_pause_enabled gauge",
+                f"selfcoin_mint_auto_pause_enabled {1 if bool(state.policy().get('auto_pause_enabled', False)) else 0}",
+                "# TYPE selfcoin_mint_health_status gauge",
+                f"selfcoin_mint_health_status {2 if health['status'] == 'critical' else 1 if health['status'] == 'warn' else 0}",
+                "# TYPE selfcoin_mint_event_log_size gauge",
+                f"selfcoin_mint_event_log_size {len(state.list_events(256))}",
+                "# TYPE selfcoin_mint_dead_letter_count gauge",
+                f"selfcoin_mint_dead_letter_count {len(state.list_dead_letters(512))}",
+                "# TYPE selfcoin_mint_pending_notifier_delivery_count gauge",
+                f"selfcoin_mint_pending_notifier_delivery_count {pending_delivery}",
+            ]
+            return "\n".join(lines) + "\n"
+
+        def _dispatch_notifier(self, notifier: dict[str, Any], event: dict[str, Any]) -> None:
+            if not bool(notifier.get("enabled", True)):
+                return
+            kind = str(notifier.get("kind", ""))
+            if kind == "webhook":
+                url = str(notifier.get("target", ""))
+                if not url:
+                    return
+                req = urllib.request.Request(
+                    url,
+                    data=canonical_json_bytes({"event": event}),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
+                return
+            if kind == "alertmanager":
+                url = str(notifier.get("target", ""))
+                if not url:
+                    return
+                payload = [{
+                    "labels": {
+                        "alertname": str(event.get("event_type", "selfcoin_mint_event")),
+                        "service": "selfcoin-mint",
+                    },
+                    "annotations": {
+                        "event_id": str(event.get("event_id", "")),
+                        "note": str(event.get("ack_note", "")),
+                        "payload": json.dumps(event.get("payload", {}), sort_keys=True),
+                    },
+                    "startsAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(event.get("created_at", 0)))),
+                }]
+                req = urllib.request.Request(
+                    url,
+                    data=canonical_json_bytes({"alerts": payload}),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=2):
+                    pass
+                return
+            if kind == "email_spool":
+                spool_dir = str(notifier.get("target", ""))
+                if not spool_dir:
+                    return
+                to_addr = str(notifier.get("email_to", "ops@example.invalid"))
+                from_addr = str(notifier.get("email_from", "selfcoin-mint@example.invalid"))
+                path = Path(spool_dir)
+                path.mkdir(parents=True, exist_ok=True)
+                subject = f"[selfcoin-mint] {event.get('event_type', 'event')}"
+                body = (
+                    f"From: {from_addr}\n"
+                    f"To: {to_addr}\n"
+                    f"Subject: {subject}\n\n"
+                    f"{json.dumps(event, indent=2, sort_keys=True)}\n"
+                )
+                out = path / f"{event.get('event_id', 'event')}.eml"
+                out.write_text(body, encoding="utf-8")
+                return
+
+        def _deliver_event_to_notifier(self, notifier: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+            notifier_id = str(notifier.get("notifier_id", ""))
+            existing = event.get("deliveries", {})
+            current = dict(existing.get(notifier_id, {})) if isinstance(existing, dict) else {}
+            attempts = int(current.get("attempts", 0)) + 1
+            max_attempts = max(1, int(notifier.get("retry_max_attempts", 3)))
+            backoff = max(1, int(notifier.get("retry_backoff_seconds", 30)))
+            try:
+                self._dispatch_notifier(notifier, event)
+                return state.update_event_delivery(
+                    str(event.get("event_id", "")),
+                    notifier_id,
+                    "delivered",
+                    attempts,
+                    delivered_at=int(time.time()),
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                if attempts >= max_attempts:
+                    state.append_dead_letter(
+                        {
+                            "dead_letter_id": sha256_hex([str(event.get("event_id", "")), notifier_id, str(time.time_ns())]),
+                            "event_id": str(event.get("event_id", "")),
+                            "notifier_id": notifier_id,
+                            "event_type": str(event.get("event_type", "")),
+                            "last_error": last_error,
+                            "attempts": attempts,
+                            "payload": dict(event.get("payload", {})),
+                        }
+                    )
+                    return state.update_event_delivery(
+                        str(event.get("event_id", "")),
+                        notifier_id,
+                        "dead_letter",
+                        attempts,
+                        last_error=last_error,
+                    )
+                next_retry_at = int(time.time()) + backoff * (2 ** (attempts - 1))
+                return state.update_event_delivery(
+                    str(event.get("event_id", "")),
+                    notifier_id,
+                    "pending",
+                    attempts,
+                    last_error=last_error,
+                    next_retry_at=next_retry_at,
+                )
+
+        def _retry_pending_deliveries(self) -> None:
+            now = int(time.time())
+            events = state.list_events(256)
+            notifiers = {str(item.get("notifier_id", "")): item for item in state.list_notifiers()}
+            for event in events:
+                deliveries = event.get("deliveries", {})
+                if not isinstance(deliveries, dict):
+                    continue
+                for notifier_id, item in deliveries.items():
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("status", "")) != "pending":
+                        continue
+                    if int(item.get("next_retry_at", 0)) > now:
+                        continue
+                    notifier = notifiers.get(notifier_id)
+                    if not isinstance(notifier, dict):
+                        continue
+                    event = self._deliver_event_to_notifier(notifier, event)
+
+        def _record_event(self, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+            event = state.append_event(event_type, payload)
+            if state.event_silenced(event_type):
+                return event
+            for notifier in state.list_notifiers():
+                event = self._deliver_event_to_notifier(notifier, event)
+            return event
+
+        def _incident_timeline_payload(self) -> dict[str, Any]:
+            return {
+                "generated_at": int(time.time()),
+                "policy": state.policy(),
+                "events": state.list_events(256),
+                "silences": state.list_silences(False),
+                "dead_letters": state.list_dead_letters(256),
+                "notifiers": state.list_notifiers(),
+            }
+
+        def _maybe_apply_auto_pause(self, summary: dict[str, Any], inventory: dict[str, Any], alerts: dict[str, Any]) -> dict[str, Any]:
+            policy = state.policy()
+            current = dict(policy)
+            recommendation = self._policy_recommendations(summary, inventory, alerts)
+            if not bool(policy.get("auto_pause_enabled", False)):
+                return current
+            if bool(policy.get("redemptions_paused", False)):
+                return current
+            if not bool(recommendation.get("auto_pause_recommended", False)):
+                return current
+            updated = state.update_policy(True, f"auto: {recommendation.get('auto_pause_reason', 'threshold triggered')}")
+            self._record_event(
+                "policy.auto_pause",
+                {
+                    "reason": updated.get("pause_reason", ""),
+                    "available_reserve": int(summary.get("available_reserve", 0)),
+                    "wallet_utxo_value": int(inventory.get("wallet_utxo_value", 0)),
+                },
+            )
+            return updated
+
+        def _remaining_utxos_after_selection(self, selected: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            selected_keys = {
+                (str(item.get("txid", "")), int(item.get("vout", -1)))
+                for item in selected
+                if isinstance(item, dict)
+            }
+            remaining: list[dict[str, Any]] = []
+            for item in self._reserve_raw_utxos():
+                key = (str(item.get("txid", "")), int(item.get("vout", -1)))
+                if key in self._locked_reserve_outpoints() or key in selected_keys:
+                    continue
+                remaining.append(item)
+            return remaining
+
+        def _inventory_metrics_from_values(self, values: list[int]) -> dict[str, Any]:
+            ordered = sorted(values)
+            return {
+                "wallet_utxo_count": len(ordered),
+                "wallet_utxo_value": sum(ordered),
+                "wallet_fragment_smallest": ordered[0] if ordered else 0,
+                "wallet_fragment_largest": ordered[-1] if ordered else 0,
+                "wallet_fragment_below_min_change": sum(1 for value in ordered if value < RESERVE_MIN_CHANGE),
+            }
+
+        def _estimated_post_consolidation(self, selected: list[dict[str, Any]], output_value: int) -> dict[str, Any]:
+            remaining = self._remaining_utxos_after_selection(selected)
+            values = [int(item.get("value", 0)) for item in remaining if int(item.get("value", 0)) > 0]
+            if output_value > 0:
+                values.append(output_value)
+            inventory = self._inventory_metrics_from_values(values)
+            summary = dict(state.reserve_summary())
+            summary.update({
+                "available_reserve": int(summary.get("available_reserve", 0)),
+                "reserve_balance": int(summary.get("reserve_balance", 0)),
+            })
+            alerts = self._reserve_alerts(summary, inventory)
+            return {
+                "wallet_utxo_count": inventory["wallet_utxo_count"],
+                "wallet_utxo_value": inventory["wallet_utxo_value"],
+                "wallet_fragment_smallest": inventory["wallet_fragment_smallest"],
+                "wallet_fragment_largest": inventory["wallet_fragment_largest"],
+                "wallet_fragment_below_min_change": inventory["wallet_fragment_below_min_change"],
+                "alerts": {
+                    "recommend_consolidation": bool(alerts.get("recommend_consolidation", False)),
+                    "alert_fragmentation_threshold_breach": bool(alerts.get("alert_fragmentation_threshold_breach", False)),
+                    "alert_max_inputs_pressure": bool(alerts.get("alert_max_inputs_pressure", False)),
+                },
             }
 
         def _reserve_inventory(self) -> dict[str, Any]:
@@ -796,14 +1523,13 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "wallet_synced_at": int(time.time()),
                     "wallet_error": "invalid reserve address",
                 }
-            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
-            raw_utxos = lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+            raw_utxos = self._reserve_raw_utxos()
             locked = self._locked_reserve_outpoints()
             utxos = [
                 item for item in raw_utxos if (str(item.get("txid", "")), int(item.get("vout", -1))) not in locked
             ]
             values = sorted(int(item.get("value", 0)) for item in utxos)
-            return {
+            out = {
                 "wallet_utxo_count": len(utxos),
                 "wallet_utxo_value": sum(values),
                 "wallet_locked_utxo_count": len(raw_utxos) - len(utxos),
@@ -813,6 +1539,8 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 "wallet_fragment_below_min_change": sum(1 for value in values if value < RESERVE_MIN_CHANGE),
                 "wallet_synced_at": int(time.time()),
             }
+            out.update(self._pending_network_spend_observation())
+            return out
 
         def _select_reserve_utxos(self, amount_needed: int) -> list[dict[str, Any]]:
             reserve_pkh = decode_selfcoin_address(config.reserve_address)
@@ -837,6 +1565,34 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 if total == amount_needed or (total > amount_needed and change >= RESERVE_MIN_CHANGE):
                     return selected
             return []
+
+        def _select_consolidation_utxos(self) -> list[dict[str, Any]]:
+            reserve_pkh = decode_selfcoin_address(config.reserve_address)
+            if reserve_pkh is None:
+                raise ValueError("invalid reserve address")
+            reserve_scripthash = hashlib.sha256(p2pkh_script_pubkey(reserve_pkh)).hexdigest()
+            utxos = [
+                item
+                for item in lightserver_get_utxos(config.lightserver_url, reserve_scripthash)
+                if int(item.get("value", 0)) > 0
+                and (str(item.get("txid", "")), int(item.get("vout", -1))) not in self._locked_reserve_outpoints()
+            ]
+            if len(utxos) < 2:
+                return []
+            prioritized = sorted(
+                utxos,
+                key=lambda item: (
+                    0 if int(item.get("value", 0)) < RESERVE_MIN_CHANGE else 1,
+                    int(item.get("value", 0)),
+                ),
+            )
+            if len(prioritized) < 2:
+                return []
+            if len(prioritized) < RESERVE_CONSOLIDATE_UTXO_COUNT and sum(
+                1 for item in prioritized if int(item.get("value", 0)) < RESERVE_MIN_CHANGE
+            ) == 0:
+                return []
+            return prioritized[:RESERVE_MAX_INPUTS]
 
         def _maybe_broadcast_redemption(self, batch_id: str) -> dict[str, Any]:
             redemption = state.get_redemption(batch_id)
@@ -876,6 +1632,87 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 },
             )
 
+        def _broadcast_consolidation(self) -> dict[str, Any]:
+            if not config.lightserver_url or not config.reserve_privkey_hex or not config.reserve_address:
+                raise ValueError("reserve wallet not configured")
+            selected = self._select_consolidation_utxos()
+            if len(selected) < 2:
+                raise ValueError("no consolidation candidates available")
+            total_input_value = _sum_utxo_values(selected)
+            if total_input_value <= config.reserve_fee:
+                raise ValueError("selected utxos do not cover reserve fee")
+            txid, tx_hex = build_redemption_tx(
+                config,
+                selected,
+                config.reserve_address,
+                total_input_value - config.reserve_fee,
+            )
+            ok, err = lightserver_broadcast_tx(config.lightserver_url, tx_hex)
+            if not ok:
+                raise ValueError(err)
+            consolidation_id = sha256_hex(
+                [
+                    "reserve-consolidation",
+                    txid,
+                    str(total_input_value),
+                    str(len(selected)),
+                ]
+            )
+            return state.record_consolidation(
+                {
+                    "consolidation_id": consolidation_id,
+                    "state": "broadcast",
+                    "l1_txid": txid,
+                    "reserve_address": config.reserve_address,
+                    "selected_utxos": [
+                        {
+                            "txid": str(item["txid"]),
+                            "vout": int(item["vout"]),
+                            "value": int(item["value"]),
+                        }
+                        for item in selected
+                    ],
+                    "total_input_value": total_input_value,
+                    "output_value": total_input_value - config.reserve_fee,
+                    "fee": config.reserve_fee,
+                    "coin_selection_policy": "smallest-first-consolidation",
+                    "max_inputs": RESERVE_MAX_INPUTS,
+                }
+            )
+
+        def _consolidation_plan(self) -> dict[str, Any]:
+            selected = self._select_consolidation_utxos()
+            if len(selected) < 2:
+                return {
+                    "available": False,
+                    "reason": "no consolidation candidates available",
+                    "input_count": len(selected),
+                }
+            total_input_value = _sum_utxo_values(selected)
+            if total_input_value <= config.reserve_fee:
+                return {
+                    "available": False,
+                    "reason": "selected utxos do not cover reserve fee",
+                    "input_count": len(selected),
+                }
+            return {
+                "available": True,
+                "coin_selection_policy": "smallest-first-consolidation",
+                "input_count": len(selected),
+                "total_input_value": total_input_value,
+                "output_value": total_input_value - config.reserve_fee,
+                "fee": config.reserve_fee,
+                "estimated_post_action": self._estimated_post_consolidation(selected, total_input_value - config.reserve_fee),
+                "selected_utxos": [
+                    {
+                        "txid": str(item["txid"]),
+                        "vout": int(item["vout"]),
+                        "value": int(item["value"]),
+                    }
+                    for item in selected
+                ],
+            }
+
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 write_json(self, HTTPStatus.OK, {"ok": True, "mint_id": config.mint_id})
@@ -904,14 +1741,63 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 )
                 return
             self._reconcile_all_broadcast()
+            self._retry_pending_deliveries()
             if self.path == "/reserves":
                 summary = state.reserve_summary()
                 summary["mint_id"] = config.mint_id
                 summary["reserve_address"] = config.reserve_address
                 inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                policy_state = self._maybe_apply_auto_pause(summary, inventory, alerts)
+                if policy_state:
+                    summary["policy_updated_at"] = policy_state.get("updated_at", 0)
                 summary.update(inventory)
-                summary.update(self._reserve_alerts(summary, inventory))
+                summary.update(alerts)
+                summary.update(self._policy_recommendations(summary, inventory, alerts))
+                summary["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
                 write_json(self, HTTPStatus.OK, summary)
+                return
+            if self.path == "/monitoring/reserve_health":
+                summary = state.reserve_summary()
+                summary["mint_id"] = config.mint_id
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                write_json(self, HTTPStatus.OK, self._reserve_health_summary(summary, inventory, alerts))
+                return
+            if self.path == "/monitoring/metrics":
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                write_text(self, HTTPStatus.OK, self._metrics_payload(summary, inventory, alerts), "text/plain; version=0.0.4")
+                return
+            if self.path.startswith("/monitoring/alerts/history"):
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                write_json(self, HTTPStatus.OK, {"events": state.list_events(100), "silences": state.list_silences(False)})
+                return
+            if self.path == "/monitoring/events/policy":
+                write_json(self, HTTPStatus.OK, state.policy())
+                return
+            if self.path == "/monitoring/events/silences":
+                write_json(self, HTTPStatus.OK, {"silences": state.list_silences(False)})
+                return
+            if self.path == "/monitoring/notifiers":
+                write_json(self, HTTPStatus.OK, {"notifiers": state.list_notifiers()})
+                return
+            if self.path == "/monitoring/dead_letters":
+                write_json(self, HTTPStatus.OK, {"dead_letters": state.list_dead_letters(100)})
+                return
+            if self.path == "/monitoring/incidents/export":
+                payload = self._incident_timeline_payload()
+                write_json(
+                    self,
+                    HTTPStatus.OK,
+                    sign_snapshot(attestor, payload, primary_operator_key_id),
+                )
                 return
             if self.path == "/accounting/summary":
                 summary = state.accounting_summary()
@@ -921,7 +1807,11 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
             if self.path == "/attestations/reserves":
                 inventory = self._reserve_inventory()
                 payload = state.reserve_attestation(config.mint_id, inventory)
-                payload.update(self._reserve_alerts(payload, inventory))
+                alerts = self._reserve_alerts(payload, inventory)
+                self._maybe_apply_auto_pause(payload, inventory, alerts)
+                payload.update(alerts)
+                payload.update(self._policy_recommendations(payload, inventory, alerts))
+                payload["reserve_health"] = self._reserve_health_summary(payload, inventory, alerts)
                 write_json(
                     self,
                     HTTPStatus.OK,
@@ -933,12 +1823,31 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     return
                 inventory = self._reserve_inventory()
                 payload = state.audit_export(config.mint_id, inventory)
-                payload["reserves"].update(self._reserve_alerts(payload["reserves"], inventory))
+                alerts = self._reserve_alerts(payload["reserves"], inventory)
+                self._maybe_apply_auto_pause(payload["reserves"], inventory, alerts)
+                payload["reserves"].update(alerts)
+                payload["reserves"].update(self._policy_recommendations(payload["reserves"], inventory, alerts))
+                payload["reserves"]["reserve_health"] = self._reserve_health_summary(payload["reserves"], inventory, alerts)
                 write_json(
                     self,
                     HTTPStatus.OK,
                     sign_snapshot(attestor, payload, primary_operator_key_id),
                 )
+                return
+            if self.path == "/reserves/consolidate_plan":
+                if not self._require_operator(b""):
+                    return
+                write_json(self, HTTPStatus.OK, self._consolidation_plan())
+                return
+            if self.path == "/policy/redemptions":
+                summary = state.reserve_summary()
+                inventory = self._reserve_inventory()
+                alerts = self._reserve_alerts(summary, inventory)
+                self._maybe_apply_auto_pause(summary, inventory, alerts)
+                policy = state.policy()
+                policy.update(self._policy_recommendations(summary, inventory, alerts))
+                policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
+                write_json(self, HTTPStatus.OK, policy)
                 return
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
 
@@ -977,6 +1886,24 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                 return
             if self.path == "/redemptions/approve_broadcast":
                 self._handle_redemption_approve_broadcast(body, raw_body)
+                return
+            if self.path == "/reserves/consolidate":
+                self._handle_reserve_consolidate(raw_body)
+                return
+            if self.path == "/policy/redemptions":
+                self._handle_redemption_policy_update(body, raw_body)
+                return
+            if self.path == "/monitoring/events/ack":
+                self._handle_event_ack(body, raw_body)
+                return
+            if self.path == "/monitoring/events/silence":
+                self._handle_event_silence(body, raw_body)
+                return
+            if self.path == "/monitoring/events/policy":
+                self._handle_event_policy_update(body, raw_body)
+                return
+            if self.path == "/monitoring/notifiers":
+                self._handle_notifier_upsert(body, raw_body)
                 return
 
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -1195,6 +2122,163 @@ def make_handler(config: MintConfig, state: MintState, signer: BlindSigner, atte
                     "l1_txid": updated.get("l1_txid", ""),
                 },
             )
+
+        def _handle_reserve_consolidate(self, raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            try:
+                item = self._broadcast_consolidation()
+            except (ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            write_json(
+                self,
+                HTTPStatus.OK,
+                {
+                    "accepted": True,
+                    "consolidation_id": item["consolidation_id"],
+                    "state": item["state"],
+                    "l1_txid": item["l1_txid"],
+                    "input_count": len(item.get("selected_utxos", [])),
+                    "total_input_value": item["total_input_value"],
+                    "output_value": item["output_value"],
+                    "fee": item["fee"],
+                },
+            )
+
+        def _handle_redemption_policy_update(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            paused = body.get("redemptions_paused")
+            reason = body.get("pause_reason", "")
+            auto_pause_enabled = body.get("auto_pause_enabled")
+            event_retention_limit = body.get("event_retention_limit")
+            export_include_acknowledged = body.get("export_include_acknowledged")
+            if not isinstance(paused, bool) or not isinstance(reason, str):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid policy fields"})
+                return
+            if auto_pause_enabled is not None and not isinstance(auto_pause_enabled, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid auto_pause_enabled"})
+                return
+            if event_retention_limit is not None and not isinstance(event_retention_limit, int):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event_retention_limit"})
+                return
+            if export_include_acknowledged is not None and not isinstance(export_include_acknowledged, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid export_include_acknowledged"})
+                return
+            policy = state.update_policy(
+                paused,
+                reason,
+                auto_pause_enabled,
+                event_retention_limit,
+                export_include_acknowledged,
+            )
+            self._record_event(
+                "policy.operator_update",
+                {
+                    "redemptions_paused": bool(policy.get("redemptions_paused", False)),
+                    "pause_reason": str(policy.get("pause_reason", "")),
+                    "auto_pause_enabled": bool(policy.get("auto_pause_enabled", False)),
+                    "event_retention_limit": int(policy.get("event_retention_limit", 256)),
+                    "export_include_acknowledged": bool(policy.get("export_include_acknowledged", True)),
+                },
+            )
+            summary = state.reserve_summary()
+            inventory = self._reserve_inventory()
+            alerts = self._reserve_alerts(summary, inventory)
+            policy.update(self._policy_recommendations(summary, inventory, alerts))
+            policy["reserve_health"] = self._reserve_health_summary(summary, inventory, alerts)
+            write_json(self, HTTPStatus.OK, {"accepted": True, **policy})
+
+        def _handle_event_ack(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            event_id = body.get("event_id")
+            note = body.get("note", "")
+            if not isinstance(event_id, str) or not isinstance(note, str) or not event_id:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event ack fields"})
+                return
+            try:
+                updated = state.acknowledge_event(event_id, note)
+            except KeyError:
+                write_json(self, HTTPStatus.NOT_FOUND, {"error": "unknown event_id"})
+                return
+            self._record_event("event.acknowledged", {"event_id": event_id, "note": note})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "event": updated})
+
+        def _handle_event_silence(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            event_type = body.get("event_type")
+            until_ts = body.get("until_ts")
+            reason = body.get("reason", "")
+            if not isinstance(event_type, str) or not isinstance(until_ts, int) or not isinstance(reason, str) or not event_type:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid silence fields"})
+                return
+            silence = state.add_silence(event_type, until_ts, reason)
+            self._record_event("event.silenced", {"event_type": event_type, "until_ts": until_ts, "reason": reason})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "silence": silence})
+
+        def _handle_event_policy_update(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            retention = body.get("event_retention_limit")
+            export_include_acknowledged = body.get("export_include_acknowledged")
+            if retention is not None and not isinstance(retention, int):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid event_retention_limit"})
+                return
+            if export_include_acknowledged is not None and not isinstance(export_include_acknowledged, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid export_include_acknowledged"})
+                return
+            current = state.policy()
+            updated = state.update_policy(
+                bool(current.get("redemptions_paused", False)),
+                str(current.get("pause_reason", "")),
+                bool(current.get("auto_pause_enabled", False)),
+                retention,
+                export_include_acknowledged,
+            )
+            self._record_event(
+                "event.policy_update",
+                {
+                    "event_retention_limit": int(updated.get("event_retention_limit", 256)),
+                    "export_include_acknowledged": bool(updated.get("export_include_acknowledged", True)),
+                },
+            )
+            write_json(self, HTTPStatus.OK, {"accepted": True, **updated})
+
+        def _handle_notifier_upsert(self, body: dict[str, Any], raw_body: bytes) -> None:
+            if not self._require_operator(raw_body):
+                return
+            notifier_id = body.get("notifier_id")
+            kind = body.get("kind")
+            target = body.get("target")
+            enabled = body.get("enabled", True)
+            retry_max_attempts = body.get("retry_max_attempts", 3)
+            retry_backoff_seconds = body.get("retry_backoff_seconds", 30)
+            if not isinstance(notifier_id, str) or not isinstance(kind, str) or not isinstance(target, str) or not isinstance(enabled, bool):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier fields"})
+                return
+            if not isinstance(retry_max_attempts, int) or not isinstance(retry_backoff_seconds, int):
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "invalid notifier retry fields"})
+                return
+            if kind not in {"webhook", "alertmanager", "email_spool"}:
+                write_json(self, HTTPStatus.BAD_REQUEST, {"error": "unsupported notifier kind"})
+                return
+            notifier = {
+                "notifier_id": notifier_id,
+                "kind": kind,
+                "target": target,
+                "enabled": enabled,
+                "retry_max_attempts": max(1, retry_max_attempts),
+                "retry_backoff_seconds": max(1, retry_backoff_seconds),
+            }
+            if kind == "email_spool":
+                notifier["email_to"] = str(body.get("email_to", "ops@example.invalid"))
+                notifier["email_from"] = str(body.get("email_from", "selfcoin-mint@example.invalid"))
+            saved = state.upsert_notifier(notifier)
+            self._record_event("notifier.upsert", {"notifier_id": notifier_id, "kind": kind, "enabled": enabled})
+            write_json(self, HTTPStatus.OK, {"accepted": True, "notifier": saved})
 
     return MintHandler
 

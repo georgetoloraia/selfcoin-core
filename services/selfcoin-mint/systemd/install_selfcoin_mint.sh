@@ -5,8 +5,10 @@ PREFIX="${1:-/opt/selfcoin-core}"
 SYSTEMD_DIR="${2:-/etc/systemd/system}"
 ETC_DIR="${3:-/etc/selfcoin-mint}"
 LIBEXEC_DIR="${4:-/usr/local/libexec}"
+STATE_DIR="${5:-/var/lib/selfcoin-mint}"
+RUN_DIR="${6:-/run/selfcoin-mint}"
 
-install -d "$SYSTEMD_DIR" "$ETC_DIR" "$ETC_DIR/secrets.d" "$LIBEXEC_DIR" /var/lib/selfcoin-mint /run/selfcoin-mint
+install -d "$SYSTEMD_DIR" "$ETC_DIR" "$ETC_DIR/secrets.d" "$LIBEXEC_DIR" "$STATE_DIR" "$RUN_DIR"
 install -m 0644 services/selfcoin-mint/systemd/selfcoin-mint-server.service "$SYSTEMD_DIR/selfcoin-mint-server.service"
 install -m 0644 services/selfcoin-mint/systemd/selfcoin-mint-worker.service "$SYSTEMD_DIR/selfcoin-mint-worker.service"
 install -m 0644 services/selfcoin-mint/systemd/selfcoin-mint.env.example "$ETC_DIR/selfcoin-mint.env"

@@ -349,3 +349,8 @@ bash services/selfcoin-mint/systemd/smoke_deploy.sh
 CI wiring for the packaging/deploy checks lives in:
 
 - [.github/workflows/selfcoin-mint-packaging.yml](/home/greendragon/Desktop/selfcoin-core/.github/workflows/selfcoin-mint-packaging.yml)
+
+That workflow now runs:
+- packaging/state tests
+- temp-prefix install smoke check
+- split server/worker live integration tests

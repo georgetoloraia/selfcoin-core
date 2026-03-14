@@ -228,6 +228,7 @@ class MintIntegrationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as td:
                 state_path = Path(td) / "mint-state.json"
                 lock_path = Path(td) / "worker.lock"
+                email_spool = Path(td) / "email-spool"
                 state_path.write_text(
                     json.dumps(
                         {
@@ -244,6 +245,34 @@ class MintIntegrationTests(unittest.TestCase):
                                     "tls_ca_file": "",
                                     "tls_client_cert_file": "",
                                     "tls_client_key_file": "",
+                                },
+                                {
+                                    "notifier_id": "ops-takeover-alertmanager",
+                                    "kind": "alertmanager",
+                                    "target": f"http://127.0.0.1:{notifier_port}/alertmanager",
+                                    "enabled": True,
+                                    "retry_max_attempts": 2,
+                                    "retry_backoff_seconds": 1,
+                                    "auth_type": "none",
+                                    "tls_verify": True,
+                                    "tls_ca_file": "",
+                                    "tls_client_cert_file": "",
+                                    "tls_client_key_file": "",
+                                },
+                                {
+                                    "notifier_id": "ops-takeover-email",
+                                    "kind": "email_spool",
+                                    "target": str(email_spool),
+                                    "enabled": True,
+                                    "retry_max_attempts": 2,
+                                    "retry_backoff_seconds": 1,
+                                    "auth_type": "none",
+                                    "tls_verify": True,
+                                    "tls_ca_file": "",
+                                    "tls_client_cert_file": "",
+                                    "tls_client_key_file": "",
+                                    "email_to": "ops@example.test",
+                                    "email_from": "mint@example.test",
                                 }
                             ]
                         }
@@ -321,10 +350,13 @@ class MintIntegrationTests(unittest.TestCase):
                     self.assertIsNotNone(takeover_event)
                     self.assertEqual(takeover_event["payload"]["stale_owner_pid"], "424242")
                     for _ in range(20):
-                        if "/webhook" in {item["path"] for item in notifier.received}:
+                        paths = {item["path"] for item in notifier.received}
+                        if "/webhook" in paths and "/alertmanager" in paths and len(list(email_spool.glob("*.eml"))) >= 1:
                             break
                         time.sleep(0.1)
                     self.assertIn("/webhook", {item["path"] for item in notifier.received})
+                    self.assertIn("/alertmanager", {item["path"] for item in notifier.received})
+                    self.assertGreaterEqual(len(list(email_spool.glob("*.eml"))), 1)
 
                     worker_status = http_get_json(f"http://127.0.0.1:{port}/monitoring/worker")
                     self.assertEqual(worker_status["takeover_policy"], "allow-after-stale-timeout")
